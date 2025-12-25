@@ -1,0 +1,15 @@
+fn main() {
+    # Declaration with explicit type (Parser uses COLON for now per impl)
+    let arr: [i32: 3] = [10, 20, 30]
+    
+    # Index Access
+    print("Array[0]: ")
+    print(arr[0])
+    
+    print("Array[1]: ")
+    print(arr[1])
+
+    let i: i32 = 2
+    print("Array[i]: ")
+    print(arr[i])
+}

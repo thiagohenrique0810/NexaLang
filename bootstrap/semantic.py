@@ -1,14 +1,21 @@
+from parser import FunctionDef, StructDef
+
 class SemanticAnalyzer:
     def __init__(self):
         self.scopes = [{}] # List of dictionaries {name: {'type': type, 'moved': bool}}
         self.current_function = None
 
     def analyze(self, ast):
-        # 1. Collect function names
+        # 1. Collect function and struct names
         self.functions = set(['print', 'gpu::global_id'])
+        self.structs = {} # name -> {field: type}
+        
         for node in ast:
-            if hasattr(node, 'name'):
+            if isinstance(node, FunctionDef):
                 self.functions.add(node.name)
+            elif isinstance(node, StructDef):
+                fields = {name: type_name for name, type_name in node.fields}
+                self.structs[node.name] = fields
 
         # 2. Analyze bodies
         for node in ast:
@@ -18,6 +25,59 @@ class SemanticAnalyzer:
         method_name = f'visit_{type(node).__name__}'
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
+
+    def visit_StructDef(self, node):
+        pass # Already collected
+
+    def visit_MemberAccess(self, node):
+        # 1. Evaluate object
+        obj_type = self.visit(node.object)
+        
+        # 2. Check if object is a struct
+        if obj_type not in self.structs:
+             raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+        
+        # 3. Check if member exists
+        fields = self.structs[obj_type]
+        if node.member not in fields:
+             raise Exception(f"Type Error: Struct '{obj_type}' has no member '{node.member}'")
+        
+        # Annotate node for CodeGen
+        node.struct_type = obj_type
+             
+        return fields[node.member]
+
+    def visit_ArrayLiteral(self, node):
+        if not node.elements:
+             raise Exception("Semantic Error: Empty array literals not supported (cannot infer type)")
+        
+        first_type = self.visit(node.elements[0])
+        for el in node.elements[1:]:
+            type_ = self.visit(el)
+            if type_ != first_type:
+                 raise Exception(f"Type Error: Array elements must be same type. Expected '{first_type}', got '{type_}'")
+                 
+        size = len(node.elements)
+        return f"[{first_type}:{size}]"
+
+    def visit_IndexAccess(self, node):
+        # 1. Analyze object
+        obj_type = self.visit(node.object)
+        
+        # 2. Verify it is an array
+        if not (obj_type.startswith('[') and obj_type.endswith(']')):
+             raise Exception(f"Type Error: Indexing non-array type '{obj_type}'")
+        
+        # Parse type string [T:N]
+        content = obj_type[1:-1]
+        elem_type, size_str = content.split(':')
+        
+        # 3. Analyze index
+        index_type = self.visit(node.index)
+        if index_type != 'i32':
+             raise Exception(f"Type Error: Array index must be i32, got '{index_type}'")
+             
+        return elem_type
 
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
@@ -116,10 +176,18 @@ class SemanticAnalyzer:
                 return 'i32'
             else:
                  # User function call
-                 # Ideally check args match signature, but for now just check existence
                  for arg in node.args:
                      self.visit(arg)
-                 return 'void' # Assuming void return for now
+                 return 'void'
+        elif node.callee in self.structs:
+            # Struct Instantiation
+            fields = self.structs[node.callee]
+            if len(node.args) != len(fields):
+                raise Exception(f"Semantic Error: Struct '{node.callee}' expects {len(fields)} arguments, got {len(node.args)}")
+            
+            for arg in node.args:
+                self.visit(arg)
+            return node.callee
         else:
              raise Exception(f"Semantic Error: Unknown function '{node.callee}'")
 

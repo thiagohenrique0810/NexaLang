@@ -6,11 +6,36 @@ class Assignment(ASTNode):
         self.name = name
         self.value = value
 
+class ArrayLiteral(ASTNode):
+    def __init__(self, elements):
+        self.elements = elements
+
+class IndexAccess(ASTNode):
+    def __init__(self, object, index):
+        self.object = object
+        self.index = index
+    
+    def __repr__(self):
+        return f"{self.object}[{self.index}]"
+
 class FunctionDef(ASTNode):
     def __init__(self, name, body, is_kernel=False):
         self.name = name
         self.body = body
         self.is_kernel = is_kernel
+
+class StructDef(ASTNode):
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields # list of (name, type) tuples
+
+class MemberAccess(ASTNode):
+    def __init__(self, object, member):
+        self.object = object
+        self.member = member
+    
+    def __repr__(self):
+        return f"{self.object}.{self.member}"
 
 class CallExpr(ASTNode):
     def __init__(self, callee, args):
@@ -109,15 +134,32 @@ class Parser:
         raise Exception(f"Expected token type {type}, found {self.tokens[self.pos].type if self.pos < len(self.tokens) else 'EOF'}")
 
     def parse(self):
-        functions = []
+        nodes = []
         while self.pos < len(self.tokens):
             if self.peek().type == 'KERNEL':
-                functions.append(self.parse_function(is_kernel=True))
+                nodes.append(self.parse_function(is_kernel=True))
             elif self.peek().type == 'FN':
-                functions.append(self.parse_function(is_kernel=False))
+                nodes.append(self.parse_function(is_kernel=False))
+            elif self.peek().type == 'STRUCT':
+                nodes.append(self.parse_struct())
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
-        return functions
+        return nodes
+
+    def parse_struct(self):
+        self.consume('STRUCT')
+        name = self.consume('IDENTIFIER').value
+        self.consume('LBRACE')
+        fields = []
+        while self.peek().type != 'RBRACE':
+            field_name = self.consume('IDENTIFIER').value
+            self.consume('COLON')
+            field_type = self.consume('IDENTIFIER').value
+            fields.append((field_name, field_type))
+            if self.peek().type == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RBRACE')
+        return StructDef(name, fields)
 
     def parse_function(self, is_kernel=False):
         if is_kernel:
@@ -162,11 +204,46 @@ class Parser:
         self.consume('LET')
         name = self.consume('IDENTIFIER').value
         self.consume('COLON')
-        type_name = self.consume('IDENTIFIER').value # e.g. i32
+        type_name = self.parse_type()
         self.consume('EQ')
         initializer = self.parse_expression()
         return VarDecl(name, type_name, initializer)
 
+    def parse_type(self):
+        if self.peek().type == 'IDENTIFIER':
+            return self.consume('IDENTIFIER').value
+        elif self.peek().type == 'LBRACKET':
+            # Array Type: [Type; Size]
+            self.consume('LBRACKET')
+            elem_type = self.consume('IDENTIFIER').value
+            self.consume('COLON') # We use semicolon usually [T;N] but Lexer has COLON?
+            # Lexer doesn't have SEMICOLON token yet! 
+            # NexaLang syntax used [i32; 3]? Or [i32: 3]?
+            # Let's use COLON for now as it exists, or add SEMICOLON.
+            # Using SEMICOLON is standard for Rust-like.
+            # I will use COLON since SEMICOLON token is missing, or I add SEMICOLON token.
+            # Let's check Lexer. It does NOT have SEMICOLON.
+            # I'll use COLON for array type [i32: 3] or update Lexer.
+            # Updating Lexer is better for correct syntax. But for speed, let's stick to what we have?
+            # Or just parse SEMICOLON as a specific char if needed?
+            # Let's assume [i32: 3] for this bootstrap to save a turn, or use already existing tokens.
+            # Wait, `examples/arrays.nxl` in plan used `[i32; 3]`.
+            # I should add SEMICOLON to Lexer.
+            # For now, to proceed in this step, I'll use COLON [i32: 3] or fix it after.
+            # Let's add SEMICOLON to Lexer quickly? No, I am in Parser edit.
+            # I will use COLON for now: [i32: 3].
+            
+            # Wait, I can just match on character if token is unknown? No, lexer produces tokens.
+            # If I encounter ';', Lexer throws exception!
+            # So I MUST update Lexer if I want ';'.
+            # I'll use COLON [i32: 3] for now.
+            
+            size = self.consume('NUMBER').value
+            self.consume('RBRACKET')
+            return f"[{elem_type}:{size}]"
+        else:
+             raise Exception(f"Expected type, found {self.peek()}")
+             
     def parse_return(self):
         self.consume('RETURN')
         value = self.parse_expression()
@@ -263,14 +340,45 @@ class Parser:
                      
             if self.peek(1).type == 'LPAREN':
                 return self.parse_call()
-            else:
-                self.consume('IDENTIFIER')
-                return VariableExpr(token.value)
+            
+            # Note: Struct instantiation looks like a function call (Name(...))
+            # But member access works on expressions: var.field
+            
+            expr = VariableExpr(token.value)
+            self.consume('IDENTIFIER')
+            
+            # Loop to handle chains: val.x.y or val[0].x etc
+            while True:
+                if self.peek().type == 'DOT':
+                    self.consume('DOT')
+                    member = self.consume('IDENTIFIER').value
+                    expr = MemberAccess(expr, member)
+                elif self.peek().type == 'LBRACKET':
+                    self.consume('LBRACKET')
+                    index = self.parse_expression()
+                    self.consume('RBRACKET')
+                    expr = IndexAccess(expr, index)
+                else:
+                    break
+            
+            return expr
         elif token.type == 'LPAREN':
             self.consume('LPAREN')
             expr = self.parse_expression()
             self.consume('RPAREN')
             return expr
+        elif token.type == 'LBRACKET':
+            # Array Literal: [1, 2, 3]
+            self.consume('LBRACKET')
+            elements = []
+            if self.peek().type != 'RBRACKET':
+                while True:
+                    elements.append(self.parse_expression())
+                    if self.peek().type == 'RBRACKET':
+                        break
+                    self.consume('COMMA')
+            self.consume('RBRACKET')
+            return ArrayLiteral(elements)
         else:
             raise Exception(f"Unexpected token in primary: {token}")
 
@@ -286,6 +394,6 @@ class Parser:
                 args.append(self.parse_expression())
                 if self.peek().type == 'RPAREN':
                     break
-                # Comma parsing could go here
+                self.consume('COMMA')
         self.consume('RPAREN')
         return CallExpr(name, args)

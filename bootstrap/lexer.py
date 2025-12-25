@@ -44,14 +44,26 @@ class Lexer:
             elif char == ')':
                 tokens.append(Token('RPAREN', ')'))
                 self.pos += 1
+            elif char == '[':
+                tokens.append(Token('LBRACKET', '['))
+                self.pos += 1
+            elif char == ']':
+                tokens.append(Token('RBRACKET', ']'))
+                self.pos += 1
             elif char == '{':
                 tokens.append(Token('LBRACE', '{'))
                 self.pos += 1
             elif char == '}':
                 tokens.append(Token('RBRACE', '}'))
                 self.pos += 1
+            elif char == '.':
+                tokens.append(Token('DOT', '.'))
+                self.pos += 1
             elif char == ':':
                 tokens.append(Token('COLON', ':'))
+                self.pos += 1
+            elif char == ',':
+                tokens.append(Token('COMMA', ','))
                 self.pos += 1
             
             # Operators
@@ -103,6 +115,8 @@ class Lexer:
                     tokens.append(Token('FN', value))
                 elif value == 'kernel':
                      tokens.append(Token('KERNEL', value))
+                elif value == 'struct':
+                     tokens.append(Token('STRUCT', value))
                 elif value == 'let':
                     tokens.append(Token('LET', value))
                 elif value == 'return':

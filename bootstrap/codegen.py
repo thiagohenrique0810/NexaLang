@@ -6,11 +6,28 @@ class CodeGen:
         self.builder = None
         self.printf = None
         self._declare_printf()
+        self.struct_types = {} # name -> ir.LiteralStructType
+        self.struct_fields = {} # name -> {field_name: index}
 
     def _declare_printf(self):
         voidptr_ty = ir.IntType(8).as_pointer()
         printf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
+
+    def visit_StructDef(self, node):
+        # Create LLVM Struct Type
+        field_types = []
+        field_indices = {}
+        for idx, (name, type_name) in enumerate(node.fields):
+            if type_name == 'i32':
+                field_types.append(ir.IntType(32))
+            else:
+                 raise Exception(f"Unsupported field type: {type_name}")
+            field_indices[name] = idx
+            
+        struct_ty = ir.LiteralStructType(field_types)
+        self.struct_types[node.name] = struct_ty
+        self.struct_fields[node.name] = field_indices
 
     def generate(self, ast):
         for node in ast:
@@ -24,6 +41,67 @@ class CodeGen:
 
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method")
+        
+    def visit_MemberAccess(self, node):
+        # ... existing implementation ...
+        struct_val = self.visit(node.object)
+        if not hasattr(node, 'struct_type'):
+             raise Exception("CodeGen Error: MemberAccess node missing 'struct_type' annotation from Semantic phase.")
+        struct_name = node.struct_type
+        field_index = self.struct_fields[struct_name][node.member]
+        return self.builder.extract_value(struct_val, field_index)
+
+    def visit_ArrayLiteral(self, node):
+        # Create array value
+        # Assume i32 elements for now since we parsed [i32:N] or inferred
+        # We need to know the type!
+        # SemanticAnalyzer verified types are consistent.
+        # We can inspect the first element's LLVM type?
+        val0 = self.visit(node.elements[0])
+        elem_ty = val0.type
+        size = len(node.elements)
+        array_ty = ir.ArrayType(elem_ty, size)
+        
+        array_val = ir.Constant(array_ty, ir.Undefined)
+        array_val = self.builder.insert_value(array_val, val0, 0)
+        
+        for i in range(1, size):
+            val = self.visit(node.elements[i])
+            array_val = self.builder.insert_value(array_val, val, i)
+            
+        return array_val
+
+    def visit_IndexAccess(self, node):
+        index_val = self.visit(node.index)
+        
+        # Optimization: If object is a Variable, use GEP on pointer
+        # We need to check if node.object is VariableExpr
+        # We also need 'VariableExpr' class available here? Or inspect type.
+        # AST classes are not imported. We can check class name.
+        if type(node.object).__name__ == 'VariableExpr':
+             ptr = self.scopes[-1].get(node.object.name)
+             # If not in local scope? (Global?) Assumed local for now.
+             if ptr:
+                 # GEP: ptr, 0, index
+                 zero = ir.Constant(ir.IntType(32), 0)
+                 ptr = self.builder.gep(ptr, [zero, index_val])
+                 return self.builder.load(ptr)
+        
+        # Fallback: Evaluate object to value (loads it)
+        array_val = self.visit(node.object)
+        
+        # If index_val is Constant, we can use extract_value
+        if isinstance(index_val, ir.Constant):
+             # extract_value index must be python int
+             idx = index_val.constant
+             return self.builder.extract_value(array_val, idx)
+             
+        # Runtime index on SSA value: Spill to stack
+        temp_ptr = self.builder.alloca(array_val.type)
+        self.builder.store(array_val, temp_ptr)
+        zero = ir.Constant(ir.IntType(32), 0)
+        ptr = self.builder.gep(temp_ptr, [zero, index_val])
+        return self.builder.load(ptr)
 
     def visit_FunctionDef(self, node):
         func_ty = ir.FunctionType(ir.VoidType(), [])
@@ -45,8 +123,21 @@ class CodeGen:
 
     def visit_VarDecl(self, node):
         # Determine type
+        # Determine type
         if node.type_name == "i32":
             llvm_type = ir.IntType(32)
+        elif node.type_name in self.struct_types:
+            llvm_type = self.struct_types[node.type_name]
+        elif node.type_name.startswith('['):
+            # Parse [T:N]
+            content = node.type_name[1:-1]
+            elem_type_str, size_str = content.split(':')
+            size = int(size_str)
+            if elem_type_str == 'i32':
+                elem_ty = ir.IntType(32)
+            else:
+                 raise Exception(f"Unsupported array element type: {elem_type_str}")
+            llvm_type = ir.ArrayType(elem_ty, size)
         else:
             raise Exception(f"Unknown type: {node.type_name}")
 
@@ -181,10 +272,22 @@ class CodeGen:
             else:
                 val_arg = self.builder.bitcast(arg, voidptr_ty)
                 self.builder.call(self.printf, [fmt_arg, val_arg])
+        elif node.callee in self.struct_types:
+             # Struct Instantiation
+             struct_ty = self.struct_types[node.callee]
+             # Create a stack allocation for the struct (or just a constant value?)
+             # To make it mutable/addressable, better to alloca, store fields, and load.
+             # Wait, generate() returns a Value.
+             # Let's create an undefined struct value and insert values.
+             
+             struct_val = ir.Constant(struct_ty, ir.Undefined)
+             for i, arg in enumerate(node.args):
+                 val = self.visit(arg)
+                 struct_val = self.builder.insert_value(struct_val, val, i)
+                 
+             return struct_val
+             
         elif node.callee == "gpu::global_id":
-             # Mock implementation of global_id
-             # In real SPIR-V, this reads a built-in variable.
-             # Here we return a dummy constant 0 for verification.
              return ir.Constant(ir.IntType(32), 0)
         else:
              # Try to find function in module

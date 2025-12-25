@@ -1,0 +1,10 @@
+struct Vector3 {
+    x: i32,
+    y: i32,
+    z: i32
+}
+
+fn main() {
+    let v: Vector3 = Vector3(10, 20, 30)
+    print(v.y)
+}
