@@ -56,6 +56,23 @@ class CodeGen:
         # Store in scope
         self.scopes[-1][node.name] = ptr
 
+    def visit_Assignment(self, node):
+        # Lookup in scopes (LIFO) to get the pointer
+        ptr = None
+        for scope in reversed(self.scopes):
+            if node.name in scope:
+                ptr = scope[node.name]
+                break
+        
+        if not ptr:
+            raise Exception(f"Undefined variable in assignment: {node.name}")
+            
+        # Evaluate value
+        val = self.visit(node.value)
+        
+        # Store new value
+        self.builder.store(val, ptr)
+
     def visit_BinaryExpr(self, node):
         left = self.visit(node.left)
         right = self.visit(node.right)
@@ -105,6 +122,31 @@ class CodeGen:
             
         # Continue
         self.builder.position_at_end(merge_bb)
+
+    def visit_WhileStmt(self, node):
+        cond_bb = self.builder.append_basic_block(name="whilecond")
+        loop_bb = self.builder.append_basic_block(name="whileloop")
+        end_bb = self.builder.append_basic_block(name="whileend")
+        
+        # Jump to condition
+        self.builder.branch(cond_bb)
+        
+        # Condition Block
+        self.builder.position_at_end(cond_bb)
+        cond_val = self.visit(node.condition)
+        if cond_val.type != ir.IntType(1):
+             cond_val = self.builder.icmp_signed('!=', cond_val, ir.Constant(cond_val.type, 0), name="loopcond")
+        self.builder.cbranch(cond_val, loop_bb, end_bb)
+        
+        # Loop Block
+        self.builder.position_at_end(loop_bb)
+        for stmt in node.body:
+            self.visit(stmt)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_bb) # Loop back to condition
+            
+        # End Block
+        self.builder.position_at_end(end_bb)
 
     def visit_IntegerLiteral(self, node):
         return ir.Constant(ir.IntType(32), node.value)

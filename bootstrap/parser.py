@@ -1,6 +1,11 @@
 class ASTNode:
     pass
 
+class Assignment(ASTNode):
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
 class FunctionDef(ASTNode):
     def __init__(self, name, body):
         self.name = name
@@ -31,11 +36,52 @@ class IfStmt(ASTNode):
         self.then_branch = then_branch
         self.else_branch = else_branch
 
+class WhileStmt(ASTNode):
+    def __init__(self, condition, body):
+        self.condition = condition
+        self.body = body
+
 class BinaryExpr(ASTNode):
     def __init__(self, left, op, right):
         self.left = left
         self.right = right
         self.op = op
+    # ... (rest of classes)
+
+# ... inside Parser class ...
+
+    def parse_statement(self):
+        token = self.peek()
+        if token.type == 'LET':
+            return self.parse_var_decl()
+        elif token.type == 'RETURN':
+            return self.parse_return()
+        elif token.type == 'IF':
+            return self.parse_if()
+        elif token.type == 'WHILE':
+            return self.parse_while()
+        elif token.type == 'IDENTIFIER':
+            # Could be assignment or expression statement
+            # For now, simplistic check
+            return self.parse_expression_stmt()
+        else:
+            raise Exception(f"Unexpected token in statement: {token}")
+
+    # ... (other parse methods) ...
+
+    def parse_while(self):
+        self.consume('WHILE')
+        self.consume('LPAREN')
+        cond = self.parse_expression()
+        self.consume('RPAREN')
+        
+        self.consume('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_statement())
+        self.consume('RBRACE')
+        
+        return WhileStmt(cond, body)
 
 class IntegerLiteral(ASTNode):
     def __init__(self, value):
@@ -82,6 +128,7 @@ class Parser:
         self.consume('RBRACE')
         return FunctionDef(name, body)
 
+
     def parse_statement(self):
         token = self.peek()
         if token.type == 'LET':
@@ -90,12 +137,21 @@ class Parser:
             return self.parse_return()
         elif token.type == 'IF':
             return self.parse_if()
+        elif token.type == 'WHILE':
+            return self.parse_while()
         elif token.type == 'IDENTIFIER':
-            # Could be assignment or expression statement
-            # For now, simplistic check
+            # Check for assignment: ID = expr
+            if self.peek(1).type == 'EQ':
+                return self.parse_assignment()
             return self.parse_expression_stmt()
         else:
             raise Exception(f"Unexpected token in statement: {token}")
+
+    def parse_assignment(self):
+        name = self.consume('IDENTIFIER').value
+        self.consume('EQ')
+        value = self.parse_expression()
+        return Assignment(name, value)
 
     def parse_var_decl(self):
         self.consume('LET')
@@ -133,6 +189,20 @@ class Parser:
             self.consume('RBRACE')
             
         return IfStmt(cond, then_branch, else_branch)
+
+    def parse_while(self):
+        self.consume('WHILE')
+        self.consume('LPAREN')
+        cond = self.parse_expression()
+        self.consume('RPAREN')
+        
+        self.consume('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_statement())
+        self.consume('RBRACE')
+        
+        return WhileStmt(cond, body)
 
     def parse_expression_stmt(self):
         expr = self.parse_expression()

@@ -1,0 +1,8 @@
+fn main() {
+    let i: i32 = 5
+    while (i) {
+        print(i)
+        i = i - 1
+    }
+    print("Loop finished")
+}

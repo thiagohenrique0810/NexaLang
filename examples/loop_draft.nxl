@@ -1,0 +1,15 @@
+fn main() {
+    let i: i32 = 5
+    while (i) {
+        print(i)
+        let i: i32 = i - 1
+        # Note: I haven't implemented variable reassignment (i = i - 1) yet, only shadowing (let i = ...).
+        # Shadowing inside the loop body works for new iterations because of how I handled scopes, 
+        # BUT strictly speaking, shadowing in a loop body creates a NEW variable for that iteration scope, 
+        # it doesn't update the outer 'i'.
+        # Wait, my CodeGen creates a new alloca for 'i'.
+        # If I shadow 'i', the condition 'while(i)' uses the OUTER 'i'.
+        # So this loop will be infinite if I just use shadowing.
+        # implementation of ASSIGNMENT (x = y) is needed for loops to be useful.
+    }
+}
