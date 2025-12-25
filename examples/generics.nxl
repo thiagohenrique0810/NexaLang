@@ -1,0 +1,26 @@
+struct Box<T> {
+    item: T
+}
+
+fn id<T>(x: T) -> T {
+    return x
+}
+
+fn main() {
+    print("Testing Generics...")
+    
+    # Generic Struct with TurboFish
+    let val = 123
+    let b = Box::<i32>(val)
+    print(b.item)
+    
+    # Generic Function with TurboFish
+    let n = id::<i32>(456)
+    print(n)
+    
+    # Type Inference + Generics
+    let inferred = id::<i32>(789)
+    print(inferred)
+    
+    print("Done")
+}

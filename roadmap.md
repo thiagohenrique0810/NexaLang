@@ -27,9 +27,12 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 
 - [ ] **Data Types**
     - [x] Primitive types (`u8`, `i64`, `bool`, `char`).
-    - [ ] Structs (Aggregate types).
-    - [ ] Tuples.
-    - [ ] Arrays (Fixed size).
+- [x] **Type System 2.0**
+  - [x] Structs & Methods
+  - [x] Arrays & Slices
+  - [x] Enums & Pattern Matching
+  - [x] Generics (Basic Monomorphization)
+  - [x] Type Inference (Local)
 - [ ] **Control Flow**
     - [x] `if` / `else` expressions.
     - [x] `while` loops.
@@ -68,10 +71,11 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 
 ## Phase 5: Self-Hosting & Ecosystem 🚀
 
-- [ ] **Standard Library (`std`)**
-    - [ ] `std::io` (File/Console).
-    - [ ] `std::mem` (Allocators).
-    - [ ] `std::vec` (Dynamic arrays).
+- [x] **Standard Library Basics**
+  - [x] `print` function (intrinsic).
+  - [x] `Option<T>` and `Result<T, E>` (via Enums).
+  - [ ] `Vec<T>` (Dynamic array).
+  - [ ] String manipulation.
 - [ ] **Self-Hosting**
     - [ ] Rewrite the compiler using NexaLang itself.
     - [ ] Verify `nxc` can compile `nxc`.

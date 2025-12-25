@@ -19,20 +19,25 @@ class IndexAccess(ASTNode):
         return f"{self.object}[{self.index}]"
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, body, is_kernel=False):
+    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None):
         self.name = name
+        self.params = params
+        self.return_type = return_type
         self.body = body
         self.is_kernel = is_kernel
+        self.generics = generics or []
 
 class StructDef(ASTNode):
-    def __init__(self, name, fields):
+    def __init__(self, name, fields, generics=None):
         self.name = name
         self.fields = fields # list of (name, type) tuples
+        self.generics = generics or []
 
 class EnumDef(ASTNode):
-    def __init__(self, name, variants):
+    def __init__(self, name, variants, generics=None):
         self.name = name
         self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
+        self.generics = generics or []
 
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
@@ -167,21 +172,41 @@ class Parser:
     def parse_struct(self):
         self.consume('STRUCT')
         name = self.consume('IDENTIFIER').value
+        
+        generics = []
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                generics.append(self.consume('IDENTIFIER').value)
+                if self.peek().type == 'COMMA':
+                    self.consume('COMMA')
+            self.consume('GT')
+            
         self.consume('LBRACE')
         fields = []
         while self.peek().type != 'RBRACE':
             field_name = self.consume('IDENTIFIER').value
             self.consume('COLON')
-            field_type = self.consume('IDENTIFIER').value
+            field_type = self.parse_type() # Use parse_type instead of raw ID to support Generic Members
             fields.append((field_name, field_type))
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return StructDef(name, fields)
+        return StructDef(name, fields, generics)
 
     def parse_enum(self):
         self.consume('ENUM')
         name = self.consume('IDENTIFIER').value
+        
+        generics = []
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                generics.append(self.consume('IDENTIFIER').value)
+                if self.peek().type == 'COMMA':
+                    self.consume('COMMA')
+            self.consume('GT')
+            
         self.consume('LBRACE')
         variants = []
         while self.peek().type != 'RBRACE':
@@ -198,21 +223,45 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return EnumDef(name, variants)
+        return EnumDef(name, variants, generics)
 
     def parse_function(self, is_kernel=False):
         if is_kernel:
             self.consume('KERNEL')
         self.consume('FN')
         name = self.consume('IDENTIFIER').value
+        
+        generics = []
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                generics.append(self.consume('IDENTIFIER').value)
+                if self.peek().type == 'COMMA':
+                   self.consume('COMMA')
+            self.consume('GT')
+            
         self.consume('LPAREN')
+        params = []
+        while self.peek().type != 'RPAREN':
+            param_name = self.consume('IDENTIFIER').value
+            self.consume('COLON')
+            param_type = self.parse_type()
+            params.append((param_name, param_type))
+            if self.peek().type == 'COMMA':
+                self.consume('COMMA')
         self.consume('RPAREN')
+        
+        return_type = 'void'
+        if self.peek().type == 'THIN_ARROW':
+            self.consume('THIN_ARROW')
+            return_type = self.parse_type()
+            
         self.consume('LBRACE')
         body = []
-        while self.pos < len(self.tokens) and self.tokens[self.pos].type != 'RBRACE':
+        while self.peek().type != 'RBRACE':
             body.append(self.parse_statement())
         self.consume('RBRACE')
-        return FunctionDef(name, body, is_kernel=is_kernel)
+        return FunctionDef(name, params, return_type, body, is_kernel, generics)
 
 
     def parse_statement(self):
@@ -244,15 +293,32 @@ class Parser:
     def parse_var_decl(self):
         self.consume('LET')
         name = self.consume('IDENTIFIER').value
-        self.consume('COLON')
-        type_name = self.parse_type()
+        
+        type_name = None
+        if self.peek().type == 'COLON':
+            self.consume('COLON')
+            type_name = self.parse_type()
+            
         self.consume('EQ')
         initializer = self.parse_expression()
         return VarDecl(name, type_name, initializer)
 
     def parse_type(self):
         if self.peek().type == 'IDENTIFIER':
-            return self.consume('IDENTIFIER').value
+            name = self.consume('IDENTIFIER').value
+            
+            # Check for Generic Arguments <T, U>
+            if self.peek().type == 'LT':
+                self.consume('LT')
+                args = []
+                while self.peek().type != 'GT':
+                    args.append(self.parse_type())
+                    if self.peek().type == 'COMMA':
+                        self.consume('COMMA')
+                self.consume('GT')
+                return f"{name}<{','.join(args)}>"
+            
+            return name
         elif self.peek().type == 'LBRACKET':
             # Array Type: [Type; Size]
             self.consume('LBRACKET')
@@ -304,7 +370,7 @@ class Parser:
                 var_name = self.consume('IDENTIFIER').value
                 self.consume('RPAREN')
             
-            self.consume('ARROW')
+            self.consume('FAT_ARROW')
             # For now, body is a single statement or expression?
             # Let's say it's a statement for now to allow return/print.
             # If we want expression-based match, we need blocks.
@@ -396,23 +462,48 @@ class Parser:
             self.consume('STRING')
             return StringLiteral(token.value)
         elif token.type == 'IDENTIFIER':
-            # Check for namespace: ID :: ID
+            # Check for namespace or TurboFish: ID :: ID or ID :: <Args>
             if self.peek(1).type == 'DOUBLE_COLON':
-                 # Namespace: ID :: ID
-                 # Could be Enum::Variant or Namespace::Func
                  lhs = self.consume('IDENTIFIER').value
                  self.consume('DOUBLE_COLON')
-                 rhs = self.consume('IDENTIFIER').value
                  
-                 # Check if it's a function call (Enum variant constructor)
-                 if self.peek().type == 'LPAREN':
-                     # We pass the full name "Enum::Variant" as callee
-                     full_name = f"{lhs}::{rhs}"
-                     return self.parse_call_explicit(full_name)
+                 if self.peek().type == 'LT':
+                     # Turbo fish: ID :: <T, U>
+                     self.consume('LT')
+                     args = []
+                     while self.peek().type != 'GT':
+                         # Parse type names (identifiers or complex types)
+                         # We use consume(ID) for simplicity or parse_type()?
+                         # parse_type should be safe inside <...>.
+                         # But let's stick to ID or parse_type if we support nested.
+                         args.append(self.parse_type())
+                         if self.peek().type == 'COMMA': self.consume('COMMA')
+                     self.consume('GT')
+                     full_name = f"{lhs}<{','.join(args)}>"
+                     
+                     # Check for Variant chaining: :: Variant
+                     if self.peek().type == 'DOUBLE_COLON':
+                         self.consume('DOUBLE_COLON')
+                         rhs = self.consume('IDENTIFIER').value
+                         full_name = f"{full_name}::{rhs}"
+                         
+                     # Check for Call
+                     if self.peek().type == 'LPAREN':
+                         return self.parse_call_explicit(full_name)
+                     else:
+                         return VariableExpr(full_name)
                  else:
-                     # Enum variant without args (if supported) or variable
-                     full_name = f"{lhs}::{rhs}"
-                     return VariableExpr(full_name)
+                     # Namespace: ID :: ID
+                     rhs = self.consume('IDENTIFIER').value
+                     # Check if it's a function call (Enum variant constructor)
+                     if self.peek().type == 'LPAREN':
+                         # We pass the full name "Enum::Variant" as callee
+                         full_name = f"{lhs}::{rhs}"
+                         return self.parse_call_explicit(full_name)
+                     else:
+                         # Enum variant without args (if supported) or variable
+                         full_name = f"{lhs}::{rhs}"
+                         return VariableExpr(full_name)
                      
             if self.peek(1).type == 'LPAREN':
                 return self.parse_call()

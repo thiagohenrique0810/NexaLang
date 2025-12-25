@@ -1,4 +1,5 @@
 from llvmlite import ir
+from parser import StructDef, EnumDef, FunctionDef
 
 class CodeGen:
     def __init__(self):
@@ -25,8 +26,12 @@ class CodeGen:
         self.exit_func = ir.Function(self.module, exit_ty, name="exit")
 
     def visit_StructDef(self, node):
+        if node.generics:
+            return # Skip generic definition (monomorphized versions will be generated)
+            
         # Create LLVM Struct Type
         field_types = []
+        element_types = [] # For LiteralStructType
         for _, type_name in node.fields:
              if type_name == 'i32':
                  field_types.append(ir.IntType(32))
@@ -40,6 +45,8 @@ class CodeGen:
         self.struct_fields[node.name] = {name: i for i, (name, _) in enumerate(node.fields)}
 
     def visit_EnumDef(self, node):
+        if node.generics: return
+        
         # Representation: { i32 tag, [MaxPayloadSize x i8] data }
         # 1. Determine max payload size
         max_size = 0
@@ -53,12 +60,33 @@ class CodeGen:
             variant_tags[vname] = i
             if payloads:
                 # Assume single payload for now
-                if payloads[0] == 'i32':
+                ptype = payloads[0]
+                if ptype == 'i32':
                     max_size = max(max_size, 4)
                     variant_payload_types[vname] = ir.IntType(32)
-                else:
-                    # Support Structs later?
+                elif ptype == 'string':
+                    max_size = max(max_size, 8) # Pointer size
+                    variant_payload_types[vname] = ir.IntType(8).as_pointer()
+                elif ptype in self.struct_types:
+                    # Struct payload - assume pointer or by value?
+                    # For simplicity, treat as by-value, but size might be large.
+                    # Or maybe we store structs as pointers in enums?
+                    # Let's say we support stored structs.
+                    # Need size of struct.
+                    # self.struct_types[ptype] is ir.LiteralStructType.
+                    # We can't easily get size in bytes from llvmlite without target data layout.
+                    # Hack: assume large defaults or skip for now?
+                    # Let's Skip arbitrary structs for now to avoid complexity, or assume 64 bytes?
                     pass
+                elif ptype.endswith('*') or ptype.startswith('['):
+                     # Pointers/Arrays
+                     max_size = max(max_size, 8)
+                     # Need actual type
+                     pass
+                else: 
+                     # Try generic fallback
+                     max_size = max(max_size, 8)
+                     variant_payload_types[vname] = ir.IntType(32) # Placeholder? Dangerous
             else:
                  variant_payload_types[vname] = None
         
@@ -72,8 +100,21 @@ class CodeGen:
         self.enum_definitions[node.name] = (enum_ty, max_size)
 
     def generate(self, ast):
+        # Pass 1: Types (Structs, Enums)
         for node in ast:
-            self.visit(node)
+            if isinstance(node, (StructDef, EnumDef)):
+                self.visit(node)
+        
+        # Pass 2: Function Headers
+        for node in ast:
+            if isinstance(node, FunctionDef):
+                self._declare_function(node)
+                
+        # Pass 3: Bodies
+        for node in ast:
+            if not isinstance(node, (StructDef, EnumDef)):
+                self.visit(node)
+                
         return str(self.module)
 
     def visit(self, node):
@@ -244,6 +285,8 @@ class CodeGen:
         # Determine type
         if node.type_name == "i32":
             llvm_type = ir.IntType(32)
+        elif node.type_name == "string":
+             llvm_type = ir.IntType(8).as_pointer()
         elif node.type_name in self.struct_types:
             llvm_type = self.struct_types[node.type_name]
         elif node.type_name in self.enum_definitions:
@@ -263,6 +306,10 @@ class CodeGen:
 
         # Evaluate initializer
         init_val = self.visit(node.initializer)
+        
+        # Auto-cast for string (array ptr -> i8*)
+        if node.type_name == "string" and init_val.type != llvm_type:
+             init_val = self.builder.bitcast(init_val, llvm_type)
         
         # Alloca
         ptr = self.builder.alloca(llvm_type, name=node.name)
@@ -512,19 +559,61 @@ class CodeGen:
                      return enum_val
 
         elif node.callee in self.struct_types:
-             # Struct Instantiation
-             struct_ty = self.struct_types[node.callee]
-             # Create a stack allocation for the struct (or just a constant value?)
-             # To make it mutable/addressable, better to alloca, store fields, and load.
-             # Wait, generate() returns a Value.
-             # Let's create an undefined struct value and insert values.
+            # Struct Instantiation
+            struct_ty = self.struct_types[node.callee]
+            struct_val = ir.Constant(struct_ty, ir.Undefined)
+            
+            for i, arg in enumerate(node.args):
+                arg_val = self.visit(arg)
+                struct_val = self.builder.insert_value(struct_val, arg_val, i)
+            return struct_val
+
+        elif '::' in node.callee:
+             # Enum Variant Construction
+             parts = node.callee.rsplit('::', 1)
+             enum_name = parts[0]
+             variant_name = parts[1]
              
-             struct_val = ir.Constant(struct_ty, ir.Undefined)
-             for i, arg in enumerate(node.args):
-                 val = self.visit(arg)
-                 struct_val = self.builder.insert_value(struct_val, val, i)
-                 
-             return struct_val
+             if enum_name in self.enum_definitions:
+                  enum_ty, max_size = self.enum_definitions[enum_name]
+                  tag_id = self.enum_types[enum_name][variant_name]
+                  
+                  # { i32 tag, [Size x i8] data }
+                  expr_val = ir.Constant(enum_ty, ir.Undefined)
+                  
+                  # Set Tag
+                  expr_val = self.builder.insert_value(expr_val, ir.Constant(ir.IntType(32), tag_id), 0)
+                  
+                  # Set Payload if exists
+                  if node.args:
+                       # Handle single payload for now
+                       payload_val = self.visit(node.args[0])
+                       
+                       # We need to store payload into the byte array...
+                       # Since we can't easily insert value into [N x i8], we need bitcast via alloca.
+                       
+                       # Alloca Enum
+                       ptr = self.builder.alloca(enum_ty)
+                       self.builder.store(expr_val, ptr)
+                       
+                       # Get data ptr
+                       zero = ir.Constant(ir.IntType(32), 0)
+                       one = ir.Constant(ir.IntType(32), 1)
+                       data_ptr = self.builder.gep(ptr, [zero, one])
+                       
+                       # Bitcast data_ptr to payload*
+                       payload_ptr_ty = payload_val.type.as_pointer()
+                       cast_ptr = self.builder.bitcast(data_ptr, payload_ptr_ty)
+                       
+                       # Store payload
+                       self.builder.store(payload_val, cast_ptr)
+                       
+                       # Load back
+                       return self.builder.load(ptr)
+                  else:
+                       return expr_val
+             else:
+                  raise Exception(f"Unknown enum: {enum_name}")
              
         elif node.callee == "gpu::global_id":
              return ir.Constant(ir.IntType(32), 0)
@@ -620,26 +709,93 @@ class CodeGen:
         self.builder.position_at_end(merge_bb)
         return ir.Constant(ir.IntType(32), 0) # Void
 
-    def visit_FunctionDef(self, node):
-        func_ty = ir.FunctionType(ir.VoidType(), [])
-        func = ir.Function(self.module, func_ty, name=node.name)
+    def visit_ReturnStmt(self, node):
+        if node.value:
+            val = self.visit(node.value)
+            self.builder.ret(val)
+        else:
+            self.builder.ret_void()
+
+    def _declare_function(self, node):
+        if node.generics: return
+
+        # Determine function type
+        arg_types = []
+        for _, ptype in node.params:
+            if ptype == 'i32':
+                arg_types.append(ir.IntType(32))
+            elif ptype == 'string':
+                arg_types.append(ir.IntType(8).as_pointer())
+            elif ptype in self.struct_types:
+                arg_types.append(self.struct_types[ptype])
+            elif ptype in self.enum_definitions:
+                ety, _ = self.enum_definitions[ptype]
+                arg_types.append(ety)
+            elif ptype.startswith('['):
+                 content = ptype[1:-1]
+                 elem_str, size_str = content.split(':')
+                 if elem_str == 'i32':
+                      arg_types.append(ir.ArrayType(ir.IntType(32), int(size_str)))
+                 else:
+                      raise Exception("Unsupported array arg")
+            else:
+                 raise Exception(f"Unknown arg type: {ptype}")
+
+        ret_type = ir.VoidType()
+        if node.return_type != 'void':
+            if node.return_type == 'i32':
+                ret_type = ir.IntType(32)
+            elif node.return_type == 'string':
+                 ret_type = ir.IntType(8).as_pointer()
+            elif node.return_type in self.struct_types:
+                 ret_type = self.struct_types[node.return_type]
+            
+        func_ty = ir.FunctionType(ret_type, arg_types)
         
+        # Check if exists
+        try:
+            func = self.module.get_global(node.name)
+        except KeyError:
+            func = ir.Function(self.module, func_ty, name=node.name)
+            
         if node.is_kernel:
              func.calling_convention = 'spir_kernel'
-             # Add metadata for OpenCL/Vulkan later if needed
-             
+        
+        return func
+
+    def visit_FunctionDef(self, node):
+        if node.generics: return
+        
+        # Function already declared in Pass 2
+        func = self.module.get_global(node.name)
+        
         entry_block = func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry_block)
         
         # Create new scope
         self.scopes.append({})
         
+        # Register arguments in scope
+        for i, (pname, ptype) in enumerate(node.params):
+             arg_val = func.args[i]
+             arg_val.name = pname
+             ptr = self.builder.alloca(arg_val.type, name=pname)
+             self.builder.store(arg_val, ptr)
+             self.scopes[-1][pname] = ptr
+        
         # Process body
         for stmt in node.body:
             self.visit(stmt)
             
-        # Add return void if missing
+        # Add return void/undef if missing
         if not self.builder.block.is_terminated:
-            self.builder.ret_void()
+            if isinstance(func.function_type.return_type, ir.VoidType):
+                self.builder.ret_void()
+            elif isinstance(func.function_type.return_type, ir.IntType):
+                self.builder.ret(ir.Constant(func.function_type.return_type, 0))
+            elif isinstance(func.function_type.return_type, ir.PointerType):
+                 self.builder.ret(ir.Constant(func.function_type.return_type, None)) # Null ptr
+            else:
+                self.builder.unreachable()
             
         self.scopes.pop()

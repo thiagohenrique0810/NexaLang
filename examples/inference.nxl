@@ -1,0 +1,15 @@
+fn main() {
+    # Integer inference
+    let x = 10
+    let y = x + 32
+    print(y)
+    
+    # String inference
+    let msg = "Inference Works!"
+    print(msg)
+    
+    # Array inference
+    let arr = [1, 2, 3]
+    let el = arr[0]
+    print(el)
+}

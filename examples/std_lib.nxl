@@ -1,0 +1,46 @@
+enum Option<T> {
+    Some(T),
+    None
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E)
+}
+
+fn unwrap_or(opt: Option<i32>, default: i32) -> i32 {
+    match opt {
+        Some(val) => val,
+        None => default
+    }
+}
+
+fn main() {
+    print("Testing Standard Library Patterns...")
+    
+    # 1. Option
+    let some = Option::<i32>::Some(42)
+    let none = Option::<i32>::None()
+    
+    let v1 = unwrap_or(some, 0)
+    print(v1) # Should be 42
+    
+    let v2 = unwrap_or(none, 0)
+    print(v2) # Should be 0
+    
+    # 2. Result with multiple generics
+    let ok = Result::<i32, string>::Ok(100)
+    let err = Result::<i32, string>::Err("Error!")
+    
+    match ok {
+        Ok(v) => print(v),
+        Err(e) => print(e)
+    }
+    
+    match err {
+        Ok(v) => print(v),
+        Err(e) => print(e) # Should print Error!
+    }
+    
+    print("Done")
+}

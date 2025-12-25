@@ -72,17 +72,27 @@ class Lexer:
                    tokens.append(Token('EQEQ', '=='))
                    self.pos += 2
                 elif self.pos + 1 < self.length and self.source[self.pos+1] == '>':
-                   tokens.append(Token('ARROW', '=>'))
+                   tokens.append(Token('FAT_ARROW', '=>'))
                    self.pos += 2
                 else:
                    tokens.append(Token('EQ', '='))
                    self.pos += 1
+            elif char == '<':
+                tokens.append(Token('LT', '<'))
+                self.pos += 1
+            elif char == '>':
+                tokens.append(Token('GT', '>'))
+                self.pos += 1
             elif char == '+':
                 tokens.append(Token('PLUS', '+'))
                 self.pos += 1
             elif char == '-':
-                tokens.append(Token('MINUS', '-'))
-                self.pos += 1
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '>':
+                    tokens.append(Token('THIN_ARROW', '->'))
+                    self.pos += 2
+                else:
+                    tokens.append(Token('MINUS', '-'))
+                    self.pos += 1
             elif char == '*':
                 tokens.append(Token('STAR', '*'))
                 self.pos += 1
