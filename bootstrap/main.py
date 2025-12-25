@@ -23,7 +23,16 @@ def main():
     ast = parser.parse()
     # print("AST:", ast)
 
-    # 3. Code Generation
+    # 3. Semantic Analysis
+    from semantic import SemanticAnalyzer
+    analyzer = SemanticAnalyzer()
+    try:
+        analyzer.analyze(ast)
+    except Exception as e:
+        print(f"[SEMANTIC ERROR] {e}")
+        return
+
+    # 4. Code Generation
     codegen = CodeGen()
     llvm_ir = codegen.generate(ast)
 
