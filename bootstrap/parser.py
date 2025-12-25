@@ -29,6 +29,22 @@ class StructDef(ASTNode):
         self.name = name
         self.fields = fields # list of (name, type) tuples
 
+class EnumDef(ASTNode):
+    def __init__(self, name, variants):
+        self.name = name
+        self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
+
+class MatchExpr(ASTNode):
+    def __init__(self, value, cases):
+        self.value = value
+        self.cases = cases # list of CaseArm
+
+class CaseArm(ASTNode):
+    def __init__(self, variant_name, var_name, body):
+        self.variant_name = variant_name # "Ok"
+        self.var_name = var_name         # "val" (bound variable) or None
+        self.body = body
+
 class MemberAccess(ASTNode):
     def __init__(self, object, member):
         self.object = object
@@ -142,6 +158,8 @@ class Parser:
                 nodes.append(self.parse_function(is_kernel=False))
             elif self.peek().type == 'STRUCT':
                 nodes.append(self.parse_struct())
+            elif self.peek().type == 'ENUM':
+                nodes.append(self.parse_enum())
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
@@ -160,6 +178,27 @@ class Parser:
                 self.consume('COMMA')
         self.consume('RBRACE')
         return StructDef(name, fields)
+
+    def parse_enum(self):
+        self.consume('ENUM')
+        name = self.consume('IDENTIFIER').value
+        self.consume('LBRACE')
+        variants = []
+        while self.peek().type != 'RBRACE':
+            variant_name = self.consume('IDENTIFIER').value
+            payloads = []
+            if self.peek().type == 'LPAREN':
+                self.consume('LPAREN')
+                while self.peek().type != 'RPAREN':
+                    payloads.append(self.consume('IDENTIFIER').value) # Type name
+                    if self.peek().type == 'COMMA':
+                        self.consume('COMMA')
+                self.consume('RPAREN')
+            variants.append((variant_name, payloads))
+            if self.peek().type == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RBRACE')
+        return EnumDef(name, variants)
 
     def parse_function(self, is_kernel=False):
         if is_kernel:
@@ -186,6 +225,8 @@ class Parser:
             return self.parse_if()
         elif token.type == 'WHILE':
             return self.parse_while()
+        elif token.type == 'MATCH':
+            return self.parse_match()
         elif token.type == 'IDENTIFIER':
             # Check for assignment: ID = expr
             if self.peek(1).type == 'EQ':
@@ -248,6 +289,36 @@ class Parser:
         self.consume('RETURN')
         value = self.parse_expression()
         return ReturnStmt(value)
+        
+    def parse_match(self):
+        # match expr { Variant(var) => stmt, ... }
+        self.consume('MATCH')
+        value = self.parse_expression()
+        self.consume('LBRACE')
+        cases = []
+        while self.peek().type != 'RBRACE':
+            variant_name = self.consume('IDENTIFIER').value
+            var_name = None
+            if self.peek().type == 'LPAREN':
+                self.consume('LPAREN')
+                var_name = self.consume('IDENTIFIER').value
+                self.consume('RPAREN')
+            
+            self.consume('ARROW')
+            # For now, body is a single statement or expression?
+            # Let's say it's a statement for now to allow return/print.
+            # If we want expression-based match, we need blocks.
+            # Let's call parse_statement().
+            # Wait, if we use braces it might be block?
+            # Basic version: Single statement.
+            body = self.parse_statement()
+            cases.append(CaseArm(variant_name, var_name, body))
+            
+            # Optional comma?
+            if self.peek().type == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RBRACE')
+        return MatchExpr(value, cases)
 
     def parse_if(self):
         self.consume('IF')
@@ -327,15 +398,20 @@ class Parser:
         elif token.type == 'IDENTIFIER':
             # Check for namespace: ID :: ID
             if self.peek(1).type == 'DOUBLE_COLON':
-                 # Namespace call or variable
+                 # Namespace: ID :: ID
+                 # Could be Enum::Variant or Namespace::Func
                  lhs = self.consume('IDENTIFIER').value
                  self.consume('DOUBLE_COLON')
                  rhs = self.consume('IDENTIFIER').value
-                 full_name = f"{lhs}::{rhs}"
                  
+                 # Check if it's a function call (Enum variant constructor)
                  if self.peek().type == 'LPAREN':
+                     # We pass the full name "Enum::Variant" as callee
+                     full_name = f"{lhs}::{rhs}"
                      return self.parse_call_explicit(full_name)
                  else:
+                     # Enum variant without args (if supported) or variable
+                     full_name = f"{lhs}::{rhs}"
                      return VariableExpr(full_name)
                      
             if self.peek(1).type == 'LPAREN':

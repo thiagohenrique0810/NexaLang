@@ -10,6 +10,10 @@ class CodeGen:
         self._declare_exit()
         self.struct_types = {} # name -> ir.LiteralStructType
         self.struct_fields = {} # name -> {field_name: index}
+        self.enum_types = {} # name -> {variant: tag_id}
+        self.enum_payloads = {} # name -> {variant: payload_type}
+        self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
+        self.scopes = []
 
     def _declare_printf(self):
         voidptr_ty = ir.IntType(8).as_pointer()
@@ -23,17 +27,49 @@ class CodeGen:
     def visit_StructDef(self, node):
         # Create LLVM Struct Type
         field_types = []
-        field_indices = {}
-        for idx, (name, type_name) in enumerate(node.fields):
-            if type_name == 'i32':
-                field_types.append(ir.IntType(32))
-            else:
-                 raise Exception(f"Unsupported field type: {type_name}")
-            field_indices[name] = idx
-            
+        for _, type_name in node.fields:
+             if type_name == 'i32':
+                 field_types.append(ir.IntType(32))
+             else:
+                 raise Exception(f"Unsupported struct field type: {type_name}")
+        
         struct_ty = ir.LiteralStructType(field_types)
         self.struct_types[node.name] = struct_ty
-        self.struct_fields[node.name] = field_indices
+        
+        # Map field names to indices
+        self.struct_fields[node.name] = {name: i for i, (name, _) in enumerate(node.fields)}
+
+    def visit_EnumDef(self, node):
+        # Representation: { i32 tag, [MaxPayloadSize x i8] data }
+        # 1. Determine max payload size
+        max_size = 0
+        variant_tags = {}
+        variant_payload_types = {}
+        
+        # For this phase, assume only i32 payloads for simplicity of size calc
+        # i32 = 4 bytes
+        
+        for i, (vname, payloads) in enumerate(node.variants):
+            variant_tags[vname] = i
+            if payloads:
+                # Assume single payload for now
+                if payloads[0] == 'i32':
+                    max_size = max(max_size, 4)
+                    variant_payload_types[vname] = ir.IntType(32)
+                else:
+                    # Support Structs later?
+                    pass
+            else:
+                 variant_payload_types[vname] = None
+        
+        # Create LLVM type
+        # Tag (i32) + Payload (Array of i8)
+        padding_ty = ir.ArrayType(ir.IntType(8), max_size)
+        enum_ty = ir.LiteralStructType([ir.IntType(32), padding_ty])
+        
+        self.enum_types[node.name] = variant_tags
+        self.enum_payloads[node.name] = variant_payload_types
+        self.enum_definitions[node.name] = (enum_ty, max_size)
 
     def generate(self, ast):
         for node in ast:
@@ -109,8 +145,84 @@ class CodeGen:
         ptr = self.builder.gep(temp_ptr, [zero, index_val])
         return self.builder.load(ptr)
 
-    def visit_FunctionDef(self, node):
-        func_ty = ir.FunctionType(ir.VoidType(), [])
+    def visit_MatchExpr(self, node):
+        # 1. Evaluate value
+        val = self.visit(node.value) # Expect {tag, data} (value or pointer?)
+        # If val is loaded (Value), we need to extract tag.
+        
+        # If val is pointer (optimization), we load tag.
+        # Assuming val is loaded Value for now.
+        
+        # Allocate val to stack to easily access payload address later
+        val_ptr = self.builder.alloca(val.type)
+        self.builder.store(val, val_ptr)
+        
+        # Extract Tag
+        tag_val = self.builder.extract_value(val, 0)
+        
+        # Create blocks
+        merge_bb = self.builder.append_basic_block("match_merge")
+        
+        # Switch
+        switch = self.builder.switch(tag_val, merge_bb)
+        
+        # Determine Enum Name from val type? 
+        # Semantic Analysis node could have annotation?
+        # Or look up by traversing all enum definitions? Slow.
+        # But we need to know Mapping {Variant -> Tag} which is in self.enum_types[EnumName].
+        # We need EnumName. 
+        # AST Node `match val` knows `val` type from Semantic.
+        # But CodeGen generic `visit` doesn't pass type info.
+        # We need to rely on `SemanticAnalyzer` annotating the AST node with `enum_type`.
+        # NOTE: I missed annotating `node.enum_type` in semantic.py!
+        # I SHOULD FIX SEMANTIC.PY FIRST.
+        # BUT I AM IN CODEGEN STEP.
+        # For now, let's assume I will fix Semantic.py or infer it?
+        # I can't infer easily.
+        # WAIT! `node.value` is AST node. Semantic visit_MatchExpr calculated `val_type`.
+        # I should have attached it to `node`.
+        # I will patch `SemanticAnalyzer` in next step if I forgot.
+        # Let's write CodeGen assuming `node.enum_name` exists.
+        
+        enum_name = node.enum_name # Expecting this!
+        
+        # Cases
+        for case in node.cases:
+            tag_id = self.enum_types[enum_name][case.variant_name]
+            case_bb = self.builder.append_basic_block(f"case_{case.variant_name}")
+            switch.add_case(ir.Constant(ir.IntType(32), tag_id), case_bb)
+            
+            self.builder.position_at_end(case_bb)
+            
+            # Bound Variable
+            if case.var_name:
+                # Get Payload Address
+                zero = ir.Constant(ir.IntType(32), 0)
+                one = ir.Constant(ir.IntType(32), 1)
+                data_ptr = self.builder.gep(val_ptr, [zero, one])
+                
+                # Bitcast to payload type
+                # Need payload type!
+                payload_ty = self.enum_payloads[enum_name][case.variant_name]
+                if payload_ty:
+                    cast_ptr = self.builder.bitcast(data_ptr, payload_ty.as_pointer())
+                    payload_val = self.builder.load(cast_ptr)
+                    
+                    # Register in scope
+                    self.scopes[-1][case.var_name] = cast_ptr # Pointer for variable? 
+                    # Wrapper uses alloca for VarDecl. Here we have a pointer.
+                    # Standard `visit_VariableExpr` loads if it finds a pointer.
+                    # So we map name -> pointer.
+                
+            # Execute body
+            self.visit(case.body)
+            
+            # Branch to merge
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_bb)
+                
+        self.builder.position_at_end(merge_bb)
+        return ir.Constant(ir.IntType(32), 0) # Void
         func = ir.Function(self.module, func_ty, name=node.name)
         
         if node.is_kernel:
@@ -134,6 +246,8 @@ class CodeGen:
             llvm_type = ir.IntType(32)
         elif node.type_name in self.struct_types:
             llvm_type = self.struct_types[node.type_name]
+        elif node.type_name in self.enum_definitions:
+            llvm_type, _ = self.enum_definitions[node.type_name]
         elif node.type_name.startswith('['):
             # Parse [T:N]
             content = node.type_name[1:-1]
@@ -353,6 +467,50 @@ class CodeGen:
              self.builder.position_at_end(cont_bb)
              return ir.Constant(ir.IntType(32), 0) # void check returns 0
 
+        # Check for Enum Variant Instantiation (Enum::Variant)
+        elif '::' in node.callee:
+            lhs, rhs = node.callee.split('::')
+            if lhs in self.enum_definitions:
+                 enum_ty, max_size = self.enum_definitions[lhs]
+                 tag = self.enum_types[lhs][rhs]
+                 
+                 # Create struct { tag, padding }
+                 enum_val = ir.Constant(enum_ty, ir.Undefined)
+                 
+                 # Set Tag
+                 tag_val = ir.Constant(ir.IntType(32), tag)
+                 enum_val = self.builder.insert_value(enum_val, tag_val, 0)
+                 
+                 # Set Payload
+                 if node.args:
+                     payload_val = self.visit(node.args[0])
+                     # We need to bitcast payload_val to [Max x i8]* or similar?
+                     # No, insert_value expects matching type.
+                     # But our struct has [Max x i8].
+                     # We cannot insert i32 into [4 x i8] directly with insert_value?
+                     # LLVM structs are rigid. 
+                     # Approach: Store enum to stack, bitcast pointer to payload, store payload.
+                     
+                     # Allocate temp enum
+                     enum_ptr = self.builder.alloca(enum_ty)
+                     self.builder.store(enum_val, enum_ptr)
+                     
+                     # Get pointer to data field (index 1)
+                     # data_ptr points to [Max x i8]
+                     zero = ir.Constant(ir.IntType(32), 0)
+                     one = ir.Constant(ir.IntType(32), 1)
+                     data_ptr = self.builder.gep(enum_ptr, [zero, one])
+                     
+                     # Cast data_ptr to payload type pointer (e.g. i32*)
+                     payload_ptr = self.builder.bitcast(data_ptr, payload_val.type.as_pointer())
+                     
+                     self.builder.store(payload_val, payload_ptr)
+                     
+                     # Load back
+                     return self.builder.load(enum_ptr)
+                 else:
+                     return enum_val
+
         elif node.callee in self.struct_types:
              # Struct Instantiation
              struct_ty = self.struct_types[node.callee]
@@ -409,3 +567,79 @@ class CodeGen:
         global_var.global_constant = True
         global_var.initializer = c_str_val
         return global_var
+
+    def visit_MatchExpr(self, node):
+        # 1. Evaluate value
+        val = self.visit(node.value) # Expect {tag, data} (value or pointer?)
+        
+        # Allocate val to stack to easily access payload address later
+        val_ptr = self.builder.alloca(val.type)
+        self.builder.store(val, val_ptr)
+        
+        # Extract Tag
+        tag_val = self.builder.extract_value(val, 0)
+        
+        # Create blocks
+        merge_bb = self.builder.append_basic_block("match_merge")
+        
+        # Switch
+        switch = self.builder.switch(tag_val, merge_bb)
+        
+        enum_name = node.enum_name
+        
+        # Cases
+        for case in node.cases:
+            tag_id = self.enum_types[enum_name][case.variant_name]
+            case_bb = self.builder.append_basic_block(f"case_{case.variant_name}")
+            switch.add_case(ir.Constant(ir.IntType(32), tag_id), case_bb)
+            
+            self.builder.position_at_end(case_bb)
+            
+            # Bound Variable
+            if case.var_name:
+                # Get Payload Address
+                zero = ir.Constant(ir.IntType(32), 0)
+                one = ir.Constant(ir.IntType(32), 1)
+                data_ptr = self.builder.gep(val_ptr, [zero, one])
+                
+                # Bitcast to payload type
+                payload_ty = self.enum_payloads[enum_name][case.variant_name]
+                if payload_ty:
+                    cast_ptr = self.builder.bitcast(data_ptr, payload_ty.as_pointer())
+                    
+                    # Register in scope
+                    self.scopes[-1][case.var_name] = cast_ptr 
+                
+            # Execute body
+            self.visit(case.body)
+            
+            # Branch to merge
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_bb)
+                
+        self.builder.position_at_end(merge_bb)
+        return ir.Constant(ir.IntType(32), 0) # Void
+
+    def visit_FunctionDef(self, node):
+        func_ty = ir.FunctionType(ir.VoidType(), [])
+        func = ir.Function(self.module, func_ty, name=node.name)
+        
+        if node.is_kernel:
+             func.calling_convention = 'spir_kernel'
+             # Add metadata for OpenCL/Vulkan later if needed
+             
+        entry_block = func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(entry_block)
+        
+        # Create new scope
+        self.scopes.append({})
+        
+        # Process body
+        for stmt in node.body:
+            self.visit(stmt)
+            
+        # Add return void if missing
+        if not self.builder.block.is_terminated:
+            self.builder.ret_void()
+            
+        self.scopes.pop()

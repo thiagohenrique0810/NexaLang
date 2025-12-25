@@ -1,0 +1,24 @@
+enum Result {
+    Ok(i32),
+    Err(i32)
+}
+
+fn main() {
+    print("Testing Enums...")
+    
+    let res: Result = Result::Ok(42)
+    
+    match res {
+        Ok(val) => print(val),
+        Err(code) => panic("Should be Ok")
+    }
+    
+    let err: Result = Result::Err(500)
+    
+    match err {
+        Ok(val) => panic("Should be Err"),
+        Err(code) => print(code)
+    }
+    
+    print("Done.")
+}

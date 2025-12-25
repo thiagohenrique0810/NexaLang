@@ -71,6 +71,9 @@ class Lexer:
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
                    tokens.append(Token('EQEQ', '=='))
                    self.pos += 2
+                elif self.pos + 1 < self.length and self.source[self.pos+1] == '>':
+                   tokens.append(Token('ARROW', '=>'))
+                   self.pos += 2
                 else:
                    tokens.append(Token('EQ', '='))
                    self.pos += 1
@@ -117,6 +120,8 @@ class Lexer:
                      tokens.append(Token('KERNEL', value))
                 elif value == 'struct':
                      tokens.append(Token('STRUCT', value))
+                elif value == 'enum':
+                     tokens.append(Token('ENUM', value))
                 elif value == 'let':
                     tokens.append(Token('LET', value))
                 elif value == 'return':
@@ -127,6 +132,8 @@ class Lexer:
                     tokens.append(Token('ELSE', value))
                 elif value == 'while':
                     tokens.append(Token('WHILE', value))
+                elif value == 'match':
+                    tokens.append(Token('MATCH', value))
                 else:
                     tokens.append(Token('IDENTIFIER', value))
             else:
