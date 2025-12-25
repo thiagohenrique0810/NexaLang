@@ -7,7 +7,7 @@ class SemanticAnalyzer:
 
     def analyze(self, ast):
         # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id'])
+        self.functions = set(['print', 'gpu::global_id', 'panic', 'assert'])
         self.structs = {} # name -> {field: type}
         
         for node in ast:
@@ -171,6 +171,19 @@ class SemanticAnalyzer:
             if node.callee == 'print':
                 for arg in node.args:
                     self.visit(arg)
+                return 'void'
+            elif node.callee == 'panic':
+                if len(node.args) != 1:
+                    raise Exception("Semantic Error: panic() expects 1 argument (message)")
+                self.visit(node.args[0])
+                return 'void'
+            elif node.callee == 'assert':
+                if len(node.args) != 2:
+                    raise Exception("Semantic Error: assert() expects 2 arguments (condition, message)")
+                cond_type = self.visit(node.args[0])
+                # We don't have explicit bool type in semantic yet? visit_BinaryExpr returns 'i32'.
+                # Let's assume i32 for now (0=false, !0=true)
+                self.visit(node.args[1])
                 return 'void'
             elif node.callee == 'gpu::global_id':
                 return 'i32'

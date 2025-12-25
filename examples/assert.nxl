@@ -1,0 +1,9 @@
+fn main() {
+    print("Testing Assert...")
+    assert(1 == 1, "Math is broken")
+    print("First assert passed")
+    
+    let x: i32 = 10
+    assert(x == 5, "x should be 5")
+    print("Should not be reached")
+}

@@ -5,7 +5,9 @@ class CodeGen:
         self.module = ir.Module(name="nexalang_module")
         self.builder = None
         self.printf = None
+        self.exit_func = None
         self._declare_printf()
+        self._declare_exit()
         self.struct_types = {} # name -> ir.LiteralStructType
         self.struct_fields = {} # name -> {field_name: index}
 
@@ -13,6 +15,10 @@ class CodeGen:
         voidptr_ty = ir.IntType(8).as_pointer()
         printf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
+
+    def _declare_exit(self):
+        exit_ty = ir.FunctionType(ir.VoidType(), [ir.IntType(32)])
+        self.exit_func = ir.Function(self.module, exit_ty, name="exit")
 
     def visit_StructDef(self, node):
         # Create LLVM Struct Type
@@ -255,23 +261,98 @@ class CodeGen:
 
     def visit_CallExpr(self, node):
         if node.callee == "print":
-            arg = self.visit(node.args[0])
+            # Generate printf
+            # Check arg type
+            val = self.visit(node.args[0])
             
-            # Check type of arg to choose format string
-            if isinstance(arg.type, ir.IntType):
-                fmt_str = self.visit_StringLiteral(ir.Constant(ir.ArrayType(ir.IntType(8), 4), bytearray("%d\n\0", "utf8")), name="fmt_d")
-            else:
-                fmt_str = self.visit_StringLiteral(ir.Constant(ir.ArrayType(ir.IntType(8), 4), bytearray("%s\n\0", "utf8")), name="fmt_s")
-                
             voidptr_ty = ir.IntType(8).as_pointer()
+            
+            if val.type == ir.IntType(32):
+                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+            else:
+                 # Assume string
+                 fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
             
             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
             
-            if isinstance(arg.type, ir.IntType):
-                self.builder.call(self.printf, [fmt_arg, arg])
+            if val.type == ir.IntType(32):
+                self.builder.call(self.printf, [fmt_arg, val])
             else:
-                val_arg = self.builder.bitcast(arg, voidptr_ty)
+                val_arg = self.builder.bitcast(val, voidptr_ty)
                 self.builder.call(self.printf, [fmt_arg, val_arg])
+        
+        elif node.callee == 'panic':
+             # Print message
+             msg_val = self.visit(node.args[0]) # Assuming string literal
+             
+             # Hardcoded "PANIC: " prefix
+             prefix = self.visit_StringLiteral(None, name="panic_prefix", value_override="PANIC: ")
+             
+             voidptr_ty = ir.IntType(8).as_pointer()
+             fmt_prefix = self.builder.bitcast(prefix, voidptr_ty)
+             
+             # Print "PANIC: "
+             # We need a format string for pure string printing? Or just printf(str)
+             # printf(str) works if str contains no %
+             # Let's verify visit_StringLiteral returns a [N x i8]*
+             
+             # Reuse helper for printing string:
+             fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
+             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
+             
+             prefix_arg = self.builder.bitcast(prefix, voidptr_ty)
+             self.builder.call(self.printf, [fmt_arg, prefix_arg])
+             
+             msg_arg = self.builder.bitcast(msg_val, voidptr_ty)
+             self.builder.call(self.printf, [fmt_arg, msg_arg])
+             
+             # Call exit(1)
+             one = ir.Constant(ir.IntType(32), 1)
+             self.builder.call(self.exit_func, [one])
+             
+             # Unreachable instruction to terminate block
+             self.builder.unreachable()
+        
+        elif node.callee == 'assert':
+             cond_val = self.visit(node.args[0])
+             msg_val = self.visit(node.args[1]) # Should be string
+             
+             # Compare cond != 0
+             zero = ir.Constant(ir.IntType(32), 0)
+             cmp = self.builder.icmp_signed('!=', cond_val, zero, name="assert_cond")
+             
+             # Create blocks
+             fail_bb = self.builder.append_basic_block(name="assert_fail")
+             cont_bb = self.builder.append_basic_block(name="assert_cont")
+             
+             self.builder.cbranch(cmp, cont_bb, fail_bb)
+             
+             # Fail Block
+             self.builder.position_at_end(fail_bb)
+             
+             # Reuse panic logic? Or just manually do it to avoid recursion issues if helper
+             # Let's manually print assertion failed
+             
+             # Print "ASSERTION FAILED: "
+             voidptr_ty = ir.IntType(8).as_pointer()
+             fails_str = self.visit_StringLiteral(None, name="assert_prefix", value_override="ASSERTION FAILED: ")
+             fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
+             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
+             fails_arg = self.builder.bitcast(fails_str, voidptr_ty)
+             
+             self.builder.call(self.printf, [fmt_arg, fails_arg])
+             
+             msg_arg = self.builder.bitcast(msg_val, voidptr_ty)
+             self.builder.call(self.printf, [fmt_arg, msg_arg])
+             
+             one = ir.Constant(ir.IntType(32), 1)
+             self.builder.call(self.exit_func, [one])
+             self.builder.unreachable()
+             
+             # Continue Block
+             self.builder.position_at_end(cont_bb)
+             return ir.Constant(ir.IntType(32), 0) # void check returns 0
+
         elif node.callee in self.struct_types:
              # Struct Instantiation
              struct_ty = self.struct_types[node.callee]
@@ -298,16 +379,32 @@ class CodeGen:
              else:
                  raise Exception(f"Unknown function call: {node.callee}")
 
-    def visit_StringLiteral(self, node, name="str"):
+    def visit_StringLiteral(self, node, name="str", value_override=None):
         # Create a global constant string
-        if isinstance(node, ir.Constant):
-             # Internal use for formatting string
-             c_str_val = node
+        if value_override:
+            value = value_override
+            if not value.endswith('\0'): 
+                value += '\0'
         else:
-            val = node.value + "\0" # Null terminator
-            c_str_val = ir.Constant(ir.ArrayType(ir.IntType(8), len(val)), bytearray(val.encode("utf8")))
+            if isinstance(node, ir.Constant):
+                # Fallback if internal code passes constants (which I removed, but just in case)
+                # But really execution shouldn't reach here if callers are fixed.
+                # Let's just create a unique name based on content if possible
+                value = node.constant.decode('utf-8')
+            else:
+                value = node.value + '\0'
+            
+        # Optimization: Deduplicate strings?
+        # For now, just generate unique name if not provided or collision risk
+        # But instructions verify unique name usage
         
-        global_var = ir.GlobalVariable(self.module, c_str_val.type, name=self.module.get_unique_name(name))
+        # Use simple hashing or counter?
+        # Helper: self.module.get_unique_name(name) is standard usage
+        
+        c_str_val = ir.Constant(ir.ArrayType(ir.IntType(8), len(value)), bytearray(value.encode("utf8")))
+        
+        unique_name = self.module.get_unique_name(name)
+        global_var = ir.GlobalVariable(self.module, c_str_val.type, name=unique_name)
         global_var.linkage = 'internal'
         global_var.global_constant = True
         global_var.initializer = c_str_val
