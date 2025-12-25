@@ -4,6 +4,13 @@ class SemanticAnalyzer:
         self.current_function = None
 
     def analyze(self, ast):
+        # 1. Collect function names
+        self.functions = set(['print', 'gpu::global_id'])
+        for node in ast:
+            if hasattr(node, 'name'):
+                self.functions.add(node.name)
+
+        # 2. Analyze bodies
         for node in ast:
             self.visit(node)
 
@@ -57,8 +64,8 @@ class SemanticAnalyzer:
         if not var_info:
             raise Exception(f"Semantic Error: Assignment to undefined variable '{node.name}'")
         
-        if var_info['moved']:
-             raise Exception(f"Ownership Error: Cannot assign to moved variable '{node.name}'")
+        # NOTE: Assigning to a moved variable is valid (re-initialization).
+        # We just need to ensure the variable is considered 'alive' (not moved) after this.
             
         # 2. Analyze value
         val_type = self.visit(node.value)
@@ -66,6 +73,9 @@ class SemanticAnalyzer:
         # 3. Check type mismatch
         if var_info['type'] != val_type:
             raise Exception(f"Type Error: Cannot assign type '{val_type}' to variable '{node.name}' of type '{var_info['type']}'")
+            
+        # Revive variable
+        var_info['moved'] = False
 
     def visit_BinaryExpr(self, node):
         left_type = self.visit(node.left)
@@ -97,11 +107,19 @@ class SemanticAnalyzer:
         return var_info['type']
 
     def visit_CallExpr(self, node):
-        if node.callee == 'print':
-            # print allows any type for now
-            for arg in node.args:
-                self.visit(arg)
-            return 'void'
+        if node.callee in self.functions:
+            if node.callee == 'print':
+                for arg in node.args:
+                    self.visit(arg)
+                return 'void'
+            elif node.callee == 'gpu::global_id':
+                return 'i32'
+            else:
+                 # User function call
+                 # Ideally check args match signature, but for now just check existence
+                 for arg in node.args:
+                     self.visit(arg)
+                 return 'void' # Assuming void return for now
         else:
              raise Exception(f"Semantic Error: Unknown function '{node.callee}'")
 

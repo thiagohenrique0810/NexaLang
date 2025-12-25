@@ -7,9 +7,10 @@ class Assignment(ASTNode):
         self.value = value
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, body):
+    def __init__(self, name, body, is_kernel=False):
         self.name = name
         self.body = body
+        self.is_kernel = is_kernel
 
 class CallExpr(ASTNode):
     def __init__(self, callee, args):
@@ -110,13 +111,17 @@ class Parser:
     def parse(self):
         functions = []
         while self.pos < len(self.tokens):
-            if self.tokens[self.pos].type == 'FN':
-                functions.append(self.parse_function())
+            if self.peek().type == 'KERNEL':
+                functions.append(self.parse_function(is_kernel=True))
+            elif self.peek().type == 'FN':
+                functions.append(self.parse_function(is_kernel=False))
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return functions
 
-    def parse_function(self):
+    def parse_function(self, is_kernel=False):
+        if is_kernel:
+            self.consume('KERNEL')
         self.consume('FN')
         name = self.consume('IDENTIFIER').value
         self.consume('LPAREN')
@@ -126,7 +131,7 @@ class Parser:
         while self.pos < len(self.tokens) and self.tokens[self.pos].type != 'RBRACE':
             body.append(self.parse_statement())
         self.consume('RBRACE')
-        return FunctionDef(name, body)
+        return FunctionDef(name, body, is_kernel=is_kernel)
 
 
     def parse_statement(self):
@@ -243,6 +248,19 @@ class Parser:
             self.consume('STRING')
             return StringLiteral(token.value)
         elif token.type == 'IDENTIFIER':
+            # Check for namespace: ID :: ID
+            if self.peek(1).type == 'DOUBLE_COLON':
+                 # Namespace call or variable
+                 lhs = self.consume('IDENTIFIER').value
+                 self.consume('DOUBLE_COLON')
+                 rhs = self.consume('IDENTIFIER').value
+                 full_name = f"{lhs}::{rhs}"
+                 
+                 if self.peek().type == 'LPAREN':
+                     return self.parse_call_explicit(full_name)
+                 else:
+                     return VariableExpr(full_name)
+                     
             if self.peek(1).type == 'LPAREN':
                 return self.parse_call()
             else:
@@ -258,6 +276,9 @@ class Parser:
 
     def parse_call(self):
         name = self.consume('IDENTIFIER').value
+        return self.parse_call_explicit(name)
+
+    def parse_call_explicit(self, name):
         self.consume('LPAREN')
         args = []
         if self.peek().type != 'RPAREN':

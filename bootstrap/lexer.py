@@ -19,11 +19,25 @@ class Lexer:
         while self.pos < self.length:
             char = self.source[self.pos]
             
+            # Skip whitespace
             if char.isspace():
                 self.pos += 1
                 continue
+            # Skip comments
+            elif char == '#':
+                while self.pos < self.length and self.source[self.pos] != '\n':
+                    self.pos += 1
+                # If the comment ends with a newline, consume it too
+                if self.pos < self.length and self.source[self.pos] == '\n':
+                    self.pos += 1
+                continue
             
             # Punctuation
+            if char == ':' and self.pos + 1 < self.length and self.source[self.pos+1] == ':':
+                tokens.append(Token('DOUBLE_COLON', '::'))
+                self.pos += 2
+                continue
+
             if char == '(':
                 tokens.append(Token('LPAREN', '('))
                 self.pos += 1
@@ -87,6 +101,8 @@ class Lexer:
                 value = self.source[start:self.pos]
                 if value == 'fn':
                     tokens.append(Token('FN', value))
+                elif value == 'kernel':
+                     tokens.append(Token('KERNEL', value))
                 elif value == 'let':
                     tokens.append(Token('LET', value))
                 elif value == 'return':

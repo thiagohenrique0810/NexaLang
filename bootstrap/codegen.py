@@ -28,6 +28,10 @@ class CodeGen:
     def visit_FunctionDef(self, node):
         func_ty = ir.FunctionType(ir.VoidType(), [])
         func = ir.Function(self.module, func_ty, name=node.name)
+        
+        if node.is_kernel:
+             func.calling_convention = 'spir_kernel'
+        
         block = func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
         
@@ -177,8 +181,19 @@ class CodeGen:
             else:
                 val_arg = self.builder.bitcast(arg, voidptr_ty)
                 self.builder.call(self.printf, [fmt_arg, val_arg])
+        elif node.callee == "gpu::global_id":
+             # Mock implementation of global_id
+             # In real SPIR-V, this reads a built-in variable.
+             # Here we return a dummy constant 0 for verification.
+             return ir.Constant(ir.IntType(32), 0)
         else:
-             raise Exception(f"Unknown function call: {node.callee}")
+             # Try to find function in module
+             if node.callee in self.module.globals:
+                 callee_func = self.module.globals[node.callee]
+                 processed_args = [self.visit(arg) for arg in node.args]
+                 return self.builder.call(callee_func, processed_args)
+             else:
+                 raise Exception(f"Unknown function call: {node.callee}")
 
     def visit_StringLiteral(self, node, name="str"):
         # Create a global constant string
