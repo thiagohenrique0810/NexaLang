@@ -31,28 +31,110 @@ class CodeGen:
         block = func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
         
+        # Scope dictionary: variable_name -> pointer
+        self.scopes = [{}]
+        
         for stmt in node.body:
             self.visit(stmt)
             
         self.builder.ret_void()
 
+    def visit_VarDecl(self, node):
+        # Determine type
+        if node.type_name == "i32":
+            llvm_type = ir.IntType(32)
+        else:
+            raise Exception(f"Unknown type: {node.type_name}")
+
+        # Evaluate initializer
+        init_val = self.visit(node.initializer)
+        
+        # Alloca
+        ptr = self.builder.alloca(llvm_type, name=node.name)
+        self.builder.store(init_val, ptr)
+        
+        # Store in scope
+        self.scopes[-1][node.name] = ptr
+
+    def visit_BinaryExpr(self, node):
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        
+        # Mapping token types to operations
+        if node.op == 'PLUS':
+            return self.builder.add(left, right, name="addtmp")
+        elif node.op == 'MINUS':
+            return self.builder.sub(left, right, name="subtmp")
+        elif node.op == 'STAR':
+            return self.builder.mul(left, right, name="multmp")
+        elif node.op == 'SLASH':
+            return self.builder.sdiv(left, right, name="divtmp")
+        elif node.op == 'EQEQ':
+            return self.builder.icmp_signed('==', left, right, name="eqtmp")
+        else:
+            raise Exception(f"Unknown operator: {node.op}")
+
+    def visit_IfStmt(self, node):
+        cond_val = self.visit(node.condition)
+        
+        # Ensure condition is a boolean (i1)
+        # If it's not (e.g. i32), compare it to 0
+        if cond_val.type != ir.IntType(1):
+             cond_val = self.builder.icmp_signed('!=', cond_val, ir.Constant(cond_val.type, 0), name="ifcond")
+        
+        then_bb = self.builder.append_basic_block(name="then")
+        else_bb = self.builder.append_basic_block(name="else")
+        merge_bb = self.builder.append_basic_block(name="ifcont")
+        
+        self.builder.cbranch(cond_val, then_bb, else_bb)
+        
+        # Generate 'then' block
+        self.builder.position_at_end(then_bb)
+        for stmt in node.then_branch:
+            self.visit(stmt)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(merge_bb)
+            
+        # Generate 'else' block
+        self.builder.position_at_end(else_bb)
+        if node.else_branch:
+            for stmt in node.else_branch:
+                self.visit(stmt)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(merge_bb)
+            
+        # Continue
+        self.builder.position_at_end(merge_bb)
+
+    def visit_IntegerLiteral(self, node):
+        return ir.Constant(ir.IntType(32), node.value)
+
+    def visit_VariableExpr(self, node):
+        # Lookup in scopes (LIFO)
+        for scope in reversed(self.scopes):
+            if node.name in scope:
+                return self.builder.load(scope[node.name], name=node.name)
+        raise Exception(f"Undefined variable: {node.name}")
+
     def visit_CallExpr(self, node):
         if node.callee == "print":
-            # Handle print specially using printf
             arg = self.visit(node.args[0])
-            fmt_str = self.visit_StringLiteral(ir.Constant(ir.ArrayType(ir.IntType(8), 4), bytearray("%s\n\0", "utf8")), name="fmt")
             
-            # Create global constant for string if not already
-            # Ideally StringLiteral visit should return a pointer to the global string
-            
-            # Simple hack for print(string_literal)
+            # Check type of arg to choose format string
+            if isinstance(arg.type, ir.IntType):
+                fmt_str = self.visit_StringLiteral(ir.Constant(ir.ArrayType(ir.IntType(8), 4), bytearray("%d\n\0", "utf8")), name="fmt_d")
+            else:
+                fmt_str = self.visit_StringLiteral(ir.Constant(ir.ArrayType(ir.IntType(8), 4), bytearray("%s\n\0", "utf8")), name="fmt_s")
+                
             voidptr_ty = ir.IntType(8).as_pointer()
             
-            # Bitcast to i8*
             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
-            val_arg = self.builder.bitcast(arg, voidptr_ty)
             
-            self.builder.call(self.printf, [fmt_arg, val_arg])
+            if isinstance(arg.type, ir.IntType):
+                self.builder.call(self.printf, [fmt_arg, arg])
+            else:
+                val_arg = self.builder.bitcast(arg, voidptr_ty)
+                self.builder.call(self.printf, [fmt_arg, val_arg])
         else:
              raise Exception(f"Unknown function call: {node.callee}")
 
