@@ -125,4 +125,49 @@ This repo includes a local VSCode extension under `vscode-nexalang/` for `.nxl` 
 
 ---
 
+## 🧬 Self-hosting (Stage 1)
+
+The first self-hosting milestone is making it possible to write compiler tooling in NexaLang that can **read real source files**.
+
+Bootstrap now provides:
+- `fs::read_file(path: string) -> Buffer<u8>`
+
+Try:
+
+```bash
+python nx.py run selfhost/stage1_read_file.nxl
+```
+
+---
+
+## 🧬 Self-hosting (Stage 2)
+
+A minimal lexer written in NexaLang (currently just counts token categories):
+
+```bash
+python nx.py run selfhost/stage2_lexer.nxl
+```
+
+---
+
+## 🧬 Self-hosting (Stage 3)
+
+Token stream milestone: a lexer written in NexaLang that produces `Token { kind, start, len }` records.
+
+```bash
+python nx.py run selfhost/stage3_tokens.nxl
+```
+
+---
+
+## 🧬 Self-hosting (Stage 4)
+
+Parser milestone (subset): parse `fn` blocks and count statements (`let` / `return` / basic `if`/`while` blocks).
+
+```bash
+python nx.py run selfhost/stage4_parser.nxl
+```
+
+---
+
 *Designed by **Thiago Henrique**.*

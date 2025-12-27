@@ -1,0 +1,329 @@
+struct Token {
+    kind: i32,   # 0=eof, 1=ident, 2=number, 3=string, 4=char, 5=op
+    start: i32,
+    len: i32
+}
+
+fn is_alpha(c: u8) -> bool {
+    let x: i32 = cast::<i32>(c)
+    if (x > 64) { if (x < 91) { return true } }     # A-Z
+    if (x > 96) { if (x < 123) { return true } }    # a-z
+    if (x == 95) { return true }                    # _
+    return false
+}
+
+fn is_digit(c: u8) -> bool {
+    let x: i32 = cast::<i32>(c)
+    if (x > 47) { if (x < 58) { return true } }
+    return false
+}
+
+fn is_space(c: u8) -> bool {
+    let x: i32 = cast::<i32>(c)
+    if (x == 32) { return true }  # space
+    if (x == 9) { return true }   # \t
+    if (x == 10) { return true }  # \n
+    if (x == 13) { return true }  # \r
+    return false
+}
+
+fn push_token(tokens: *Token, count: *i32, kind: i32, start: i32, len: i32) {
+    let idx: i32 = *count;
+    tokens[idx] = Token(kind, start, len);
+    *count = idx + 1;
+}
+
+fn lex(p: *u8, n: i32, tokens: *Token, count: *i32) {
+    let i: i32 = 0
+
+    while (i < n) {
+        let c: u8 = p[i]
+        if (is_space(c)) {
+            i = i + 1
+        } else {
+            # comment: # ... \n
+            if (cast::<i32>(c) == 35) {
+                let j: i32 = i + 1
+                while (j < n) {
+                    if (cast::<i32>(p[j]) == 10) { i = j; j = n } else { j = j + 1 }
+                }
+            } else {
+                # string: "..."
+                if (cast::<i32>(c) == 34) {
+                    let start: i32 = i
+                    let j: i32 = i + 1
+                    while (j < n) {
+                        let cj: i32 = cast::<i32>(p[j])
+                        if (cj == 34) { j = j + 1; i = j; j = n }
+                        else {
+                            if (cj == 92) { if (j + 1 < n) { j = j + 2 } else { j = j + 1 } }
+                            else { j = j + 1 }
+                        }
+                    }
+                    push_token(tokens, count, 3, start, i - start)
+                } else {
+                    # char: 'a' or '\n'
+                    if (cast::<i32>(c) == 39) {
+                        let start: i32 = i
+                        let j: i32 = i + 1
+                        if (j < n) {
+                            if (cast::<i32>(p[j]) == 92) {
+                                j = j + 2
+                                if (j < n) { if (cast::<i32>(p[j - 1]) == 120) { j = j + 2 } }
+                            } else { j = j + 1 }
+                        }
+                        if (j < n) { if (cast::<i32>(p[j]) == 39) { j = j + 1 } }
+                        i = j
+                        push_token(tokens, count, 4, start, i - start)
+                    } else {
+                        # ident
+                        if (is_alpha(c)) {
+                            let start: i32 = i
+                            let j: i32 = i + 1
+                            while (j < n) {
+                                if (is_alpha(p[j])) { j = j + 1 }
+                                else { if (is_digit(p[j])) { j = j + 1 } else { i = j; j = n } }
+                            }
+                            if (i == start) { i = n }
+                            push_token(tokens, count, 1, start, i - start)
+                        } else {
+                            # number
+                            if (is_digit(c)) {
+                                let start: i32 = i
+                                let j: i32 = i + 1
+                                while (j < n) { if (is_digit(p[j])) { j = j + 1 } else { i = j; j = n } }
+                                push_token(tokens, count, 2, start, i - start)
+                            } else {
+                                # op/punct (single char)
+                                push_token(tokens, count, 5, i, 1)
+                                i = i + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    push_token(tokens, count, 0, n, 0)
+}
+
+fn tok_kind(tokens: *Token, pos: i32) -> i32 {
+    let t: *Token = ptr_offset::<Token>(tokens, pos)
+    return (*t).kind
+}
+
+fn tok_start(tokens: *Token, pos: i32) -> i32 {
+    let t: *Token = ptr_offset::<Token>(tokens, pos)
+    return (*t).start
+}
+
+fn tok_len(tokens: *Token, pos: i32) -> i32 {
+    let t: *Token = ptr_offset::<Token>(tokens, pos)
+    return (*t).len
+}
+
+fn tok_eq_kw(p: *u8, tokens: *Token, pos: i32, kw: *u8) -> bool {
+    # Compare ident token with an ASCII null-terminated keyword (kw).
+    if (tok_kind(tokens, pos) == 1) { } else { return false }
+    let start: i32 = tok_start(tokens, pos)
+    let len: i32 = tok_len(tokens, pos)
+
+    # compute kw length
+    let klen: i32 = 0
+    let kdone: bool = false
+    while (kdone == false) {
+        if (cast::<i32>(kw[klen]) == 0) { kdone = true } else { klen = klen + 1 }
+    }
+    if (len == klen) { } else { return false }
+
+    let i: i32 = 0
+    while (i < len) {
+        if (p[start + i] == kw[i]) { } else { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn tok_is_ch(p: *u8, tokens: *Token, pos: i32, ch: u8) -> bool {
+    if (tok_kind(tokens, pos) == 5) { } else { return false }
+    let s: i32 = tok_start(tokens, pos)
+    return (p[s] == ch)
+}
+
+fn expect_kw(p: *u8, tokens: *Token, pos: *i32, kw: *u8) -> bool {
+    if (tok_eq_kw(p, tokens, *pos, kw)) { *pos = *pos + 1; return true }
+    return false
+}
+
+fn expect_ch(p: *u8, tokens: *Token, pos: *i32, ch: u8) -> bool {
+    if (tok_is_ch(p, tokens, *pos, ch)) { *pos = *pos + 1; return true }
+    return false
+}
+
+fn skip_until_stmt_end(p: *u8, tokens: *Token, pos: *i32) {
+    # Skip tokens until ';' or '}' or EOF.
+    let done: bool = false
+    while (done == false) {
+        if (tok_kind(tokens, *pos) == 0) { done = true } else {
+        if (tok_is_ch(p, tokens, *pos, cast::<u8>(59))) { # ';'
+            *pos = *pos + 1
+            done = true
+        } else {
+            if (tok_is_ch(p, tokens, *pos, cast::<u8>(125))) { # '}'
+                done = true
+            } else {
+                *pos = *pos + 1
+            }
+        } }
+    }
+}
+
+fn parse_block(p: *u8, tokens: *Token, pos: *i32, lets: *i32, rets: *i32) {
+    # expects '{' already consumed
+    let done: bool = false
+    while (done == false) {
+        if (tok_kind(tokens, *pos) == 0) { done = true } else {
+        if (tok_is_ch(p, tokens, *pos, cast::<u8>(125))) { # '}'
+            *pos = *pos + 1
+            done = true
+        } else {
+
+        let handled: bool = false
+
+        # let
+        if (tok_eq_kw(p, tokens, *pos, "let")) {
+            *lets = *lets + 1;
+            *pos = *pos + 1;
+            skip_until_stmt_end(p, tokens, pos);
+            handled = true
+        }
+
+        # return
+        if (handled == false) {
+            if (tok_eq_kw(p, tokens, *pos, "return")) {
+                *rets = *rets + 1;
+                *pos = *pos + 1;
+                skip_until_stmt_end(p, tokens, pos);
+                handled = true
+            }
+        }
+
+        # if block (subset)
+        if (handled == false) {
+            if (tok_eq_kw(p, tokens, *pos, "if")) {
+                *pos = *pos + 1;
+                let find_block: bool = false
+                while (find_block == false) {
+                    if (tok_kind(tokens, *pos) == 0) { find_block = true } else {
+                        if (tok_is_ch(p, tokens, *pos, cast::<u8>(123))) { # '{'
+                            *pos = *pos + 1;
+                            parse_block(p, tokens, pos, lets, rets);
+                            # optional else
+                            if (tok_eq_kw(p, tokens, *pos, "else")) {
+                                *pos = *pos + 1;
+                                if (expect_ch(p, tokens, pos, cast::<u8>(123))) {
+                                    parse_block(p, tokens, pos, lets, rets);
+                                }
+                            }
+                            find_block = true
+                        }
+                        *pos = *pos + 1;
+                    }
+                }
+                handled = true
+            }
+        }
+
+        # while block (subset)
+        if (handled == false) {
+            if (tok_eq_kw(p, tokens, *pos, "while")) {
+                *pos = *pos + 1;
+                let find_wblock: bool = false
+                while (find_wblock == false) {
+                    if (tok_kind(tokens, *pos) == 0) { find_wblock = true } else {
+                        if (tok_is_ch(p, tokens, *pos, cast::<u8>(123))) { # '{'
+                            *pos = *pos + 1;
+                            parse_block(p, tokens, pos, lets, rets);
+                            find_wblock = true
+                        }
+                        *pos = *pos + 1;
+                    }
+                }
+                handled = true
+            }
+        }
+
+        # expression statement fallback
+        if (handled == false) {
+            skip_until_stmt_end(p, tokens, pos);
+            handled = true
+        }
+        } }
+    }
+}
+
+fn parse_program(p: *u8, tokens: *Token, count: i32) -> i32 {
+    let pos: i32 = 0
+    let fn_count: i32 = 0
+    let let_count: i32 = 0
+    let ret_count: i32 = 0
+
+    while (pos < count) {
+        if (tok_kind(tokens, pos) == 0) { pos = count; }
+
+        if (pos < count) {
+            let handled: bool = false
+
+            if (tok_eq_kw(p, tokens, pos, "fn")) {
+                handled = true
+                fn_count = fn_count + 1;
+                pos = pos + 1;
+
+                # skip name + params until '{'
+                let find_fn_block: bool = false
+                while (find_fn_block == false) {
+                    if (tok_kind(tokens, pos) == 0) { pos = count; find_fn_block = true; }
+
+                    if (find_fn_block == false) {
+                        if (tok_is_ch(p, tokens, pos, cast::<u8>(123))) { # '{'
+                            pos = pos + 1;
+                            parse_block(p, tokens, &pos, &let_count, &ret_count);
+                            find_fn_block = true
+                        }
+                        pos = pos + 1;
+                    }
+                }
+            }
+
+            if (handled == false) {
+                pos = pos + 1;
+            }
+        }
+    }
+
+    print("Stage4 parse stats:")
+    print(fn_count)
+    print(let_count)
+    print(ret_count)
+    return 0
+}
+
+fn main() -> i32 {
+    let src: Buffer<u8> = fs::read_file("examples/control.nxl")
+    let p: *u8 = src.ptr
+    let n: i32 = src.len
+
+    let cap: i32 = 4096
+    let bytes: i32 = cap * sizeof::<Token>()
+    let raw: *u8 = malloc(bytes)
+    let tokens: *Token = cast::<*Token>(raw)
+    let count: i32 = 0
+
+    lex(p, n, tokens, &count)
+    let rc: i32 = parse_program(p, tokens, count)
+    free(raw)
+    return rc
+}
+
+

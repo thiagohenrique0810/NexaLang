@@ -1,0 +1,14 @@
+fn main() -> i32 {
+    # Stage 1: prove we can read a .nxl file from disk (required for self-hosting).
+    let b: Buffer<u8> = fs::read_file("examples/hello.nxl")
+    print(b.len)
+
+    # Print first byte as integer (ASCII code)
+    let p: *u8 = b.ptr
+    if (b.len > 0) {
+        print(cast::<i32>(p[0]))
+    }
+    return 0
+}
+
+

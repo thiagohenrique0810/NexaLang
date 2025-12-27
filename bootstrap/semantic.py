@@ -48,7 +48,7 @@ class SemanticAnalyzer:
     def analyze(self, ast):
         self.ast_root = ast
         # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
         self.enums = {} # name -> {variant: [payload_types]}
@@ -608,7 +608,7 @@ class SemanticAnalyzer:
 
         # Comparisons
         if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'):
-            if left_type not in ('i32', 'f32', 'bool'):
+            if left_type not in ('i32', 'i64', 'u8', 'char', 'f32', 'bool'):
                 raise Exception(f"Type Error: Comparison not supported for type '{left_type}'")
             node.type_name = 'bool'
             return 'bool'
@@ -656,6 +656,17 @@ class SemanticAnalyzer:
             self.exit_scope()
             node.type_name = 'void'
             return 'void'
+        elif node.callee == 'fs::read_file':
+            # fs::read_file(path: string) -> Buffer<u8>
+            if len(node.args) != 1:
+                raise Exception("fs::read_file expects 1 arg: path (string)")
+            path_ty = self.visit(node.args[0])
+            if path_ty != 'string':
+                raise Exception(f"Type Error: fs::read_file expects string path, got '{path_ty}'")
+            ret_ty = "Buffer<u8>"
+            self.instantiate_generic_type(ret_ty)
+            node.type_name = ret_ty
+            return ret_ty
         elif node.callee == 'slice_from_array':
             # slice_from_array(&arr) -> Slice<T>
             if len(node.args) != 1:

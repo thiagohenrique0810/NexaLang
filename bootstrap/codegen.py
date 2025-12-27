@@ -33,6 +33,11 @@ class CodeGen:
         self.free = None
         self.realloc = None
         self.memcpy = None
+        self.fopen = None
+        self.fseek = None
+        self.ftell = None
+        self.fread = None
+        self.fclose = None
 
         # Core compiler state
         self.struct_types = {} # name -> ir.LiteralStructType
@@ -51,8 +56,27 @@ class CodeGen:
             self._declare_exit()
             self._declare_malloc_free()
             self._declare_memcpy()
+            self._declare_fileio()
             self._declare_gpu_state()
             self._declare_arena()
+
+    def _declare_fileio(self):
+        # Minimal libc FILE* I/O for self-hosting bootstrap helpers.
+        # Treat FILE* as i8* (opaque).
+        void_ptr = ir.IntType(8).as_pointer()
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+
+        # FILE* fopen(const char* path, const char* mode)
+        self.fopen = ir.Function(self.module, ir.FunctionType(void_ptr, [void_ptr, void_ptr]), name="fopen")
+        # int fseek(FILE* stream, long offset, int whence)
+        self.fseek = ir.Function(self.module, ir.FunctionType(i32, [void_ptr, i64, i32]), name="fseek")
+        # long ftell(FILE* stream)
+        self.ftell = ir.Function(self.module, ir.FunctionType(i64, [void_ptr]), name="ftell")
+        # size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream)
+        self.fread = ir.Function(self.module, ir.FunctionType(i64, [void_ptr, i64, i64, void_ptr]), name="fread")
+        # int fclose(FILE* stream)
+        self.fclose = ir.Function(self.module, ir.FunctionType(i32, [void_ptr]), name="fclose")
 
     def _get_or_declare_vulkan_kernel_arg_global(self, kernel_name: str, arg_name: str, arg_type_name: str) -> ir.GlobalVariable:
         key = (kernel_name, arg_name)
@@ -292,6 +316,8 @@ class CodeGen:
     def get_llvm_type(self, type_name):
         if type_name == 'i32':
             return ir.IntType(32)
+        elif type_name == 'bool':
+            return ir.IntType(1)
         elif type_name == 'char':
             # Represent as i32 (Unicode scalar) in the bootstrap
             return ir.IntType(32)
@@ -1007,6 +1033,57 @@ class CodeGen:
             # `print` is a statement-level intrinsic (void).
             return None
 
+        elif node.callee == "fs::read_file":
+            # fs::read_file(path: string) -> Buffer<u8>
+            if len(node.args) != 1:
+                raise Exception("fs::read_file expects 1 arg")
+            if not hasattr(node, "type_name"):
+                raise Exception("CodeGen Error: fs::read_file CallExpr missing type_name annotation from Semantic phase.")
+
+            path = self.visit(node.args[0])  # i8*
+            void_ptr = ir.IntType(8).as_pointer()
+            i32 = ir.IntType(32)
+            i64 = ir.IntType(64)
+
+            # mode = "rb"
+            mode_arr = self.visit_StringLiteral(None, name="fs_mode_rb", value_override="rb\0")
+            mode = self.builder.bitcast(mode_arr, void_ptr)
+            path_c = self.builder.bitcast(path, void_ptr) if path.type != void_ptr else path
+
+            f = self.builder.call(self.fopen, [path_c, mode], name="f")
+
+            # if (!f) exit(1)
+            is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
+            with self.builder.if_then(is_null):
+                self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
+
+            # fseek(f, 0, 2)  (SEEK_END)
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
+            sz = self.builder.call(self.ftell, [f], name="file_size")
+            # fseek(f, 0, 0)  (SEEK_SET)
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 0)])
+
+            # malloc(sz + 1)
+            sz_i32 = self.builder.trunc(sz, i32, name="sz_i32")
+            cap = self.builder.add(sz_i32, ir.Constant(i32, 1), name="cap")
+            buf_void = self.builder.call(self.malloc, [cap], name="buf_void")
+            buf = self.builder.bitcast(buf_void, ir.IntType(8).as_pointer(), name="buf_u8")
+
+            # fread(buf, 1, sz, f)
+            _read = self.builder.call(self.fread, [buf_void, ir.Constant(i64, 1), sz, f])
+            _ = self.builder.call(self.fclose, [f])
+
+            # null-terminate: buf[sz] = 0
+            end_ptr = self.builder.gep(buf, [sz_i32], name="end_ptr")
+            self.builder.store(ir.Constant(ir.IntType(8), 0), end_ptr)
+
+            # return Buffer<u8> { ptr: u8*, len: i32 }
+            buf_ty = self.get_llvm_type(node.type_name)
+            out = ir.Constant(buf_ty, ir.Undefined)
+            out = self.builder.insert_value(out, buf, 0)
+            out = self.builder.insert_value(out, sz_i32, 1)
+            return out
+
         elif node.callee == "slice_from_array":
             # slice_from_array(&arr) where arr is [T:N]
             if len(node.args) != 1:
@@ -1181,21 +1258,18 @@ class CodeGen:
              target_type_name = node.callee[5:].rstrip('>')
              
              # Resolve target LLVM type
-             target_ty = None
-             if target_type_name == 'i32':
-                 target_ty = ir.IntType(32)
-             elif target_type_name == 'u8':
-                 target_ty = ir.IntType(8)
-             elif target_type_name.endswith('*'): 
-                  # Recursion needed for T**?
-                  # Just pointer cast
-                  base = target_type_name[:-1]
-                  if base == 'i32': target_ty = ir.IntType(32).as_pointer()
-                  elif base == 'u8': target_ty = ir.IntType(8).as_pointer()
-                  else: target_ty = ir.IntType(8).as_pointer() # Default to i8* for unknown base
-             else:
-                 # Fallback for other types, or raise error
-                 raise Exception(f"Unsupported cast target type: {target_type_name}")
+             try:
+                 target_ty = self.get_llvm_type(target_type_name)
+             except Exception:
+                 # Fallback for legacy targets
+                 if target_type_name == 'i32':
+                     target_ty = ir.IntType(32)
+                 elif target_type_name == 'u8':
+                     target_ty = ir.IntType(8)
+                 elif target_type_name == 'bool':
+                     target_ty = ir.IntType(1)
+                 else:
+                     raise Exception(f"Unsupported cast target type: {target_type_name}")
              
              
              src_ty = val.type

@@ -82,7 +82,12 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] `Vec<T>` (Dynamic array).
     - [x] String manipulation.
 - [ ] **Self-Hosting**
-    - [ ] Rewrite the compiler using NexaLang itself.
+    - [~] Rewrite the compiler using NexaLang itself.
+      - [x] Stage 1: file IO (`fs::read_file`) + Buffer<u8> sample.
+      - [x] Stage 2: minimal lexer in NexaLang (token counting).
+      - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
+      - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
+      - [ ] Stage 5: emit LLVM IR (subset) or transpile to bootstrap IR.
     - [ ] Verify `nxc` can compile `nxc`.
 - [ ] **Tooling**
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
