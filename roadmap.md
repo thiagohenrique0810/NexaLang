@@ -27,14 +27,17 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 ## Phase 2: Core Language Features 🧬
 
 - [x] **Data Types**
-    - [x] Primitive types (`u8`, `i64`, `bool`, `char`).
+    - [~] Primitive types (`u8`, `i64`, `bool`).
+    - [x] `char`.
 - [x] **Type System 2.0**
   - [x] Structs & Methods
-  - [x] Arrays & Slices
+  - [~] Arrays & Slices
+    - [x] Arrays
+    - [x] Slices (bootstrap: `[]T` lowered to `Slice<T>`, `slice_from_array(&arr)`, `s.len`, `s[i]`).
   - [x] Enums & Pattern Matching
   - [x] Generics (Basic Monomorphization)
   - [x] Type Inference (Local)
-- [ ] **Control Flow**
+- [x] **Control Flow**
     - [x] `if` / `else` expressions.
     - [x] `while` loops.
     - [x] `match` pattern matching (basic).
@@ -55,7 +58,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] Immutable borrowings (`&T`).
     - [x] Mutable borrowings (`&mut T`).
     - [x] Enforce "One writer OR many readers" rule.
-- [ ] **Region Management**
+- [x] **Region Management**
     - [x] Implement `region` keyword syntax.
     - [x] Arena allocator implementation in runtime (bootstrap: `Arena_new/drop/alloc`).
 
@@ -64,10 +67,11 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **GPU Syntax**
     - [x] `kernel` keyword parsing.
     - [x] `Buffer<T>` generic type (bootstrap builtin).
-- [ ] **SPIR-V Backend**
-    - [x] Add SPIR-V target to LLVM pipeline (bootstrap: emits LLVM IR with `spir64-unknown-unknown`; `.spv` needs external tools).
-    - [~] Map `gpu::global_id()` to intrinsics (bootstrap: uses placeholder global `__spirv_BuiltInGlobalInvocationId_x`; real mapping depends on translator/toolchain).
-- [ ] **Runtime Dispatch**
+- [x] **SPIR-V Backend**
+    - [x] Add SPIR-V target to LLVM pipeline (bootstrap: module triple `spirv64-unknown-unknown`; `.spv` needs external tools).
+    - [x] Map `gpu::global_id()` to SPIR-V BuiltIn `GlobalInvocationId` (bootstrap: loads from `__spirv_BuiltInGlobalInvocationId` as `<3 x i32>` in `addrspace(5)` and extracts `.x`).
+    - [x] Vulkan env (bootstrap): `--spirv-env vulkan` emits `OpCapability Shader` + `OpMemoryModel Logical GLSL450`, supports `--spirv-local-size`, maps kernel args to interface globals (no params), and auto-patches access chains + descriptor bindings using `spirv-dis`/`spirv-as` so `spirv-val` passes for `Buffer<T>` indexing.
+- [x] **Runtime Dispatch**
     - [x] Implement `gpu::dispatch` (bootstrap/mock: CPU loop calling kernel + sets `gpu::global_id()`).
 
 ## Phase 5: Self-Hosting & Ecosystem 🚀
@@ -81,5 +85,5 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [ ] Rewrite the compiler using NexaLang itself.
     - [ ] Verify `nxc` can compile `nxc`.
 - [ ] **Tooling**
-    - [ ] `nx` CLI build tool.
-    - [ ] Syntax highlighter extension (VSCode).
+    - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
+    - [x] Syntax highlighter extension (VSCode) (TextMate grammar under `vscode-nexalang/`).

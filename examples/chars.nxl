@@ -1,0 +1,10 @@
+fn main() {
+    let a: char = 'A'
+    let nl: char = '\n'
+    print(a)
+    print(nl)
+    let x: i32 = 65
+    print(x)
+}
+
+

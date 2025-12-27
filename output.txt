@@ -1,4 +1,0 @@
-﻿DEBUG: Visiting CallExpr 'vec_new<i32>'
-DEBUG: Instantiated 'vec_new<i32>' with return type 'Vec<i32>'
-DEBUG: Key 'vec_new<i32>' added to function_defs with type 'Vec<i32>'
-[SEMANTIC ERROR] DEBUG: init_type='void', node.type='Vec<i32>'. Type Error: Cannot assign type 'void' to variable 'v' of type 'Vec<i32>'

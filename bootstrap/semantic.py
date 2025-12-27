@@ -1,5 +1,5 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral
+from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
 import sys
 import copy
 class SemanticAnalyzer:
@@ -19,7 +19,7 @@ class SemanticAnalyzer:
         """
         if not type_name:
             return False
-        if type_name in ('i32', 'i64', 'u8', 'bool', 'f32', 'string'):
+        if type_name in ('i32', 'i64', 'u8', 'bool', 'f32', 'string', 'char'):
             return True
         if type_name.endswith('*'):
             return True
@@ -48,7 +48,7 @@ class SemanticAnalyzer:
     def analyze(self, ast):
         self.ast_root = ast
         # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
         self.enums = {} # name -> {variant: [payload_types]}
@@ -87,6 +87,15 @@ class SemanticAnalyzer:
                 generics=['T'],
             )
 
+        # Built-in generic Slice<T> (for views into arrays/buffers):
+        # struct Slice<T> { ptr: *T, len: i32 }
+        if 'Slice' not in self.generic_structs and 'Slice' not in self.structs:
+            self.generic_structs['Slice'] = StructDef(
+                'Slice',
+                fields=[('ptr', 'T*'), ('len', 'i32')],
+                generics=['T'],
+            )
+
         # Inject Built-in Arena
         self.structs['Arena'] = {'chunk': 'u8*', 'offset': 'i32', 'capacity': 'i32'}
 
@@ -121,7 +130,9 @@ class SemanticAnalyzer:
         # Annotate node for CodeGen
         node.struct_type = obj_type
              
-        return fields[node.member]
+        ty = fields[node.member]
+        node.type_name = ty
+        return ty
 
     def visit_ArrayLiteral(self, node):
         if not node.elements:
@@ -150,12 +161,21 @@ class SemanticAnalyzer:
             # Parse type string [T:N]
             content = obj_type[1:-1]
             elem_type, _size_str = content.split(':', 1)
+            node.type_name = elem_type
             return elem_type
 
         # 4. Pointers: T*
         # Allow pointer indexing as syntactic sugar for ptr_offset + deref.
         if obj_type.endswith('*'):
-            return obj_type[:-1]
+            ty = obj_type[:-1]
+            node.type_name = ty
+            return ty
+
+        # 5. Slices: Slice<T>
+        if isinstance(obj_type, str) and obj_type.startswith("Slice<") and obj_type.endswith(">"):
+            inner = obj_type[len("Slice<"):-1]
+            node.type_name = inner
+            return inner
 
         raise Exception(f"Type Error: Indexing non-array/non-pointer type '{obj_type}'")
 
@@ -166,7 +186,9 @@ class SemanticAnalyzer:
             # Dereference: operand must be a pointer type "T*"
             if not operand_type.endswith('*'):
                  raise Exception(f"Type Error: Cannot dereference non-pointer type '{operand_type}'")
-            return operand_type[:-1]
+            ty = operand_type[:-1]
+            node.type_name = ty
+            return ty
             
         elif node.op == '&':
             # Address Of: return "T*"
@@ -194,7 +216,9 @@ class SemanticAnalyzer:
                      self.scopes[-1]['active_borrows'] = []
                 self.scopes[-1]['active_borrows'].append((var_name, 'reader'))
                 
-            return f"{operand_type}*"
+            ty = f"{operand_type}*"
+            node.type_name = ty
+            return ty
             
         elif node.op == '&mut':
              # Mutable Reference
@@ -217,8 +241,11 @@ class SemanticAnalyzer:
                      self.scopes[-1]['active_borrows'] = []
                 self.scopes[-1]['active_borrows'].append((var_name, 'writer'))
                 
-             return f"{operand_type}*"
+             ty = f"{operand_type}*"
+             node.type_name = ty
+             return ty
             
+        node.type_name = operand_type
         return operand_type
 
     def visit_MatchExpr(self, node):
@@ -576,27 +603,37 @@ class SemanticAnalyzer:
         if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH'):
             if left_type not in ('i32', 'f32'):
                 raise Exception(f"Type Error: Arithmetic only supported for i32/f32. Got '{left_type}'")
+            node.type_name = left_type
             return left_type
 
         # Comparisons
         if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'):
             if left_type not in ('i32', 'f32', 'bool'):
                 raise Exception(f"Type Error: Comparison not supported for type '{left_type}'")
+            node.type_name = 'bool'
             return 'bool'
 
         raise Exception(f"Semantic Error: Unsupported binary operator '{node.op}'")
 
     def visit_IntegerLiteral(self, node):
+        node.type_name = 'i32'
         return 'i32' # Default
 
     def visit_FloatLiteral(self, node):
+        node.type_name = 'f32'
         return 'f32'
 
     def visit_BooleanLiteral(self, node):
+        node.type_name = 'bool'
         return 'bool'
 
     def visit_StringLiteral(self, node):
+        node.type_name = 'string'
         return 'string'
+
+    def visit_CharLiteral(self, node):
+        node.type_name = 'char'
+        return 'char'
 
     def visit_VariableExpr(self, node):
         var_info = self.lookup(node.name)
@@ -606,7 +643,9 @@ class SemanticAnalyzer:
         if var_info['moved']:
             raise Exception(f"Ownership Error: Use of moved variable '{node.name}'")
             
-        return var_info['type']
+        ty = var_info['type']
+        node.type_name = ty
+        return ty
 
     def visit_CallExpr(self, node):
         # Intrinsics
@@ -615,7 +654,29 @@ class SemanticAnalyzer:
             for arg in node.args:
                 self.visit(arg)
             self.exit_scope()
+            node.type_name = 'void'
             return 'void'
+        elif node.callee == 'slice_from_array':
+            # slice_from_array(&arr) -> Slice<T>
+            if len(node.args) != 1:
+                raise Exception("slice_from_array expects 1 arg: &arr where arr is [T:N]")
+            arg_ty = self.visit(node.args[0])
+            if not (isinstance(arg_ty, str) and arg_ty.endswith('*')):
+                raise Exception("slice_from_array expects a pointer to array: use slice_from_array(&arr)")
+            inner = arg_ty[:-1]
+            if not (inner.startswith('[') and inner.endswith(']')):
+                raise Exception("slice_from_array expects &arr where arr is [T:N]")
+            content = inner[1:-1]
+            elem_type, size_str = content.split(':', 1)
+            elem_type = elem_type.strip()
+            size = int(size_str.strip())
+
+            slice_ty = f"Slice<{elem_type}>"
+            self.instantiate_generic_type(slice_ty)
+            node.type_name = slice_ty
+            node.slice_elem_type = elem_type
+            node.slice_len = size
+            return slice_ty
         elif node.callee == 'memcpy':
             if len(node.args) != 3: raise Exception("memcpy requires 3 args")
             # Validation logic? dest and src should be pointers.
@@ -625,6 +686,7 @@ class SemanticAnalyzer:
             size_ty = self.visit(node.args[2])
             self.exit_scope()
             if size_ty != 'i32': raise Exception("memcpy size must be i32")
+            node.type_name = 'void'
             return 'void'
             
         elif node.callee == 'malloc':
@@ -633,6 +695,7 @@ class SemanticAnalyzer:
              size_type = self.visit(node.args[0])
              self.exit_scope()
              if size_type != 'i32': raise Exception("malloc expects i32")
+             node.type_name = 'u8*'
              return 'u8*'
              
         elif node.callee == 'free':
@@ -640,6 +703,7 @@ class SemanticAnalyzer:
              self.enter_scope()
              self.visit(node.args[0])
              self.exit_scope()
+             node.type_name = 'void'
              return 'void'
              
         elif node.callee == 'realloc':
@@ -648,6 +712,7 @@ class SemanticAnalyzer:
              self.visit(node.args[0])
              self.visit(node.args[1])
              self.exit_scope()
+             node.type_name = 'u8*'
              return 'u8*'
              
         elif node.callee == 'panic':
@@ -655,6 +720,7 @@ class SemanticAnalyzer:
             self.enter_scope()
             self.visit(node.args[0])
             self.exit_scope()
+            node.type_name = 'void'
             return 'void'
             
         elif node.callee == 'assert':
@@ -663,9 +729,11 @@ class SemanticAnalyzer:
             self.visit(node.args[0])
             self.visit(node.args[1])
             self.exit_scope()
+            node.type_name = 'void'
             return 'void'
             
         elif node.callee == 'gpu::global_id':
+             node.type_name = 'i32'
              return 'i32'
 
         elif node.callee == 'gpu::dispatch':

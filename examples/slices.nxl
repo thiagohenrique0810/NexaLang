@@ -1,0 +1,8 @@
+fn main() {
+    let arr: [i32:4] = [10, 20, 30, 40]
+    let s: []i32 = slice_from_array(&arr)
+    print(s.len)
+    print(s[2])
+}
+
+

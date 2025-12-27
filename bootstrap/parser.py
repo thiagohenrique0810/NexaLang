@@ -67,6 +67,10 @@ class StringLiteral(ASTNode):
     def __init__(self, value):
         self.value = value
 
+class CharLiteral(ASTNode):
+    def __init__(self, value: int):
+        self.value = value
+
 class VarDecl(ASTNode):
     def __init__(self, name, type_name, initializer):
         self.name = name
@@ -348,8 +352,13 @@ class Parser:
             inner = self.parse_type()
             return f"{inner}*" # Use postfix * for internal string representation
         elif self.peek().type == 'LBRACKET':
-            # Array Type: [Type; Size]
+            # Slice Type: []T   (lowered to Slice<T>)
+            # Array Type: [T:N]
             self.consume('LBRACKET')
+            if self.peek().type == 'RBRACKET':
+                self.consume('RBRACKET')
+                elem_type = self.parse_type()
+                return f"Slice<{elem_type}>"
             elem_type = self.consume('IDENTIFIER').value
             self.consume('COLON') # We use semicolon usually [T;N] but Lexer has COLON?
             # Lexer doesn't have SEMICOLON token yet! 
@@ -524,6 +533,9 @@ class Parser:
         if token.type == 'NUMBER':
             self.consume('NUMBER')
             expr = IntegerLiteral(int(token.value))
+        elif token.type == 'CHAR':
+            self.consume('CHAR')
+            expr = CharLiteral(int(token.value))
         elif token.type == 'FLOAT':
             self.consume('FLOAT')
             expr = FloatLiteral(float(token.value))

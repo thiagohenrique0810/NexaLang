@@ -115,6 +115,54 @@ class Lexer:
                 value = self.source[start:self.pos]
                 tokens.append(Token('STRING', value))
                 self.pos += 1
+
+            # Char Literals: 'a', '\n', '\'', '\\', '\x41'
+            elif char == "'":
+                self.pos += 1  # consume opening '
+                if self.pos >= self.length:
+                    raise Exception("Unterminated char literal")
+
+                c = self.source[self.pos]
+                if c == '\\':
+                    self.pos += 1
+                    if self.pos >= self.length:
+                        raise Exception("Unterminated char escape")
+                    esc = self.source[self.pos]
+                    self.pos += 1
+                    if esc == 'n':
+                        codepoint = ord('\n')
+                    elif esc == 't':
+                        codepoint = ord('\t')
+                    elif esc == 'r':
+                        codepoint = ord('\r')
+                    elif esc == '0':
+                        codepoint = 0
+                    elif esc == "'":
+                        codepoint = ord("'")
+                    elif esc == '"':
+                        codepoint = ord('"')
+                    elif esc == '\\':
+                        codepoint = ord('\\')
+                    elif esc == 'x':
+                        # \xNN
+                        if self.pos + 1 >= self.length:
+                            raise Exception("Invalid \\x escape in char literal")
+                        h1 = self.source[self.pos]
+                        h2 = self.source[self.pos + 1]
+                        if not re.match(r"[0-9a-fA-F]", h1) or not re.match(r"[0-9a-fA-F]", h2):
+                            raise Exception("Invalid \\x escape in char literal")
+                        codepoint = int(h1 + h2, 16)
+                        self.pos += 2
+                    else:
+                        raise Exception(f"Unknown char escape: \\{esc}")
+                else:
+                    codepoint = ord(c)
+                    self.pos += 1
+
+                if self.pos >= self.length or self.source[self.pos] != "'":
+                    raise Exception("Unterminated char literal (missing closing ')")
+                self.pos += 1  # consume closing '
+                tokens.append(Token('CHAR', str(codepoint)))
             
             # Numbers: integer or float (e.g. 123, 3.14)
             elif char.isdigit():

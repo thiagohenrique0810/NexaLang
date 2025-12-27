@@ -82,6 +82,47 @@ If you created the environment under `Y:\tools\nexalang-spirv`, you can activate
 .\tools\activate_spirv_env.ps1
 ```
 
+### Vulkan environment (experimental)
+
+You can switch the SPIR-V environment to Vulkan compute:
+
+```powershell
+python bootstrap\main.py examples\gpu_kernel_vulkan_spirv.nxl --target spirv --spirv-env vulkan --spirv-local-size 8,1,1 --emit spv --out fill_vulkan.spv
+spirv-dis fill_vulkan.spv | Select-String -Pattern "OpCapability|OpMemoryModel|OpEntryPoint|OpExecutionMode"
+spirv-val fill_vulkan.spv
+```
+
+Notes:
+- The LLVM SPIR-V backend may emit `OpPtrAccessChain` for buffer indexing. The bootstrap emitter will patch this to `OpAccessChain` for `__nexa_*_data` StorageBuffer variables when `spirv-as` is available (required for Vulkan validation).
+- When `--spirv-vulkan-var-pointers on` (default) and `spirv-as` is available, the bootstrap emitter may also inject `SPV_KHR_variable_pointers` + `VariablePointers*` capabilities if any remaining `OpPtrAccessChain` exists.
+- If you don't have `spirv-as`, install SPIRV-Tools and ensure it is in PATH.
+- Vulkan bindings are assigned deterministically by name: `*_len` first, then `*_data`, then others (per kernel/arg).
+
+---
+
+## 🛠️ `nx` CLI (Bootstrap)
+
+A small helper CLI to run common tasks:
+
+```bash
+python nx.py examples
+python nx.py run examples/hello.nxl
+python nx.py build examples/gpu_kernel_vulkan_spirv.nxl --target spirv --spirv-env vulkan --emit spv --spv-out fill.spv
+python nx.py val spirv fill.spv
+```
+
+By default, `nx` writes build outputs to `dev/artifacts/` to keep the repo root clean.
+
+---
+
+## 🎨 VSCode Syntax Highlighting
+
+This repo includes a local VSCode extension under `vscode-nexalang/` for `.nxl` files.
+
+- Open VSCode
+- `Ctrl+Shift+P` → **Developer: Install Extension from Location...**
+- Select the folder `vscode-nexalang`
+
 ---
 
 *Designed by **Thiago Henrique**.*

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "NexaLang",
+  "scopeName": "source.nexalang",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#char" },
+    { "include": "#number" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.nexalang",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.nexalang",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.nexalang", "match": "\\\\(n|t|r|0|\\\\|\"|')"},
+            { "name": "constant.character.escape.hex.nexalang", "match": "\\\\x[0-9a-fA-F]{2}" }
+          ]
+        }
+      ]
+    },
+    "char": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.nexalang",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "name": "constant.character.escape.nexalang", "match": "\\\\(n|t|r|0|\\\\|\"|')"},
+            { "name": "constant.character.escape.hex.nexalang", "match": "\\\\x[0-9a-fA-F]{2}" }
+          ]
+        }
+      ]
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.float.nexalang", "match": "\\b\\d+\\.\\d+\\b" },
+        { "name": "constant.numeric.integer.nexalang", "match": "\\b\\d+\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nexalang",
+          "match": "\\b(fn|kernel|struct|enum|match|region|let|return|if|else|while|mut)\\b"
+        },
+        {
+          "name": "constant.language.boolean.nexalang",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.nexalang",
+          "match": "\\b(i32|i64|u8|bool|f32|string|char|void)\\b"
+        },
+        {
+          "name": "support.type.nexalang",
+          "match": "\\b(Buffer|Slice|Vec|Option|Result|Arena)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.nexalang",
+          "match": "\\b(print|panic|assert|malloc|free|realloc|memcpy|slice_from_array)\\b"
+        },
+        {
+          "name": "support.function.nexalang",
+          "match": "\\b(gpu::dispatch|gpu::global_id)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.nexalang", "match": "(::|->|=>|==|!=|<=|>=|<|>|\\+|\\-|\\*|/|=|&|\\.)" }
+      ]
+    }
+  }
+}
+
+

@@ -15,5 +15,6 @@ Write-Host "  llvm-as:   " (Get-Command llvm-as -ErrorAction SilentlyContinue).S
 Write-Host "  llc:       " (Get-Command llc -ErrorAction SilentlyContinue).Source
 Write-Host "  llvm-spirv:" (Get-Command llvm-spirv -ErrorAction SilentlyContinue).Source
 Write-Host "  spirv-val: " (Get-Command spirv-val -ErrorAction SilentlyContinue).Source
+Write-Host "  spirv-as:  " (Get-Command spirv-as -ErrorAction SilentlyContinue).Source
 
 

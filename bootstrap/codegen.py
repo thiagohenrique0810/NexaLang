@@ -1,25 +1,139 @@
 from llvmlite import ir
-from parser import StructDef, EnumDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess
+from parser import StructDef, EnumDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess, CharLiteral
 
 class CodeGen:
-    def __init__(self, target: str = "native", emit_kernels_only: bool = False):
+    def __init__(
+        self,
+        target: str = "native",
+        emit_kernels_only: bool = False,
+        spirv_env: str = "opencl",
+        spirv_local_size: str = "1,1,1",
+    ):
         self.module = ir.Module(name="nexalang_module")
         self.target = target
         self.emit_kernels_only = emit_kernels_only
+        self.spirv_env = spirv_env
+        self.spirv_local_size = spirv_local_size
+        self._kernel_function_names = set()
+        self._vulkan_kernel_arg_globals = {}  # (kernel_name, arg_name) -> ir.GlobalVariable
+        self._vulkan_buffer_args = {}  # (kernel_name, arg_name) -> (data_gv, len_gv)
+        self._current_function_name = None
+        self._current_function_is_kernel = False
         # Set a more appropriate module triple for SPIR(-V) translation paths.
         # Note: actual .spv emission depends on external tooling (llvm-spirv).
         if self.target == "spirv":
-            self.module.triple = "spir64-unknown-unknown"
+            if self.spirv_env == "vulkan":
+                self.module.triple = "spirv64-unknown-vulkan"
+            else:
+                self.module.triple = "spirv64-unknown-unknown"
         self.builder = None
         self.printf = None
         self.exit_func = None
         self.malloc = None
         self.free = None
-        self._declare_printf()
-        self._declare_exit()
-        self._declare_malloc_free()
-        self._declare_gpu_state()
-        self._declare_arena()
+        self.realloc = None
+        self.memcpy = None
+
+        # Core compiler state
+        self.struct_types = {} # name -> ir.LiteralStructType
+        self.struct_fields = {} # name -> {field_name: index}
+        self.enum_types = {} # name -> {variant: tag_id}
+        self.enum_payloads = {} # name -> {variant: payload_type}
+        self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
+        self.scopes = []
+
+        # For Vulkan SPIR-V kernels-only, avoid emitting host/runtime helpers
+        # (Arena/malloc/printf) because they pull in pointer ops that are not shader-friendly.
+        if self.target == "spirv" and self.spirv_env == "vulkan" and self.emit_kernels_only:
+            self._declare_gpu_state()
+        else:
+            self._declare_printf()
+            self._declare_exit()
+            self._declare_malloc_free()
+            self._declare_memcpy()
+            self._declare_gpu_state()
+            self._declare_arena()
+
+    def _get_or_declare_vulkan_kernel_arg_global(self, kernel_name: str, arg_name: str, arg_type_name: str) -> ir.GlobalVariable:
+        key = (kernel_name, arg_name)
+        if key in self._vulkan_kernel_arg_globals:
+            return self._vulkan_kernel_arg_globals[key]
+
+        llvm_ty = self.get_llvm_type(arg_type_name)
+        # For Vulkan, use StorageBuffer addrspace(11) for Buffer<T> so pointers are logical under VariablePointersStorageBuffer.
+        # (addrspace mapping confirmed by experiment with llc spirv64-unknown-vulkan)
+        addrspace = 11 if (isinstance(arg_type_name, str) and arg_type_name.startswith("Buffer<")) else 1
+        gv = ir.GlobalVariable(self.module, llvm_ty, name=f"__nexa_{kernel_name}_{arg_name}", addrspace=addrspace)
+        gv.linkage = "external"
+        self._vulkan_kernel_arg_globals[key] = gv
+        return gv
+
+    def _get_or_declare_vulkan_buffer_globals(self, kernel_name: str, arg_name: str, buf_type_name: str):
+        """
+        Vulkan logical pointers can't be loaded as values from memory. So for Buffer<T> we model:
+          - data: external addrspace(11) global <T>   (StorageBuffer)
+          - len:  external addrspace(12) global i32   (Uniform)
+        """
+        key = (kernel_name, arg_name)
+        if key in self._vulkan_buffer_args:
+            return self._vulkan_buffer_args[key]
+
+        # Parse Buffer<T>
+        inner = buf_type_name[len("Buffer<"):-1]
+        elem_ty = self.get_llvm_type(inner)
+        # Use [0 x T] in StorageBuffer so the backend emits a runtime array + ArrayStride.
+        data_ty = ir.ArrayType(elem_ty, 0)
+        data_gv = ir.GlobalVariable(self.module, data_ty, name=f"__nexa_{kernel_name}_{arg_name}_data", addrspace=11)
+        data_gv.linkage = "external"
+
+        len_gv = ir.GlobalVariable(self.module, ir.IntType(32), name=f"__nexa_{kernel_name}_{arg_name}_len", addrspace=12)
+        len_gv.linkage = "external"
+
+        self._vulkan_buffer_args[key] = (data_gv, len_gv)
+        return data_gv, len_gv
+
+    def _postprocess_spirv_vulkan_kernel_attributes(self, llvm_ir: str) -> str:
+        """
+        llvmlite does not currently support arbitrary key/value function attributes, but
+        LLVM's SPIR-V Vulkan path expects at least:
+          - "hlsl.shader"="compute"
+          - "hlsl.numthreads"="X,Y,Z"
+        We inject an attribute group into the textual LLVM IR and attach it to kernel functions.
+        """
+        if not self._kernel_function_names:
+            return llvm_ir
+
+        import re
+
+        # Find next free attribute group id.
+        max_attr = -1
+        for m in re.finditer(r"^attributes\s+#(\d+)\s*=\s*\{", llvm_ir, flags=re.MULTILINE):
+            max_attr = max(max_attr, int(m.group(1)))
+        attr_id = max_attr + 1
+
+        attr_block = f'attributes #{attr_id} = {{ "hlsl.shader"="compute" "hlsl.numthreads"="{self.spirv_local_size}" }}'
+
+        # Attach attribute group to each kernel function definition line if it doesn't already have one.
+        # Handles both @name and @"name" forms.
+        lines = llvm_ir.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("define "):
+                continue
+            # Skip if already has an attribute group like "#0"
+            if re.search(r"\s#\d+\s*(\{|$)", line):
+                continue
+            for kname in self._kernel_function_names:
+                if (f'@{kname}(' in line) or (f'@"{kname}"(' in line):
+                    # llvmlite often prints the opening brace on the next line, so we attach
+                    # the attribute group to the `define ...` line itself.
+                    lines[i] = f"{line} #{attr_id}"
+                    break
+
+        out = "\n".join(lines)
+        if not out.endswith("\n"):
+            out += "\n"
+        out += "\n" + attr_block + "\n"
+        return out
 
     def _declare_gpu_state(self):
         # Mock GPU execution state for bootstrap runtime dispatch (CPU loop).
@@ -33,13 +147,14 @@ class CodeGen:
             gv.initializer = ir.Constant(i32, 0)
             self.gpu_global_id = gv
 
-        # Placeholder for SPIR-V builtin mapping (best-effort).
-        # Many pipelines use special naming/addrspaces; we keep it simple here and
-        # fall back to __gpu_global_id if translator doesn't pick it up.
+        # SPIR-V builtin (LLVM SPIR-V backend convention):
+        # Declare `__spirv_BuiltInGlobalInvocationId` as v3i32 in addrspace(5).
+        # LLVM will decorate it as BuiltIn GlobalInvocationId and map to a suitable memory class.
         if self.target == "spirv":
-            spirv_gv = ir.GlobalVariable(self.module, i32, name="__spirv_BuiltInGlobalInvocationId_x")
+            v3i32 = ir.VectorType(i32, 3)
+            spirv_gv = ir.GlobalVariable(self.module, v3i32, name="__spirv_BuiltInGlobalInvocationId", addrspace=5)
             spirv_gv.linkage = "external"
-            self.spirv_global_id_x = spirv_gv
+            self.spirv_global_invocation_id = spirv_gv
 
     def _infer_type_name_from_llvm(self, ty):
         # Best-effort mapping for local scope bookkeeping (mainly for drop calls).
@@ -154,13 +269,6 @@ class CodeGen:
         # realloc
         realloc_ty = ir.FunctionType(void_ptr, [void_ptr, ir.IntType(32)])
         self.realloc = ir.Function(self.module, realloc_ty, name="realloc")
-        self.struct_types = {} # name -> ir.LiteralStructType
-        self.struct_fields = {} # name -> {field_name: index}
-        self.enum_types = {} # name -> {variant: tag_id}
-        self.enum_payloads = {} # name -> {variant: payload_type}
-        self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
-        self.scopes = []
-        self._declare_memcpy()
 
     def _declare_memcpy(self):
         # Declare llvm.memcpy.p0i8.p0i8.i32
@@ -183,6 +291,9 @@ class CodeGen:
 
     def get_llvm_type(self, type_name):
         if type_name == 'i32':
+            return ir.IntType(32)
+        elif type_name == 'char':
+            # Represent as i32 (Unicode scalar) in the bootstrap
             return ir.IntType(32)
         elif type_name == 'i64':
              return ir.IntType(64)
@@ -215,8 +326,17 @@ class CodeGen:
             
         # Create LLVM Struct Type
         field_types = []
-        for _, type_name in node.fields:
-             field_types.append(self.get_llvm_type(type_name))
+        is_spirv_buffer = self.target == "spirv" and isinstance(node.name, str) and node.name.startswith("Buffer<")
+        for field_name, type_name in node.fields:
+             # For SPIR-V, treat Buffer<T>.ptr as a storage pointer (addrspace depends on env).
+             # - opencl: addrspace(1) -> CrossWorkgroup
+             # - vulkan: addrspace(11) -> StorageBuffer
+             if is_spirv_buffer and field_name == "ptr" and isinstance(type_name, str) and type_name.endswith("*"):
+                 inner = type_name[:-1]
+                 asid = 11 if (self.target == "spirv" and self.spirv_env == "vulkan") else 1
+                 field_types.append(self.get_llvm_type(inner).as_pointer(addrspace=asid))
+             else:
+                 field_types.append(self.get_llvm_type(type_name))
         
         struct_ty = ir.LiteralStructType(field_types)
         self.struct_types[node.name] = struct_ty
@@ -299,7 +419,10 @@ class CodeGen:
                     continue
                 self.visit(node)
                 
-        return str(self.module)
+        llvm_ir = str(self.module)
+        if self.target == "spirv" and self.spirv_env == "vulkan":
+            llvm_ir = self._postprocess_spirv_vulkan_kernel_attributes(llvm_ir)
+        return llvm_ir
 
     def visit(self, node):
         method_name = f'visit_{type(node).__name__}'
@@ -333,6 +456,29 @@ class CodeGen:
 
     def visit_MemberAccess(self, node):
         # ... existing implementation ...
+        # Vulkan: Buffer<T> is lowered to interface globals, not an in-memory struct.
+        if (
+            self.target == "spirv"
+            and self.spirv_env == "vulkan"
+            and hasattr(node, "struct_type")
+            and isinstance(node.struct_type, str)
+            and node.struct_type.startswith("Buffer<")
+        ):
+            if not isinstance(node.object, VariableExpr):
+                raise Exception("Vulkan Buffer<T> member access only supported on variables (e.g. buf.ptr / buf.len).")
+            # Find buffer globals
+            key = (self._current_function_name or "", node.object.name)
+            if key not in self._vulkan_buffer_args:
+                # In case it wasn't predeclared (defensive)
+                self._get_or_declare_vulkan_buffer_globals(self._current_function_name or "", node.object.name, node.struct_type)
+            data_gv, len_gv = self._vulkan_buffer_args[(self._current_function_name or "", node.object.name)]
+            if node.member == "ptr":
+                # Return the runtime array base pointer. Indexing will use gep(0, idx).
+                return data_gv
+            if node.member == "len":
+                return self.builder.load(len_gv, name=f"{node.object.name}_len")
+            raise Exception(f"Unknown Buffer member '{node.member}'")
+
         struct_val = self.visit(node.object)
         if not hasattr(node, 'struct_type'):
              raise Exception("CodeGen Error: MemberAccess node missing 'struct_type' annotation from Semantic phase.")
@@ -371,7 +517,29 @@ class CodeGen:
                      entry = scope[node.object.name]
                      break
              if entry:
-                 var_ptr, type_name = entry
+                 if isinstance(entry, tuple) and len(entry) == 3:
+                     var_ptr, type_name, tag = entry
+                     if tag in ("value", "vulkan_buffer"):
+                         # SSA pointer value: gep then load
+                         if not isinstance(var_ptr.type, ir.PointerType):
+                             raise Exception("Index access requires pointer/array base")
+                         if isinstance(var_ptr.type.pointee, ir.ArrayType):
+                             zero = ir.Constant(ir.IntType(32), 0)
+                             elem_ptr = self.builder.gep(var_ptr, [zero, index_val])
+                         else:
+                             elem_ptr = self.builder.gep(var_ptr, [index_val])
+                         return self.builder.load(elem_ptr)
+                     # fallback to legacy behavior
+                     var_ptr = var_ptr
+                 else:
+                     var_ptr, type_name = entry
+
+                 # Slice<T> sugar: slice[i] -> *(slice.ptr + i)
+                 if isinstance(type_name, str) and type_name.startswith("Slice<"):
+                     slice_val = self.builder.load(var_ptr, name=f"{node.object.name}_slice")
+                     base_ptr = self.builder.extract_value(slice_val, 0, name="slice_ptr")
+                     elem_ptr = self.builder.gep(base_ptr, [index_val])
+                     return self.builder.load(elem_ptr)
 
                  # Arrays: alloca [N x T] -> gep (0, idx)
                  if isinstance(var_ptr.type.pointee, ir.ArrayType):
@@ -390,7 +558,11 @@ class CodeGen:
 
         # Pointer indexing: gep(ptr, idx) then load
         if isinstance(obj_val.type, ir.PointerType):
-            elem_ptr = self.builder.gep(obj_val, [index_val])
+            if isinstance(obj_val.type.pointee, ir.ArrayType):
+                zero = ir.Constant(ir.IntType(32), 0)
+                elem_ptr = self.builder.gep(obj_val, [zero, index_val])
+            else:
+                elem_ptr = self.builder.gep(obj_val, [index_val])
             return self.builder.load(elem_ptr)
         
         # If index_val is Constant, we can use extract_value
@@ -466,11 +638,29 @@ class CodeGen:
         # Auto-cast for string (array ptr -> i8*)
         if node.type_name == "string" and init_val.type != llvm_type:
              init_val = self.builder.bitcast(init_val, llvm_type)
+
+        # SPIR-V: allow pointer address-space propagation from initializer.
+        # Example: Buffer<T>.ptr may be addrspace(1) but source type is just `T*`.
+        if (
+            isinstance(llvm_type, ir.PointerType)
+            and isinstance(init_val.type, ir.PointerType)
+            and llvm_type.pointee == init_val.type.pointee
+            and llvm_type.addrspace != init_val.type.addrspace
+        ):
+            llvm_type = init_val.type
         
+        # Vulkan: avoid storing/loading pointer-typed SSA values (OpLoad result = pointer is invalid in Logical addressing).
+        if (
+            self.target == "spirv"
+            and self.spirv_env == "vulkan"
+            and isinstance(llvm_type, ir.PointerType)
+        ):
+            self.scopes[-1][node.name] = (init_val, node.type_name, "value")
+            return
+
         # Alloca
         ptr = self.builder.alloca(llvm_type, name=node.name)
         self.builder.store(init_val, ptr)
-        
         self.builder.store(init_val, ptr)
         
         # Store in scope: (Pointer, TypeName)
@@ -482,9 +672,15 @@ class CodeGen:
         if isinstance(node.target, VariableExpr):
              # Find stack allocation
              ptr = None
+             entry = None
              for scope in reversed(self.scopes):
                    if node.target.name in scope:
-                        ptr, _ = scope[node.target.name]
+                        entry = scope[node.target.name]
+                        if isinstance(entry, tuple) and len(entry) == 3 and entry[2] == "value":
+                            # SSA update (Vulkan pointer values, etc.)
+                            scope[node.target.name] = (val, entry[1], "value")
+                            return
+                        ptr, _ = entry
                         break
              if not ptr: raise Exception(f"Undefined var {node.target.name}")
              self.builder.store(val, ptr)
@@ -512,7 +708,23 @@ class CodeGen:
                   if not entry:
                        raise Exception(f"Undefined var {node.target.object.name}")
 
-                  obj_ptr, type_name = entry
+                  if isinstance(entry, tuple) and len(entry) == 3:
+                       obj_val, type_name, tag = entry
+                       # SSA pointer value (Vulkan) or Vulkan Buffer data pointer.
+                       if tag in ("value", "vulkan_buffer"):
+                            if not isinstance(obj_val.type, ir.PointerType):
+                                 raise Exception("Index assignment requires pointer/array base")
+                            if isinstance(obj_val.type.pointee, ir.ArrayType):
+                                 zero = ir.Constant(ir.IntType(32), 0)
+                                 elem_ptr = self.builder.gep(obj_val, [zero, index_val])
+                            else:
+                                 elem_ptr = self.builder.gep(obj_val, [index_val])
+                            self.builder.store(val, elem_ptr)
+                            return
+                       # Fallback to old behavior if unknown tag
+                       obj_ptr = obj_val
+                  else:
+                       obj_ptr, type_name = entry
 
                   # Array alloca: gep (0, idx)
                   if isinstance(obj_ptr.type.pointee, ir.ArrayType):
@@ -720,6 +932,9 @@ class CodeGen:
     def visit_FloatLiteral(self, node):
         return ir.Constant(ir.FloatType(), node.value)
 
+    def visit_CharLiteral(self, node):
+        return ir.Constant(ir.IntType(32), node.value)
+
     def visit_BooleanLiteral(self, node):
         val = 1 if node.value else 0
         return ir.Constant(ir.IntType(1), val)
@@ -728,7 +943,17 @@ class CodeGen:
         # Lookup in scopes (LIFO)
         for scope in reversed(self.scopes):
             if node.name in scope:
-                ptr, _ = scope[node.name]
+                entry = scope[node.name]
+                # Vulkan special entries:
+                # - (ptr, type_name, "value"): SSA value stored directly in scope (no load)
+                # - (ptr, type_name, "vulkan_buffer"): Buffer<T> handled via MemberAccess
+                if isinstance(entry, tuple) and len(entry) == 3:
+                    val_or_ptr, _, tag = entry
+                    if tag == "value":
+                        return val_or_ptr
+                    if tag == "vulkan_buffer":
+                        return val_or_ptr
+                ptr, _ = entry
                 return self.builder.load(ptr, name=node.name)
         raise Exception(f"Ref to undefined variable: {node.name}")
 
@@ -740,8 +965,28 @@ class CodeGen:
             
             voidptr_ty = ir.IntType(8).as_pointer()
             
-            if val.type == ir.IntType(32):
+            arg_node = node.args[0] if node.args else None
+            arg_type_name = getattr(arg_node, "type_name", None)
+            int_like = False
+
+            if arg_type_name == "char":
+                fmt_str = self.visit_StringLiteral(None, name="fmt_c", value_override="%c\n\0")
+                if val.type != ir.IntType(32):
+                    val = self.builder.zext(val, ir.IntType(32))
+                int_like = True
+            elif arg_type_name == "bool":
                 fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+                if val.type != ir.IntType(32):
+                    val = self.builder.zext(val, ir.IntType(32))
+                int_like = True
+            elif arg_type_name == "u8":
+                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+                if val.type != ir.IntType(32):
+                    val = self.builder.zext(val, ir.IntType(32))
+                int_like = True
+            elif val.type == ir.IntType(32):
+                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+                int_like = True
             elif val.type == ir.FloatType():
                  # printf("%f") expects double
                  fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
@@ -751,7 +996,7 @@ class CodeGen:
             
             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
             
-            if val.type == ir.IntType(32):
+            if int_like:
                 self.builder.call(self.printf, [fmt_arg, val])
             elif val.type == ir.FloatType():
                 dbl = self.builder.fpext(val, ir.DoubleType())
@@ -761,6 +1006,33 @@ class CodeGen:
                 self.builder.call(self.printf, [fmt_arg, val_arg])
             # `print` is a statement-level intrinsic (void).
             return None
+
+        elif node.callee == "slice_from_array":
+            # slice_from_array(&arr) where arr is [T:N]
+            if len(node.args) != 1:
+                raise Exception("slice_from_array expects 1 arg")
+            arr_ptr = self.visit(node.args[0])
+            if not isinstance(arr_ptr.type, ir.PointerType):
+                raise Exception("slice_from_array expects pointer to array")
+            if not hasattr(node, "type_name"):
+                raise Exception("CodeGen Error: slice_from_array CallExpr missing type_name annotation from Semantic phase.")
+            if not isinstance(arr_ptr.type.pointee, ir.ArrayType):
+                raise Exception("slice_from_array expects pointer to [N x T]")
+
+            slice_ty = self.get_llvm_type(node.type_name)
+
+            zero = ir.Constant(ir.IntType(32), 0)
+            data_ptr = self.builder.gep(arr_ptr, [zero, zero], name="slice_data")
+
+            n = getattr(node, "slice_len", None)
+            if n is None:
+                raise Exception("CodeGen Error: slice_from_array CallExpr missing slice_len")
+            len_val = ir.Constant(ir.IntType(32), int(n))
+
+            s = ir.Constant(slice_ty, ir.Undefined)
+            s = self.builder.insert_value(s, data_ptr, 0)
+            s = self.builder.insert_value(s, len_val, 1)
+            return s
         
         elif node.callee == 'panic':
              # Print message
@@ -980,8 +1252,9 @@ class CodeGen:
              return self.builder.call(self.memcpy, [dest, src, size, is_volatile])
         
         elif node.callee == "gpu::global_id":
-             if self.target == "spirv" and hasattr(self, "spirv_global_id_x"):
-                 return self.builder.load(self.spirv_global_id_x, name="spirv_global_id_x")
+             if self.target == "spirv" and hasattr(self, "spirv_global_invocation_id"):
+                 gid = self.builder.load(self.spirv_global_invocation_id, name="spirv_gid")
+                 return self.builder.extract_element(gid, ir.Constant(ir.IntType(32), 0), name="spirv_gid_x")
              return self.builder.load(self.gpu_global_id, name="gpu_global_id")
 
         elif node.callee == "gpu::dispatch":
@@ -1156,7 +1429,15 @@ class CodeGen:
 
         # Determine function type
         arg_types = []
-        for _, ptype in node.params:
+        # Vulkan Shader entrypoints cannot have parameters; map kernel params to globals instead.
+        if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:
+            for pname, ptype in node.params:
+                if isinstance(ptype, str) and ptype.startswith("Buffer<"):
+                    self._get_or_declare_vulkan_buffer_globals(node.name, pname, ptype)
+                else:
+                    self._get_or_declare_vulkan_kernel_arg_global(node.name, pname, ptype)
+        else:
+            for _, ptype in node.params:
              # Handle arrays manually for now or add to get_llvm_type
              if ptype.startswith('['):
                   content = ptype[1:-1]
@@ -1193,7 +1474,12 @@ class CodeGen:
         
         # Function already declared in Pass 2
         func = self.module.get_global(node.name)
+        if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:
+            self._kernel_function_names.add(node.name)
         
+        self._current_function_name = node.name
+        self._current_function_is_kernel = bool(node.is_kernel)
+
         entry_block = func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry_block)
         
@@ -1201,14 +1487,26 @@ class CodeGen:
         self.scopes.append({})
         
         # Register arguments in scope
-        for i, (pname, ptype) in enumerate(node.params):
-             arg_val = func.args[i]
-             arg_val.name = pname
-             alloca = self.builder.alloca(self.get_llvm_type(ptype), name=pname)
-             self.builder.store(arg_val, alloca)
-             
-             # Store in scope: (Pointer, TypeName)
-             self.scopes[-1][pname] = (alloca, ptype)
+        if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:
+            for pname, ptype in node.params:
+                if isinstance(ptype, str) and ptype.startswith("Buffer<"):
+                    data_gv, len_gv = self._get_or_declare_vulkan_buffer_globals(node.name, pname, ptype)
+                    # Store as special entry; MemberAccess will resolve ptr/len.
+                    self.scopes[-1][pname] = (data_gv, ptype, "vulkan_buffer")
+                    self._vulkan_buffer_args[(node.name, pname)] = (data_gv, len_gv)
+                else:
+                    gv = self._get_or_declare_vulkan_kernel_arg_global(node.name, pname, ptype)
+                    # Treat global like a pointer slot for VariableExpr loads.
+                    self.scopes[-1][pname] = (gv, ptype)
+        else:
+            for i, (pname, ptype) in enumerate(node.params):
+                 arg_val = func.args[i]
+                 arg_val.name = pname
+                 alloca = self.builder.alloca(self.get_llvm_type(ptype), name=pname)
+                 self.builder.store(arg_val, alloca)
+                 
+                 # Store in scope: (Pointer, TypeName)
+                 self.scopes[-1][pname] = (alloca, ptype)
         
         # Process body
         for stmt in node.body:

@@ -1,0 +1,10 @@
+# Build / scratch outputs (local development)
+dev/
+
+# Common compiler artifacts
+*.ll
+*.bc
+*.spv
+*.spvasm
+
+

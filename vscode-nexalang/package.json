@@ -1,0 +1,32 @@
+{
+  "name": "nexalang",
+  "displayName": "NexaLang",
+  "description": "Syntax highlighting for NexaLang (.nxl)",
+  "version": "0.0.1",
+  "publisher": "thiago-henrique",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nexalang",
+        "aliases": ["NexaLang", "nexalang"],
+        "extensions": [".nxl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nexalang",
+        "scopeName": "source.nexalang",
+        "path": "./syntaxes/nexalang.tmLanguage.json"
+      }
+    ]
+  }
+}
+
+

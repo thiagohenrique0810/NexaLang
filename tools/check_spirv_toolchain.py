@@ -27,6 +27,7 @@ def main() -> int:
         ("llvm-spirv", "SPIRV-LLVM-Translator (turn .bc into .spv)"),
         ("spirv-val", "SPIR-V Tools (validate .spv)"),
         ("spirv-dis", "SPIR-V Tools (disassemble .spv)"),
+        ("spirv-as", "SPIR-V Tools (assemble .spvasm -> .spv; used for Vulkan variable-pointers patching)"),
         ("clang", "LLVM/Clang (optional; useful for native builds and some SPIR-V workflows)"),
     ]
 
@@ -48,6 +49,8 @@ def main() -> int:
         print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out output.spv")
         if found.get("spirv-val"):
             print("  spirv-val output.spv")
+        if found.get("spirv-as"):
+            print("\nNote: For `--spirv-env vulkan`, `spirv-as` enables an optional patch to add VariablePointers capabilities when needed.")
         return 0
 
     print("Missing required tools: need either `llc` OR (`llvm-as` + `llvm-spirv`).")
