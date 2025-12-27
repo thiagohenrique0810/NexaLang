@@ -1,5 +1,5 @@
 from llvmlite import ir
-from parser import StructDef, EnumDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess, CharLiteral
+from parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess, CharLiteral
 
 class CodeGen:
     def __init__(
@@ -38,6 +38,7 @@ class CodeGen:
         self.ftell = None
         self.fread = None
         self.fclose = None
+        self.fwrite = None
 
         # Core compiler state
         self.struct_types = {} # name -> ir.LiteralStructType
@@ -75,6 +76,8 @@ class CodeGen:
         self.ftell = ir.Function(self.module, ir.FunctionType(i64, [void_ptr]), name="ftell")
         # size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream)
         self.fread = ir.Function(self.module, ir.FunctionType(i64, [void_ptr, i64, i64, void_ptr]), name="fread")
+        # size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream)
+        self.fwrite = ir.Function(self.module, ir.FunctionType(i64, [void_ptr, i64, i64, void_ptr]), name="fwrite")
         # int fclose(FILE* stream)
         self.fclose = ir.Function(self.module, ir.FunctionType(i32, [void_ptr]), name="fclose")
 
@@ -393,8 +396,8 @@ class CodeGen:
                 elif ptype == 'string':
                     max_size = max(max_size, 8) # Pointer size
                     variant_payload_types[vname] = ir.IntType(8).as_pointer()
-                elif ptype in self.struct_types:
-                    # Struct payload - assume pointer or by value?
+                elif ptype in self.struct_types or ptype in self.enum_definitions:
+                    # Struct or Enum payload
                     # For simplicity, treat as by-value, but size might be large.
                     # Or maybe we store structs as pointers in enums?
                     # Let's say we support stored structs.
@@ -403,7 +406,11 @@ class CodeGen:
                     # We can't easily get size in bytes from llvmlite without target data layout.
                     # Hack: assume large defaults or skip for now?
                     # Let's Skip arbitrary structs for now to avoid complexity, or assume 64 bytes?
-                    pass
+                     max_size = max(max_size, 64) # Hacky max size
+                     enum_ty = None
+                     if ptype in self.struct_types: enum_ty = self.struct_types[ptype]
+                     else: enum_ty, _ = self.enum_definitions[ptype]
+                     variant_payload_types[vname] = enum_ty
                 elif ptype.endswith('*') or ptype.startswith('['):
                      # Pointers/Arrays
                      max_size = max(max_size, 8)
@@ -425,6 +432,10 @@ class CodeGen:
         self.enum_payloads[node.name] = variant_payload_types
         self.enum_definitions[node.name] = (enum_ty, max_size)
 
+    def visit_ImplDef(self, node):
+        for method in node.methods:
+             self.visit(method)
+
     def generate(self, ast):
         # Pass 1: Types (Structs, Enums)
         for node in ast:
@@ -437,6 +448,9 @@ class CodeGen:
                 if self.emit_kernels_only and not node.is_kernel:
                     continue
                 self._declare_function(node)
+            elif isinstance(node, ImplDef):
+                 for method in node.methods:
+                      self._declare_function(method)
                 
         # Pass 3: Bodies
         for node in ast:
@@ -637,6 +651,15 @@ class CodeGen:
     def visit_Block(self, node):
         self.scopes.append({})
         for stmt in node.statements:
+             self.visit(stmt)
+        
+        # Auto-drop variables in this scope
+        self.emit_scope_drops(self.scopes[-1])
+        self.scopes.pop()
+
+    def visit_BlockStmt(self, node):
+        self.scopes.append({})
+        for stmt in node.stmts:
              self.visit(stmt)
         
         # Auto-drop variables in this scope
@@ -1084,6 +1107,34 @@ class CodeGen:
             out = self.builder.insert_value(out, sz_i32, 1)
             return out
 
+        elif node.callee == "fs::write_file" or node.callee == "fs::append_file":
+            if len(node.args) != 3:
+                raise Exception(f"{node.callee} expects 3 args")
+            path = self.visit(node.args[0])  # i8*
+            data = self.visit(node.args[1])  # i8* (string) or u8*
+            length = self.visit(node.args[2])  # i32
+
+            void_ptr = ir.IntType(8).as_pointer()
+            i32 = ir.IntType(32)
+            i64 = ir.IntType(64)
+
+            path_c = self.builder.bitcast(path, void_ptr) if path.type != void_ptr else path
+            data_c = self.builder.bitcast(data, void_ptr) if data.type != void_ptr else data
+
+            mode = "wb\0" if node.callee == "fs::write_file" else "ab\0"
+            mode_arr = self.visit_StringLiteral(None, name="fs_mode_write", value_override=mode)
+            mode_ptr = self.builder.bitcast(mode_arr, void_ptr)
+
+            f = self.builder.call(self.fopen, [path_c, mode_ptr], name="f")
+            is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
+            with self.builder.if_then(is_null):
+                self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
+
+            nmemb = self.builder.zext(length, i64, name="len_i64")
+            _written = self.builder.call(self.fwrite, [data_c, ir.Constant(i64, 1), nmemb, f])
+            _ = self.builder.call(self.fclose, [f])
+            return None
+
         elif node.callee == "slice_from_array":
             # slice_from_array(&arr) where arr is [T:N]
             if len(node.args) != 1:
@@ -1423,6 +1474,7 @@ class CodeGen:
     def visit_MatchExpr(self, node):
         # 1. Evaluate value
         val = self.visit(node.value) # Expect {tag, data} (value or pointer?)
+        print(f"DEBUG MatchExpr Value Type: {val.type}")
         
         # Allocate val to stack to easily access payload address later
         val_ptr = self.builder.alloca(val.type)
@@ -1493,10 +1545,11 @@ class CodeGen:
         for scope in reversed(self.scopes):
              self.emit_scope_drops(scope)
         
-        if ret_val:
-            self.builder.ret(ret_val)
-        else:
-            self.builder.ret_void()
+        if not self.builder.block.is_terminated:
+            if ret_val:
+                self.builder.ret(ret_val)
+            else:
+                self.builder.ret_void()
 
     def _declare_function(self, node):
         if node.generics: return

@@ -39,6 +39,11 @@ class EnumDef(ASTNode):
         self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
         self.generics = generics or []
 
+class ImplDef(ASTNode):
+    def __init__(self, struct_name, methods):
+        self.struct_name = struct_name
+        self.methods = methods
+
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
         self.value = value
@@ -108,7 +113,21 @@ class UnaryExpr(ASTNode):
 
     def parse_statement(self):
         token = self.peek()
-        if token.type == 'LET':
+        if token.type == 'LBRACE':
+            self.consume('LBRACE')
+            body = []
+            while self.peek().type != 'RBRACE':
+                body.append(self.parse_statement())
+                if self.peek().type == 'SEMICOLON':
+                    self.consume('SEMICOLON')
+            self.consume('RBRACE')
+            # Return a Block? Or list of Stmts?
+            # Since parse_statement returns single ASTNode, we need a Block node.
+            # But for bootstrap simplicity, if caller expects list, this is tricky.
+            # However, Block IS a statement usually.
+            # Let's define BlockStmt.
+            return BlockStmt(body)
+        elif token.type == 'LET':
             return self.parse_var_decl()
         elif token.type == 'RETURN':
             return self.parse_return()
@@ -157,6 +176,10 @@ class VariableExpr(ASTNode):
     def __init__(self, name):
         self.name = name
 
+class BlockStmt(ASTNode):
+    def __init__(self, stmts):
+        self.stmts = stmts
+
 class RegionStmt(ASTNode):
     def __init__(self, name, body):
         self.name = name
@@ -189,9 +212,21 @@ class Parser:
                 nodes.append(self.parse_struct())
             elif self.peek().type == 'ENUM':
                 nodes.append(self.parse_enum())
+            elif self.peek().type == 'IMPL':
+                nodes.append(self.parse_impl())
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
+
+    def parse_impl(self):
+        self.consume('IMPL')
+        struct_name = self.consume('IDENTIFIER').value
+        self.consume('LBRACE')
+        methods = []
+        while self.peek().type != 'RBRACE':
+            methods.append(self.parse_function(is_kernel=False))
+        self.consume('RBRACE')
+        return ImplDef(struct_name, methods)
 
     def parse_struct(self):
         self.consume('STRUCT')
@@ -267,12 +302,22 @@ class Parser:
         self.consume('LPAREN')
         params = []
         while self.peek().type != 'RPAREN':
-            param_name = self.consume('IDENTIFIER').value
-            self.consume('COLON')
-            param_type = self.parse_type()
-            params.append((param_name, param_type))
+            # Handle self
+            if self.peek().type == 'SELF':
+                 self.consume('SELF')
+                 params.append(('self', 'Self'))
+            elif self.peek().type == 'AMPERSAND' and self.peek(1).type == 'SELF':
+                 self.consume('AMPERSAND')
+                 self.consume('SELF')
+                 params.append(('self', '&Self'))
+            else:
+                 param_name = self.consume('IDENTIFIER').value
+                 self.consume('COLON')
+                 param_type = self.parse_type()
+                 params.append((param_name, param_type))
+            
             if self.peek().type == 'COMMA':
-                self.consume('COMMA')
+                 self.consume('COMMA')
         self.consume('RPAREN')
         
         return_type = 'void'
@@ -292,8 +337,11 @@ class Parser:
 
     def parse_statement(self):
         token = self.peek()
+        print(f"DEBUG: parse_statement peek: {token}. type='{token.type}' == LET? {token.type == 'LET'}")
         if token.type == 'LET':
+            # print(f"DEBUG: LET check passed")
             return self.parse_var_decl()
+        print(f"DEBUG: Checking others. type='{token.type}'")
         elif token.type == 'RETURN':
             return self.parse_return()
         elif token.type == 'IF':
@@ -304,11 +352,22 @@ class Parser:
             return self.parse_match()
         elif token.type == 'REGION':
             return self.parse_region()
+        elif token.type == 'LBRACE':
+            self.consume('LBRACE')
+            stmts = []
+            while self.peek().type != 'RBRACE':
+                stmts.append(self.parse_statement())
+                if self.peek().type == 'SEMICOLON':
+                     self.consume('SEMICOLON')
+            self.consume('RBRACE')
+            return BlockStmt(stmts)
         else:
             # General Expression or Assignment
             # Try parsing as expression
             # If followed by =, it's an assignment.
             # Otherwise it's an expression statement.
+            # Expression statement
+            # expr = self.parse_expression() # Line 330 (approx)
             expr = self.parse_expression()
             
             if self.peek().type == 'EQ':
@@ -344,7 +403,12 @@ class Parser:
                     if self.peek().type == 'COMMA':
                         self.consume('COMMA')
                 self.consume('GT')
-                return f"{name}<{','.join(args)}>"
+                name = f"{name}<{','.join(args)}>"
+            
+            # Support Postfix '*' (e.g. i32*)
+            while self.peek().type == 'STAR':
+                self.consume('STAR')
+                name = f"{name}*"
             
             return name
         elif self.peek().type == 'STAR':
@@ -613,9 +677,13 @@ class Parser:
             self.consume('RBRACKET')
             expr = ArrayLiteral(elements)
         else:
-            raise Exception(f"Unexpected token in primary: {token}")
+            # Print context
+            start = max(0, self.pos - 10)
+            end = min(len(self.tokens), self.pos + 10)
+            context = self.tokens[start:end]
+            raise Exception(f"Unexpected token in primary: {token}. Type: '{token.type}'. Context: {context}")
             
-        # Postfix Handlers (Member Access, Index Access, Call?)
+        # Postfix Handlers (Member Access, Index Access, Call)
         while True:
             if self.peek().type == 'DOT':
                 self.consume('DOT')
@@ -626,6 +694,9 @@ class Parser:
                 index = self.parse_expression()
                 self.consume('RBRACKET')
                 expr = IndexAccess(expr, index)
+            elif self.peek().type == 'LPAREN':
+                args = self.parse_call_arguments()
+                expr = CallExpr(expr, args)
             else:
                 break
                 
@@ -633,9 +704,13 @@ class Parser:
 
     def parse_call(self):
         name = self.consume('IDENTIFIER').value
-        return self.parse_call_explicit(name)
+        return CallExpr(name, self.parse_call_arguments())
 
     def parse_call_explicit(self, name):
+        # Used by DoubleColon path
+        return CallExpr(name, self.parse_call_arguments())
+
+    def parse_call_arguments(self):
         self.consume('LPAREN')
         args = []
         if self.peek().type != 'RPAREN':
@@ -645,4 +720,4 @@ class Parser:
                     break
                 self.consume('COMMA')
         self.consume('RPAREN')
-        return CallExpr(name, args)
+        return args

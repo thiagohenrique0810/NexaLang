@@ -1,5 +1,5 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
+from parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
 import sys
 import copy
 class SemanticAnalyzer:
@@ -48,7 +48,7 @@ class SemanticAnalyzer:
     def analyze(self, ast):
         self.ast_root = ast
         # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
         self.enums = {} # name -> {variant: [payload_types]}
@@ -76,6 +76,11 @@ class SemanticAnalyzer:
                      # Variants: list of (name, payload_types)
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
+            elif isinstance(node, ImplDef):
+                 pass # We handle ImplDef in a second pass or directly in visit loop?
+                 # Actually, methods should be available before visiting bodies.
+                 # So we should process ImplDef here (extract method signatures).
+                 self.register_impl_methods(node)
         
         # Built-in generic Buffer<T> (for GPU/heterogeneous APIs):
         # struct Buffer<T> { ptr: *T, len: i32 }
@@ -114,21 +119,54 @@ class SemanticAnalyzer:
     def visit_EnumDef(self, node):
         pass # Already collected
 
+    def visit_ImplDef(self, node):
+        # Visit methods to check bodies
+        for method in node.methods:
+             self.visit(method) # visit_FunctionDef
+
+    def register_impl_methods(self, node):
+        struct_name = node.struct_name
+        # Mangle method names and fix 'self' types
+        for method in node.methods:
+             # Check for duplicate?
+             
+             # Rewrite 'self'
+             if method.params:
+                  pname, ptype = method.params[0]
+                  if pname == 'self':
+                       # method.params is list of tuples (name, type)
+                       # tuples are immutable. Need to replace tuple in list.
+                       if ptype == 'Self': 
+                           method.params[0] = ('self', struct_name)
+                       elif ptype == '&Self': 
+                           method.params[0] = ('self', f"{struct_name}*")
+             
+             # Mangle name
+             mangled_name = f"{struct_name}_{method.name}"
+             method.name = mangled_name # Update AST for CodeGen/Semantic visitation
+             
+             self.functions.add(mangled_name)
+             self.function_defs[mangled_name] = method
+
     def visit_MemberAccess(self, node):
         # 1. Evaluate object
         obj_type = self.visit(node.object)
         
-        # 2. Check if object is a struct
-        if obj_type not in self.structs:
+        # 2. Check if object is a struct or pointer to struct
+        base_type = obj_type
+        if base_type.endswith('*'):
+             base_type = base_type[:-1]
+
+        if base_type not in self.structs:
              raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         # 3. Check if member exists
-        fields = self.structs[obj_type]
+        fields = self.structs[base_type]
         if node.member not in fields:
-             raise Exception(f"Type Error: Struct '{obj_type}' has no member '{node.member}'")
+             raise Exception(f"Type Error: Struct '{base_type}' has no member '{node.member}'")
         
         # Annotate node for CodeGen
-        node.struct_type = obj_type
+        node.struct_type = base_type
              
         ty = fields[node.member]
         node.type_name = ty
@@ -648,15 +686,48 @@ class SemanticAnalyzer:
         return ty
 
     def visit_CallExpr(self, node):
+        callee_name = None
+        
+        # 1. Resolve Callee Name or Handle Method Call
+        if isinstance(node.callee, str):
+            callee_name = node.callee
+        elif isinstance(node.callee, VariableExpr):
+            callee_name = node.callee.name
+        elif isinstance(node.callee, MemberAccess):
+             obj_node = node.callee.object
+             method_name = node.callee.member
+             obj_type = self.visit(obj_node)
+             base_type = obj_type
+             if base_type.endswith('*'): base_type = base_type[:-1]
+             mangled_name = f"{base_type}_{method_name}"
+             
+             if mangled_name in self.functions:
+                  target_func = self.function_defs[mangled_name]
+                  if target_func.params and target_func.params[0][0] == 'self':
+                      self_param_type = target_func.params[0][1]
+                      arg_expr = obj_node
+                      if obj_type == base_type and self_param_type.endswith('*'):
+                           arg_expr = UnaryExpr('&', obj_node)
+                      elif obj_type.endswith('*') and not self_param_type.endswith('*'):
+                           arg_expr = UnaryExpr('*', obj_node)
+                      node.args.insert(0, arg_expr)
+                  callee_name = mangled_name
+                  node.callee = callee_name 
+             else:
+                  raise Exception(f"Method '{method_name}' not found for type '{base_type}'")
+
+        if not callee_name:
+             raise Exception(f"Semantic Error: Call to complex expression or unknown method: {node.callee}")
+
         # Intrinsics
-        if node.callee == 'print':
+        if callee_name == 'print':
             self.enter_scope()
             for arg in node.args:
                 self.visit(arg)
             self.exit_scope()
             node.type_name = 'void'
             return 'void'
-        elif node.callee == 'fs::read_file':
+        elif callee_name == 'fs::read_file':
             # fs::read_file(path: string) -> Buffer<u8>
             if len(node.args) != 1:
                 raise Exception("fs::read_file expects 1 arg: path (string)")
@@ -667,6 +738,136 @@ class SemanticAnalyzer:
             self.instantiate_generic_type(ret_ty)
             node.type_name = ret_ty
             return ret_ty
+        elif callee_name == 'fs::write_file' or callee_name == 'fs::append_file':
+            if len(node.args) != 3: raise Exception(f"{callee_name} expects 3 args: (path, data, len)")
+            path_ty = self.visit(node.args[0])
+            data_ty = self.visit(node.args[1])
+            len_ty = self.visit(node.args[2])
+            if path_ty != 'string': raise Exception(f"Type Error: {callee_name} expects string path")
+            if data_ty != 'string' and data_ty != 'u8*': raise Exception(f"Type Error: {callee_name} expects data as string or u8*")
+            if len_ty != 'i32': raise Exception(f"Type Error: {callee_name} expects len as i32")
+            node.type_name = 'void'
+            return 'void'
+        elif callee_name == 'slice_from_array':
+            if len(node.args) != 1: raise Exception("slice_from_array expects 1 arg")
+            arg_ty = self.visit(node.args[0])
+            if not arg_ty.endswith('*'): raise Exception("slice_from_array expects pointer")
+            elem_type = arg_ty[:-1].split('[')[1].split(':')[0]
+            size = int(arg_ty[:-1].split(':')[1][:-1])
+            slice_ty = f"Slice<{elem_type}>"
+            self.instantiate_generic_type(slice_ty)
+            node.type_name = slice_ty
+            node.slice_elem_type = elem_type
+            node.slice_len = size
+            return slice_ty
+        elif callee_name == 'memcpy':
+            if len(node.args) != 3: raise Exception("memcpy requires 3 args")
+            self.enter_scope()
+            self.visit(node.args[0])
+            self.visit(node.args[1])
+            size_ty = self.visit(node.args[2])
+            self.exit_scope()
+            if size_ty != 'i32': raise Exception("memcpy size must be i32")
+            node.type_name = 'void'
+            return 'void'
+        elif callee_name == 'malloc':
+             self.enter_scope()
+             size_type = self.visit(node.args[0])
+             self.exit_scope()
+             node.type_name = 'u8*'
+             return 'u8*'
+        elif callee_name == 'free':
+             self.enter_scope()
+             self.visit(node.args[0])
+             self.exit_scope()
+             node.type_name = 'void'
+             return 'void'
+        elif callee_name == 'realloc':
+             self.enter_scope()
+             self.visit(node.args[0])
+             self.visit(node.args[1])
+             self.exit_scope()
+             node.type_name = 'u8*'
+             return 'u8*'
+        elif callee_name == 'panic':
+            self.enter_scope()
+            self.visit(node.args[0])
+            self.exit_scope()
+            node.type_name = 'void'
+            return 'void'
+        elif callee_name == 'assert':
+            self.enter_scope()
+            self.visit(node.args[0])
+            self.visit(node.args[1])
+            self.exit_scope()
+            node.type_name = 'void'
+            return 'void'
+        elif callee_name == 'gpu::global_id':
+             node.type_name = 'i32'
+             return 'i32'
+        elif callee_name == 'gpu::dispatch':
+            node.type_name = 'void'
+            return 'void'
+        elif callee_name.startswith('cast<'):
+             self.visit(node.args[0])
+             return callee_name[5:-1]
+        elif callee_name.startswith('sizeof<'):
+             return 'i32'
+        elif callee_name.startswith('ptr_offset<'):
+             target_type = callee_name[11:-1]
+             self.visit(node.args[0])
+             self.visit(node.args[1])
+             return f"{target_type}*"
+
+        # Generic Instantiation
+        if '<' in callee_name:
+             self.instantiate_generic_function(callee_name)
+
+        # Regular Function Call
+        if callee_name in self.function_defs:
+            fn = self.function_defs[callee_name]
+            if len(node.args) != len(fn.params):
+                 raise Exception(f"Function identity '{callee_name}' expects {len(fn.params)} args, got {len(node.args)}")
+            
+            self.enter_scope()
+            for i, arg in enumerate(node.args):
+                 arg_ty = self.visit(arg)
+                 _pname, ptype = fn.params[i]
+                 if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
+                      self.move_var(arg.name)
+            self.exit_scope()
+            return fn.return_type
+
+        # Struct Constructor
+        if callee_name in self.structs:
+            self.enter_scope()
+            for arg in node.args:
+                arg_ty = self.visit(arg)
+                if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
+                    self.move_var(arg.name)
+            self.exit_scope()
+            return callee_name
+
+        # Enum Variant
+        if '::' in callee_name:
+            parts = callee_name.rsplit('::', 1)
+            enum_name = parts[0]
+            variant_name = parts[1]
+            if '<' in enum_name: self.instantiate_generic_type(enum_name)
+            if enum_name in self.enums:
+                 variants = self.enums[enum_name]
+                 if variant_name not in variants: raise Exception(f"Enum has no variant '{variant_name}'")
+                 payloads = variants[variant_name]
+                 if len(node.args) != len(payloads): raise Exception("Enum arg mismatch")
+                 self.enter_scope()
+                 for i, arg in enumerate(node.args):
+                      self.visit(arg)
+                      if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
+                           self.move_var(arg.name)
+                 self.exit_scope()
+                 return enum_name
+
+        raise Exception(f"Semantic Error: Call to undefined function '{callee_name}'")
         elif node.callee == 'slice_from_array':
             # slice_from_array(&arr) -> Slice<T>
             if len(node.args) != 1:
@@ -821,39 +1022,56 @@ class SemanticAnalyzer:
             self.exit_scope()
             return node.callee
             
-        # Enum Variant: Enum::Variant
-        if '::' in node.callee:
-            parts = node.callee.rsplit('::', 1)
-            enum_name = parts[0]
-            variant_name = parts[1]
+        # Double Colon Logic (Enums or Static Methods)
+        if '::' in callee_name:
+            parts = callee_name.rsplit('::', 1)
+            prefix = parts[0]
+            suffix = parts[1]
             
-            # Instantiate generic enum if needed
-            if '<' in enum_name:
-                self.instantiate_generic_type(enum_name)
+            # 1. Try Enum Variant
+            if '<' in prefix: self.instantiate_generic_type(prefix)
             
-            if enum_name in self.enums:
-                 variants = self.enums[enum_name]
-                 if variant_name not in variants:
-                      raise Exception(f"Semantic Error: Enum '{enum_name}' has no variant '{variant_name}'")
+            if prefix in self.enums:
+                 variants = self.enums[prefix]
+                 if suffix not in variants:
+                      raise Exception(f"Semantic Error: Enum '{prefix}' has no variant '{suffix}'")
                  
-                 payloads = variants[variant_name]
+                 payloads = variants[suffix]
                  if len(node.args) != len(payloads):
-                      raise Exception(f"Semantic Error: Variant '{node.callee}' expects {len(payloads)} arguments, got {len(node.args)}")
+                      raise Exception(f"Semantic Error: Variant '{callee_name}' expects {len(payloads)} arguments, got {len(node.args)}")
                  
                  self.enter_scope()
                  for i, arg in enumerate(node.args):
                       arg_type = self.visit(arg)
                       if arg_type != payloads[i]:
-                           raise Exception(f"Type Error: Variant '{variant_name}' arg {i} expected '{payloads[i]}', got '{arg_type}'")
+                           raise Exception(f"Type Error: Variant '{suffix}' arg {i} expected '{payloads[i]}', got '{arg_type}'")
 
                       # Move payload variables if the payload type is move-only
                       if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
                           self.move_var(arg.name)
                  self.exit_scope()
+                 return prefix
+            
+            # 2. Try Static Method (Struct_method)
+            mangled = f"{prefix}_{suffix}"
+            if mangled in self.function_defs:
+                 fn = self.function_defs[mangled]
+                 callee_name = mangled
+                 node.callee = callee_name # Update for CodeGen
                  
-                 return enum_name
-            else:
-                 raise Exception(f"Semantic Error: Unknown function or type '{node.callee}'")
+                 if len(node.args) != len(fn.params):
+                      raise Exception(f"Static Method '{callee_name}' expects {len(fn.params)} args, got {len(node.args)}")
+                 
+                 self.enter_scope()
+                 for i, arg in enumerate(node.args):
+                      arg_ty = self.visit(arg)
+                      _pname, ptype = fn.params[i]
+                      if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
+                           self.move_var(arg.name)
+                 self.exit_scope()
+                 return fn.return_type
+            
+            raise Exception(f"Semantic Error: Unknown function or type '{callee_name}'")
 
         raise Exception(f"Semantic Error: Unknown function '{node.callee}'")
 
@@ -979,3 +1197,9 @@ class SemanticAnalyzer:
              return mapping[type_str]
              
         return type_str
+
+    def visit_BlockStmt(self, node):
+        self.enter_scope()
+        for stmt in node.stmts:
+             self.visit(stmt)
+        self.exit_scope()

@@ -1,0 +1,36 @@
+struct Vector {
+    x: i32,
+    y: i32
+}
+
+impl Vector {
+    fn new(x: i32, y: i32) -> Vector {
+        return Vector(x, y);
+    }
+    
+    fn dot(&self, other: Vector) -> i32 {
+         let a = self.x * other.x;
+         let b = self.y * other.y;
+         return a + b;
+    }
+    
+    fn set_x(&self, val: i32) {
+         # self is &Vector.
+    }
+}
+
+fn main() -> i32 {
+    let v1 = Vector::new(10, 20);
+    let v2 = Vector::new(3, 4);
+    
+    # Method call
+    let prod = v1.dot(v2);
+    
+    print(prod); # Should be 30 + 80 = 110
+    
+    if prod == 110 {
+        return 0;
+    } else {
+        return 1;
+    }
+}

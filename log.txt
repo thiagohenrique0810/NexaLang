@@ -1,0 +1,160 @@
+﻿DEBUG: VarDecl 'x' type='i32' init_type='i32'
+DEBUG: VarDecl 'x' type='i32' init_type='i32'
+DEBUG: VarDecl 'x' type='i32' init_type='i32'
+DEBUG: VarDecl 'p' type='u8*' init_type='u8*'
+DEBUG: VarDecl 'i' type='i32' init_type='i32'
+DEBUG: VarDecl 'c' type='u8' init_type='u8'
+DEBUG: VarDecl 'pa' type='u8*' init_type='u8*'
+DEBUG: VarDecl 'pb' type='u8*' init_type='u8*'
+DEBUG: VarDecl 'i' type='i32' init_type='i32'
+DEBUG: VarDecl 'ca' type='u8' init_type='u8'
+DEBUG: VarDecl 'cb' type='u8' init_type='u8'
+DEBUG: VarDecl 'chunk' type='u8*' init_type='u8*'
+DEBUG: VarDecl 'off' type='i32' init_type='i32'
+DEBUG: VarDecl 'ptr' type='u8*' init_type='u8*'
+DEBUG: VarDecl 'idx' type='i32' init_type='i32'
+DEBUG: VarDecl 'i' type='i32' init_type='i32'
+DEBUG: VarDecl 'c' type='u8' init_type='u8'
+DEBUG: VarDecl 'j' type='i32' init_type='i32'
+DEBUG: VarDecl 'start' type='i32' init_type='i32'
+DEBUG: VarDecl 'j' type='i32' init_type='i32'
+DEBUG: VarDecl 'start' type='i32' init_type='i32'
+DEBUG: VarDecl 'j' type='i32' init_type='i32'
+DEBUG: VarDecl 'is_match' type='bool' init_type='bool'
+DEBUG: VarDecl 'start' type='i32' init_type='i32'
+DEBUG: VarDecl 'j' type='i32' init_type='i32'
+DEBUG: VarDecl 't' type='Token*' init_type='Token*'
+DEBUG: VarDecl 't' type='Token*' init_type='Token*'
+DEBUG: VarDecl 't' type='Token*' init_type='Token*'
+DEBUG: VarDecl 't' type='Token*' init_type='Token*'
+DEBUG: VarDecl 'e' type='Expr' init_type='Expr'
+DEBUG: VarDecl 'name_tok' type='Token' init_type='Token'
+DEBUG: VarDecl 'stmts_ptr' type='Stmt*' init_type='Stmt*'
+DEBUG: VarDecl 'cnt' type='i32' init_type='i32'
+DEBUG: VarDecl 't' type='Token*' init_type='Token*'
+DEBUG: VarDecl 's' type='i32' init_type='i32'
+DEBUG: VarDecl 'c' type='u8' init_type='u8'
+DEBUG: VarDecl 'stmt' type='Stmt' init_type='Stmt'
+DEBUG: VarDecl 'funcs_ptr' type='Function*' init_type='Function*'
+DEBUG: VarDecl 'cnt' type='i32' init_type='i32'
+DEBUG: VarDecl 'out' type='string' init_type='string'
+DEBUG: VarDecl 'i' type='i32' init_type='i32'
+DEBUG: VarDecl 'f' type='Function' init_type='Function'
+DEBUG: VarDecl 'j' type='i32' init_type='i32'
+DEBUG: VarDecl 's' type='Stmt' init_type='Stmt'
+DEBUG: VarDecl 'src_buf' type='Buffer<u8>' init_type='Buffer<u8>'
+DEBUG: VarDecl 'max_toks' type='i32' init_type='i32'
+DEBUG: VarDecl 'tok_bytes' type='i32' init_type='i32'
+DEBUG: VarDecl 'tokens' type='Token*' init_type='Token*'
+DEBUG: VarDecl 'count' type='i32' init_type='i32'
+DEBUG: VarDecl 'mem' type='Arena' init_type='Arena'
+DEBUG: VarDecl 'parser' type='Parser' init_type='Parser'
+DEBUG: VarDecl 'prog' type='Program' init_type='Program'
+DEBUG MatchExpr Value Type: {i32, [8 x i8]}
+DEBUG MatchExpr Value Type: i32
+python : Traceback (most recent call 
+last):
+No linha:1 caractere:1
++ python nx.py build 
+selfhost/stage5_full.nxl --no-link 
+2>&1 | Out-File ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpe 
+   cified: (Traceback (most recent   
+  call last)::String) [], RemoteEx   
+ ception
+    + FullyQualifiedErrorId : Native 
+   CommandError
+ 
+  File "C:\Users\thiag\AppData\Local\
+Programs\Python\Python313\Lib\site-pa
+ckages\llvmlite\ir\instructions.py", 
+line 697, in __init__
+    typ = typ.elements[i]
+          ^^^^^^^^^^^^
+AttributeError: 'IntType' object has 
+no attribute 'elements'
+
+During handling of the above 
+exception, another exception 
+occurred:
+
+Traceback (most recent call last):
+  File 
+"Y:\WWW\NexaLang\bootstrap\main.py", 
+line 90, in <module>
+    main()
+    ~~~~^^
+  File 
+"Y:\WWW\NexaLang\bootstrap\main.py", 
+line 55, in main
+    llvm_ir = codegen.generate(ast)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 449, in generate
+    self.visit(node)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 1629, in 
+visit_FunctionDef
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 932, in 
+visit_WhileStmt
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 932, in 
+visit_WhileStmt
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 1511, in 
+visit_MatchExpr
+    self.visit(case.body)
+    ~~~~~~~~~~^^^^^^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 652, in 
+visit_BlockStmt
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 459, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\cod
+egen.py", line 1473, in 
+visit_MatchExpr
+    tag_val = 
+self.builder.extract_value(val, 0)
+  File "C:\Users\thiag\AppData\Local\
+Programs\Python\Python313\Lib\site-pa
+ckages\llvmlite\ir\builder.py", line 
+974, in extract_value
+    instr = instructions.ExtractValue
+(self.block, agg, idx, name=name)
+  File "C:\Users\thiag\AppData\Local\
+Programs\Python\Python313\Lib\site-pa
+ckages\llvmlite\ir\instructions.py", 
+line 699, in __init__
+    raise TypeError("Can't index at 
+%r in %s"
+                    % 
+(list(indices), agg.type))
+TypeError: Can't index at [0] in i32
++ C:\Users\thiag\AppData\Local\Programs\Python\Python313\python.exe Y:\WWW\NexaLang\bootstrap\main.py selfhost/stage5_full.nxl --target native --emit ll --out Y:\WWW\NexaLang\dev\artifacts\output.ll

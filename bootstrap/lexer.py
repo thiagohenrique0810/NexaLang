@@ -105,13 +105,25 @@ class Lexer:
             elif char == '&':
                 tokens.append(Token('AMPERSAND', '&'))
                 self.pos += 1
+            elif char == '!':
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
+                   tokens.append(Token('NEQ', '!='))
+                   self.pos += 2
+                else:
+                   tokens.append(Token('BANG', '!'))
+                   self.pos += 1
 
             # String Literals
             elif char == '"':
                 self.pos += 1
                 start = self.pos
-                while self.pos < self.length and self.source[self.pos] != '"':
-                    self.pos += 1
+                while self.pos < self.length:
+                    if self.source[self.pos] == '"':
+                        break
+                    if self.source[self.pos] == '\\' and self.pos + 1 < self.length:
+                        self.pos += 2 # Skip escape sequence
+                    else:
+                        self.pos += 1
                 value = self.source[start:self.pos]
                 tokens.append(Token('STRING', value))
                 self.pos += 1
@@ -219,6 +231,14 @@ class Lexer:
                     tokens.append(Token('FALSE', value))
                 elif value == 'mut':
                     tokens.append(Token('MUT', value))
+                elif value == 'impl':
+                    tokens.append(Token('IMPL', value))
+                elif value == 'self':
+                    tokens.append(Token('SELF', value))
+                elif value == 'or':
+                    tokens.append(Token('OR', value))
+                elif value == 'and':
+                    tokens.append(Token('AND', value))
                 else:
                     tokens.append(Token('IDENTIFIER', value))
             else:

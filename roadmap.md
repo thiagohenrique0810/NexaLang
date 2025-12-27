@@ -31,6 +31,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] `char`.
 - [x] **Type System 2.0**
   - [x] Structs & Methods
+    - [x] Struct Definitions
+    - [ ] `impl` blocks (Associating functions with types).
+    - [ ] Methods (`self`, `&self` receivers).
+    - [ ] Static Methods (`Type::new()`) vs Instance Methods (`obj.method()`).
   - [~] Arrays & Slices
     - [x] Arrays
     - [x] Slices (bootstrap: `[]T` lowered to `Slice<T>`, `slice_from_array(&arr)`, `s.len`, `s[i]`).
