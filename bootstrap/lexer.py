@@ -65,6 +65,9 @@ class Lexer:
             elif char == ',':
                 tokens.append(Token('COMMA', ','))
                 self.pos += 1
+            elif char == ';':
+                tokens.append(Token('SEMICOLON', ';'))
+                self.pos += 1
             
             # Operators
             elif char == '=':
@@ -98,6 +101,9 @@ class Lexer:
                 self.pos += 1
             elif char == '/':
                 tokens.append(Token('SLASH', '/'))
+                self.pos += 1
+            elif char == '&':
+                tokens.append(Token('AMPERSAND', '&'))
                 self.pos += 1
 
             # String Literals
@@ -144,6 +150,10 @@ class Lexer:
                     tokens.append(Token('WHILE', value))
                 elif value == 'match':
                     tokens.append(Token('MATCH', value))
+                elif value == 'true':
+                    tokens.append(Token('TRUE', value))
+                elif value == 'false':
+                    tokens.append(Token('FALSE', value))
                 else:
                     tokens.append(Token('IDENTIFIER', value))
             else:

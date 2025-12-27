@@ -1,0 +1,13 @@
+
+fn main() {
+    let x: i32 = 10;
+    
+    # Borrow x
+    let r: *i32 = &x;
+    
+    # Attempt to mutate x while borrowed
+    # Should fail if Borrow Checker is working
+    x = 20;
+    
+    print(*r);
+}

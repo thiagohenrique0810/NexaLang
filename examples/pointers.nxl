@@ -1,0 +1,15 @@
+fn main() {
+    let x: i32 = 10;
+    let ptr: *i32 = &x;
+    
+    print(*ptr);
+    
+    # Test Malloc
+    let raw_ptr: *u8 = malloc(4);
+    let int_ptr: *i32 = cast::<*i32>(raw_ptr); 
+    
+    *int_ptr = 42;
+    print(*int_ptr);
+    
+    free(raw_ptr);
+}

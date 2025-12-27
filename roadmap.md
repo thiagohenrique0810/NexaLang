@@ -74,8 +74,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Standard Library Basics**
   - [x] `print` function (intrinsic).
   - [x] `Option<T>` and `Result<T, E>` (via Enums).
-  - [ ] `Vec<T>` (Dynamic array).
-  - [ ] String manipulation.
+    - [x] `Vec<T>` (Dynamic array).
+    - [x] String manipulation.
 - [ ] **Self-Hosting**
     - [ ] Rewrite the compiler using NexaLang itself.
     - [ ] Verify `nxc` can compile `nxc`.

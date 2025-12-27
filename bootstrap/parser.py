@@ -2,8 +2,8 @@ class ASTNode:
     pass
 
 class Assignment(ASTNode):
-    def __init__(self, name, value):
-        self.name = name
+    def __init__(self, target, value):
+        self.target = target # Can be name(str) or ASTNode (LValue)
         self.value = value
 
 class ArrayLiteral(ASTNode):
@@ -93,6 +93,11 @@ class BinaryExpr(ASTNode):
         self.left = left
         self.right = right
         self.op = op
+
+class UnaryExpr(ASTNode):
+    def __init__(self, op, operand):
+        self.op = op
+        self.operand = operand
     # ... (rest of classes)
 
 # ... inside Parser class ...
@@ -126,11 +131,17 @@ class BinaryExpr(ASTNode):
         body = []
         while self.peek().type != 'RBRACE':
             body.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
         self.consume('RBRACE')
         
         return WhileStmt(cond, body)
 
 class IntegerLiteral(ASTNode):
+    def __init__(self, value):
+        self.value = value
+
+class BooleanLiteral(ASTNode):
     def __init__(self, value):
         self.value = value
 
@@ -260,6 +271,8 @@ class Parser:
         body = []
         while self.peek().type != 'RBRACE':
             body.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                self.consume('SEMICOLON')
         self.consume('RBRACE')
         return FunctionDef(name, params, return_type, body, is_kernel, generics)
 
@@ -276,19 +289,19 @@ class Parser:
             return self.parse_while()
         elif token.type == 'MATCH':
             return self.parse_match()
-        elif token.type == 'IDENTIFIER':
-            # Check for assignment: ID = expr
-            if self.peek(1).type == 'EQ':
-                return self.parse_assignment()
-            return self.parse_expression_stmt()
         else:
-            raise Exception(f"Unexpected token in statement: {token}")
-
-    def parse_assignment(self):
-        name = self.consume('IDENTIFIER').value
-        self.consume('EQ')
-        value = self.parse_expression()
-        return Assignment(name, value)
+            # General Expression or Assignment
+            # Try parsing as expression
+            # If followed by =, it's an assignment.
+            # Otherwise it's an expression statement.
+            expr = self.parse_expression()
+            
+            if self.peek().type == 'EQ':
+                 self.consume('EQ')
+                 value = self.parse_expression()
+                 return Assignment(expr, value)
+                 
+            return expr
 
     def parse_var_decl(self):
         self.consume('LET')
@@ -319,6 +332,10 @@ class Parser:
                 return f"{name}<{','.join(args)}>"
             
             return name
+        elif self.peek().type == 'STAR':
+            self.consume('STAR')
+            inner = self.parse_type()
+            return f"{inner}*" # Use postfix * for internal string representation
         elif self.peek().type == 'LBRACKET':
             # Array Type: [Type; Size]
             self.consume('LBRACKET')
@@ -396,6 +413,8 @@ class Parser:
         then_branch = []
         while self.peek().type != 'RBRACE':
             then_branch.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
         self.consume('RBRACE')
         
         else_branch = None
@@ -405,6 +424,8 @@ class Parser:
             else_branch = []
             while self.peek().type != 'RBRACE':
                 else_branch.append(self.parse_statement())
+                if self.peek().type == 'SEMICOLON':
+                     self.consume('SEMICOLON')
             self.consume('RBRACE')
             
         return IfStmt(cond, then_branch, else_branch)
@@ -419,6 +440,8 @@ class Parser:
         body = []
         while self.peek().type != 'RBRACE':
             body.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
         self.consume('RBRACE')
         
         return WhileStmt(cond, body)
@@ -431,8 +454,21 @@ class Parser:
     def parse_expression(self):
         return self.parse_binary_expr(0)
 
+    def parse_unary(self):
+        token = self.peek()
+        if token.type == 'STAR':
+            self.consume('STAR')
+            operand = self.parse_unary()
+            return UnaryExpr('*', operand)
+        elif token.type == 'AMPERSAND':
+            self.consume('AMPERSAND')
+            operand = self.parse_unary()
+            return UnaryExpr('&', operand)
+        else:
+            return self.parse_primary()
+
     def parse_binary_expr(self, min_prec):
-        left = self.parse_primary()
+        left = self.parse_unary()
         
         while True:
             token = self.peek()
@@ -450,32 +486,37 @@ class Parser:
     def get_precedence(self, op_type):
         if op_type in ('PLUS', 'MINUS'): return 1
         if op_type in ('STAR', 'SLASH'): return 2
-        if op_type == 'EQEQ': return 0
+        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 0
         return -1
 
     def parse_primary(self):
         token = self.peek()
+        expr = None
+        
         if token.type == 'NUMBER':
             self.consume('NUMBER')
-            return IntegerLiteral(int(token.value))
+            expr = IntegerLiteral(int(token.value))
         elif token.type == 'STRING':
             self.consume('STRING')
-            return StringLiteral(token.value)
+            expr = StringLiteral(token.value)
+        elif token.type == 'TRUE':
+            self.consume('TRUE')
+            expr = BooleanLiteral(True)
+        elif token.type == 'FALSE':
+            self.consume('FALSE')
+            expr = BooleanLiteral(False)
         elif token.type == 'IDENTIFIER':
             # Check for namespace or TurboFish: ID :: ID or ID :: <Args>
             if self.peek(1).type == 'DOUBLE_COLON':
                  lhs = self.consume('IDENTIFIER').value
                  self.consume('DOUBLE_COLON')
                  
+                 full_name = lhs
                  if self.peek().type == 'LT':
                      # Turbo fish: ID :: <T, U>
                      self.consume('LT')
                      args = []
                      while self.peek().type != 'GT':
-                         # Parse type names (identifiers or complex types)
-                         # We use consume(ID) for simplicity or parse_type()?
-                         # parse_type should be safe inside <...>.
-                         # But let's stick to ID or parse_type if we support nested.
                          args.append(self.parse_type())
                          if self.peek().type == 'COMMA': self.consume('COMMA')
                      self.consume('GT')
@@ -489,9 +530,9 @@ class Parser:
                          
                      # Check for Call
                      if self.peek().type == 'LPAREN':
-                         return self.parse_call_explicit(full_name)
+                         expr = self.parse_call_explicit(full_name)
                      else:
-                         return VariableExpr(full_name)
+                         expr = VariableExpr(full_name)
                  else:
                      # Namespace: ID :: ID
                      rhs = self.consume('IDENTIFIER').value
@@ -499,41 +540,23 @@ class Parser:
                      if self.peek().type == 'LPAREN':
                          # We pass the full name "Enum::Variant" as callee
                          full_name = f"{lhs}::{rhs}"
-                         return self.parse_call_explicit(full_name)
+                         expr = self.parse_call_explicit(full_name)
                      else:
                          # Enum variant without args (if supported) or variable
                          full_name = f"{lhs}::{rhs}"
-                         return VariableExpr(full_name)
-                     
-            if self.peek(1).type == 'LPAREN':
-                return self.parse_call()
+                         expr = VariableExpr(full_name)
             
-            # Note: Struct instantiation looks like a function call (Name(...))
-            # But member access works on expressions: var.field
-            
-            expr = VariableExpr(token.value)
-            self.consume('IDENTIFIER')
-            
-            # Loop to handle chains: val.x.y or val[0].x etc
-            while True:
-                if self.peek().type == 'DOT':
-                    self.consume('DOT')
-                    member = self.consume('IDENTIFIER').value
-                    expr = MemberAccess(expr, member)
-                elif self.peek().type == 'LBRACKET':
-                    self.consume('LBRACKET')
-                    index = self.parse_expression()
-                    self.consume('RBRACKET')
-                    expr = IndexAccess(expr, index)
-                else:
-                    break
-            
-            return expr
+            elif self.peek(1).type == 'LPAREN':
+                 expr = self.parse_call()
+            else:
+                 expr = VariableExpr(token.value)
+                 self.consume('IDENTIFIER')
+
         elif token.type == 'LPAREN':
             self.consume('LPAREN')
             expr = self.parse_expression()
             self.consume('RPAREN')
-            return expr
+            
         elif token.type == 'LBRACKET':
             # Array Literal: [1, 2, 3]
             self.consume('LBRACKET')
@@ -545,9 +568,25 @@ class Parser:
                         break
                     self.consume('COMMA')
             self.consume('RBRACKET')
-            return ArrayLiteral(elements)
+            expr = ArrayLiteral(elements)
         else:
             raise Exception(f"Unexpected token in primary: {token}")
+            
+        # Postfix Handlers (Member Access, Index Access, Call?)
+        while True:
+            if self.peek().type == 'DOT':
+                self.consume('DOT')
+                member = self.consume('IDENTIFIER').value
+                expr = MemberAccess(expr, member)
+            elif self.peek().type == 'LBRACKET':
+                self.consume('LBRACKET')
+                index = self.parse_expression()
+                self.consume('RBRACKET')
+                expr = IndexAccess(expr, index)
+            else:
+                break
+                
+        return expr
 
     def parse_call(self):
         name = self.consume('IDENTIFIER').value

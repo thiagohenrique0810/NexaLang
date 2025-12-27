@@ -1,0 +1,77 @@
+struct Vec<T> {
+    ptr: *T,
+    len: i32,
+    cap: i32
+}
+
+fn vec_new<T>() -> Vec<T> {
+    let cap: i32 = 2;
+    let size: i32 = sizeof::<T>(); 
+    let bytes: i32 = cap * size;
+    let raw: *u8 = malloc(bytes);
+    let ptr: *T = cast::<*T>(raw);
+    return Vec::<T>(ptr, 0, cap);
+}
+
+fn vec_push<T>(v: *Vec<T>, item: T) {
+    # Check capacity
+    if ((*v).len == (*v).cap) {
+        # Resize
+        let new_cap: i32 = (*v).cap * 2;
+        let size: i32 = sizeof::<T>();
+        let new_bytes: i32 = new_cap * size;
+        
+        let old_ptr: *T = (*v).ptr;
+        let old_raw: *u8 = cast::<*u8>(old_ptr);
+        
+        let new_raw: *u8 = realloc(old_raw, new_bytes);
+        let new_ptr: *T = cast::<*T>(new_raw);
+        
+        (*v).ptr = new_ptr;
+        (*v).cap = new_cap;
+    }
+    
+    # Push item
+    let ptr: *T = (*v).ptr;
+    let idx: i32 = (*v).len;
+    
+    # ptr[idx] = item
+    # Need pointer arithmetic
+    let item_ptr: *T = ptr_offset::<T>(ptr, idx);
+    *item_ptr = item;
+    
+    (*v).len = (*v).len + 1;
+}
+
+fn vec_get<T>(v: Vec<T>, idx: i32) -> T {
+    # No bounds check for simplicity yet, rely on valid use
+    let ptr: *T = v.ptr;
+    let item_ptr: *T = ptr_offset::<T>(ptr, idx);
+    return *item_ptr;
+}
+
+fn main() {
+    let v: Vec<i32> = vec_new::<i32>();
+    
+    # We need address of v to push
+    # NexaLang doesn't have & operator for local variables easily yet?
+    # Wait, I added UnaryExpr '&' support in CodeGen! 
+    # visit_UnaryExpr: if op == '&' return address (alloc).
+    
+    vec_push::<i32>(&v, 10);
+    vec_push::<i32>(&v, 20);
+    vec_push::<i32>(&v, 30); # Should resize
+    
+    let a: i32 = vec_get::<i32>(v, 0);
+    let b: i32 = vec_get::<i32>(v, 1);
+    let c: i32 = vec_get::<i32>(v, 2);
+    
+    print(a);
+    print(b);
+    print(c);
+    
+    print(v.len);
+    print(v.cap);
+    
+    free(cast::<*u8>(v.ptr));
+}

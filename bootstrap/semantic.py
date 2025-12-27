@@ -1,10 +1,12 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, VarDecl, IfStmt, WhileStmt
+from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr
 import sys
 import copy
 class SemanticAnalyzer:
     def __init__(self):
-        self.scopes = [{}] # List of dictionaries {name: {'type': type, 'moved': bool}}
+        # Symbol table entries: {name: {'type': type, 'moved': bool, 'readers': int, 'writer': bool, 'is_ref': bool}}
+        self.scopes = [{}] 
+        self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
 
     def analyze(self, ast):
@@ -12,8 +14,6 @@ class SemanticAnalyzer:
         # 1. Collect function and struct names
         self.functions = set(['print', 'gpu::global_id', 'panic', 'assert'])
         self.function_defs = {} # name -> FunctionDef
-        self.structs = {} # name -> {field: type}
-        self.structs = {} # name -> {field: type}
         self.structs = {} # name -> {field: type}
         self.enums = {} # name -> {variant: [payload_types]}
         self.generic_functions = {} # name -> node
@@ -102,9 +102,53 @@ class SemanticAnalyzer:
         # 3. Analyze index
         index_type = self.visit(node.index)
         if index_type != 'i32':
-             raise Exception(f"Type Error: Array index must be i32, got '{index_type}'")
+             raise Exception(f"Type Error: Array index must be i32, got {index_type}")
              
-        return elem_type
+        base_elem_type = obj_type[1:].split(':')[0] # Use obj_type instead of undefined array_type
+        return base_elem_type
+
+    def visit_UnaryExpr(self, node):
+        operand_type = self.visit(node.operand)
+        
+        if node.op == '*':
+            # Dereference: operand must be a pointer type "T*"
+            if not operand_type.endswith('*'):
+                 raise Exception(f"Type Error: Cannot dereference non-pointer type '{operand_type}'")
+            return operand_type[:-1]
+            
+        elif node.op == '&':
+            # Address Of: return "T*"
+            if isinstance(node.operand, VariableExpr):
+                var_name = node.operand.name
+                var_info = self.lookup(var_name)
+                if not var_info:
+                     raise Exception(f"Semantic Error: Borrow of undefined variable '{var_name}'")
+                
+                # Check Borrow Rules
+                try:
+                    if var_info['writer']:
+                         raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as immutable because it is already borrowed as mutable")
+                except KeyError:
+                    print(f"DEBUG: KeyError accessing 'writer' for '{var_name}'. Info: {var_info}")
+                    raise
+                
+                # Register Reader
+                
+                # Register Reader
+                var_info['readers'] += 1
+                
+                # Add to current scope cleanup
+                # We need to associate this borrow with the current scope lifetime.
+                # Simplest way: self.scopes[-1] needs a 'borrows' list?
+                # Using self.borrow_cleanup_stack might be tricky if scopes handle it.
+                # Let's add 'active_borrows' to self.scopes entries.
+                if 'active_borrows' not in self.scopes[-1]:
+                     self.scopes[-1]['active_borrows'] = []
+                self.scopes[-1]['active_borrows'].append((var_name, 'reader'))
+                
+            return f"{operand_type}*"
+            
+        return operand_type
 
     def visit_MatchExpr(self, node):
         # 1. Analyze value
@@ -143,7 +187,7 @@ class SemanticAnalyzer:
                 # Register bound variable
                 # Assuming single payload for now
                 payload_type = expected_payloads[0]
-                self.scopes[-1][case.var_name] = {'type': payload_type, 'moved': False}
+                self.declare(case.var_name, payload_type)
             
             # Visit body
             self.visit(case.body)
@@ -159,7 +203,36 @@ class SemanticAnalyzer:
         self.scopes.append({})
 
     def exit_scope(self):
+        current_scope = self.scopes[-1]
+        
+        # Release borrows tied to this scope
+        if 'active_borrows' in current_scope:
+            for var_name, role in current_scope['active_borrows']:
+                var_info = self.lookup(var_name)
+                if var_info:
+                    if role == 'reader':
+                        var_info['readers'] -= 1
+                    elif role == 'writer':
+                        var_info['writer'] = False
+                        
         self.scopes.pop()
+
+    def declare(self, name, type_name):
+        if name in self.scopes[-1]:
+             raise Exception(f"Semantic Error: Variable '{name}' already declared in this scope")
+        # Initialize borrow state: readers=0 (set needed?), writer=False
+        self.scopes[-1][name] = {
+            'type': type_name, 
+            'moved': False,
+            'readers': 0,
+            'writer': False
+        }
+
+    def lookup(self, name):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
 
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
@@ -202,34 +275,11 @@ class SemanticAnalyzer:
         
         new_fields = []
         for fname, ftype in def_node.fields:
-            # Substitute T
-            # Simple substitution for now. Nested logic needed for Box<Box<T>>
-            # For Phase 2.9, simplistic replacement
-            if ftype in mapping:
-                new_type = mapping[ftype]
-            else:
-                new_type = ftype
+            new_type = self.apply_submap(ftype, mapping)
             new_fields.append((fname, new_type))
             
         # Register new concrete struct
         self.structs[name_with_args] = dict(new_fields)
-        
-        # We also need to add a StructDef to AST for CodeGen?
-        # Yes, CodeGen iterates AST.
-        # But analyze() modifies `self.structs` which Semantic uses.
-        # CodeGen uses `codegen.struct_types` populated by `visit_StructDef`.
-        # CodeGen NEEDS `visit_StructDef` called for "Box<i32>".
-        # So we must create a new StructDef node and append to AST or visit it manually?
-        # CodeGen logic runs AFTER Semantic.
-        # So if we append to AST, CodeGen will see it.
-        # But `self.analyze(ast)` doesn't easily return new nodes to append.
-        # We can append to `self.ast` if we stored it?
-        # Or `node.parent`? No parent links.
-        # Hack: SemanticAnalyzer can have `generated_nodes`. CodeGen main loop can be updated?
-        # Or better: `semantic.analyze` returns `augmented_ast`?
-        # `main.py`: `semantic.analyze(ast)` -> `codegen.generate(ast)`.
-        # If `semantic` modifies `ast` (it's a list), it works.
-        # So: self.ast_root.append(...)
         
         new_def = StructDef(name_with_args, new_fields)
         self.ast_root.append(new_def)
@@ -257,10 +307,7 @@ class SemanticAnalyzer:
         for vname, payloads in def_node.variants:
              new_payloads = []
              for ptype in payloads:
-                 if ptype in mapping:
-                      new_payloads.append(mapping[ptype])
-                 else:
-                      new_payloads.append(ptype)
+                 new_payloads.append(self.apply_submap(ptype, mapping))
              new_variants.append((vname, new_payloads))
              
         self.enums[name_with_args] = {v: ps for v, ps in new_variants}
@@ -282,9 +329,6 @@ class SemanticAnalyzer:
         args = [a.strip() for a in rest.split(',')]
         
         if base_name not in self.generic_functions:
-             # Might be struct instantiation? Code below handles that.
-             # Or error?
-             # Let's check generic functions.
              if base_name in self.generic_structs:
                   self.instantiate_generic_struct(name_with_args)
                   return
@@ -301,71 +345,25 @@ class SemanticAnalyzer:
              
         mapping = dict(zip(def_node.generics, args))
         
-        # Monomorphize Function
-        # Need to deep copy body?
-        # For simplicity, we just clone AST nodes if possible or re-create them.
-        # Python shallow copy might not be enough if we modify types in place.
-        # We need to substitute types in params, return type, and BODY VAR DECLS.
-        # This is recursive substitution. Complex.
-        # Alternative: Re-parse? No source.
-        # Alternative: Helper `substitute_types(node, mapping)`.
-        
         new_params = []
         for pname, ptype in def_node.params:
-            if ptype in mapping:
-                new_params.append((pname, mapping[ptype]))
-            else:
-                new_params.append((pname, ptype))
+            new_params.append((pname, self.apply_submap(ptype, mapping)))
                 
-        new_return = def_node.return_type
-        if new_return in mapping:
-            new_return = mapping[new_return]
+        new_return = self.apply_submap(def_node.return_type, mapping)
             
         # Body substitution
-        # We need a deep copy of body.
-        # Let's use `copy` module?
         import copy
         new_body = copy.deepcopy(def_node.body)
-        
-        # Now traverse new_body and replace types.
-        # We need a visitor for substitution?
-        # Or just rely on Type Inference!
-        # If we replace declaration types, inference handles the rest?
-        # `let x: T = ...` -> `let x: i32 = ...`.
-        # `VarDecl.type_name` needs change.
-        # `CallExpr`? If inside we call `id<T>(...)`, it becomes `id<i32>(...)`.
-        # Complex.
-        # Phase 2.9 goal is simple Generics.
-        # Let's assume naive substitution on `VarDecl` in body is enough for now?
-        # And `match` arms?
         
         self.substitute_generics(new_body, mapping)
         
         new_func = FunctionDef(name_with_args, new_params, new_return, new_body, def_node.is_kernel)
+        print(f"DEBUG: Instantiated '{name_with_args}' with return type '{new_return}'")
         self.ast_root.append(new_func)
         self.functions.add(name_with_args)
         self.function_defs[name_with_args] = new_func
+        print(f"DEBUG: Key '{name_with_args}' added to function_defs with type '{new_return}'")
 
-    def substitute_generics(self, nodes, mapping):
-        # Helper to recursively substitute types in body
-        for node in nodes:
-            if isinstance(node, VarDecl):
-                if node.type_name in mapping:
-                    node.type_name = mapping[node.type_name]
-                # Also handle generic structs: Box<T> -> Box<i32>
-                if node.type_name and '<' in node.type_name and any(k in node.type_name for k in mapping):
-                     # Naive string replacement for simple cases
-                     for k, v in mapping.items():
-                         node.type_name = node.type_name.replace(f"<{k}>", f"<{v}>")
-                         # Also handle Box<T> -> Box<i32> check split
-                         # This is crude. Ideally we parse type string.
-                         
-            elif isinstance(node, IfStmt):
-                self.substitute_generics(node.then_block, mapping)
-                if node.else_block:
-                    self.substitute_generics(node.else_block, mapping)
-            elif isinstance(node, WhileStmt):
-                self.substitute_generics(node.body, mapping)
 
     def declare(self, name, type_name):
         if name in self.scopes[-1]:
@@ -379,6 +377,13 @@ class SemanticAnalyzer:
         return None
 
     def visit_FunctionDef(self, node):
+        if node.generics:
+             # Skip body analysis for generic definitions.
+             # They are analyzed only when instantiated.
+             self.functions.add(node.name)
+             self.generic_functions[node.name] = node
+             return
+
         self.current_function = node.name
         self.enter_scope()
         
@@ -404,31 +409,64 @@ class SemanticAnalyzer:
         # Instantiate generic type if needed
         if node.type_name and '<' in node.type_name:
              self.instantiate_generic_type(node.type_name)
+        
+        print(f"DEBUG: VarDecl '{node.name}' type='{node.type_name}' init_type='{init_type}'")
 
         if init_type != node.type_name:
-             raise Exception(f"Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
+             raise Exception(f"DEBUG: init_type='{init_type}', node.type='{node.type_name}'. Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
         
         # 3. Declare variable
         self.declare(node.name, node.type_name)
 
     def visit_Assignment(self, node):
-        # 1. Check if variable exists
-        var_info = self.lookup(node.name)
-        if not var_info:
-            raise Exception(f"Semantic Error: Assignment to undefined variable '{node.name}'")
+        value_type = self.visit(node.value)
         
-        # NOTE: Assigning to a moved variable is valid (re-initialization).
-        # We just need to ensure the variable is considered 'alive' (not moved) after this.
-            
-        # 2. Analyze value
-        val_type = self.visit(node.value)
-        
-        # 3. Check type mismatch
-        if var_info['type'] != val_type:
-            raise Exception(f"Type Error: Cannot assign type '{val_type}' to variable '{node.name}' of type '{var_info['type']}'")
-            
-        # Revive variable
-        var_info['moved'] = False
+        if isinstance(node.target, VariableExpr):
+             name = node.target.name
+             var_info = self.lookup(name)
+             if not var_info:
+                 raise Exception(f"Semantic Error: Assignment to undefined variable '{name}'")
+             
+             # Borrow Check: No mutation while borrowed
+             if var_info['readers'] > 0:
+                  raise Exception(f"Borrow Error: Cannot assign to '{name}' because it is borrowed")
+             if var_info['writer']:
+                  raise Exception(f"Borrow Error: Cannot assign to '{name}' because it is borrowed mutable")
+
+             target_type = var_info['type']
+             
+             # Check type mismatch
+             if target_type != value_type:
+                  # Allow explicit pointer assignment?
+                  pass
+             if target_type != value_type:
+                  raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
+                  
+             # Revive variable
+             var_info['moved'] = False
+             
+        elif isinstance(node.target, UnaryExpr):
+             if node.target.op == '*':
+                  # *ptr = val
+                  # visit(*ptr) returns type T (dereferenced type)
+                  # visit(node.target) checks valid dereference.
+                  target_type = self.visit(node.target)
+                  
+                  if target_type != value_type:
+                       raise Exception(f"Type Error: Cannot assign '{value_type}' to dereference of type '{target_type}'")
+             else:
+              raise Exception("Invalid assignment target")
+              
+        elif isinstance(node.target, MemberAccess):
+             # Assign to struct field
+             # Visit MemberAccess (which checks validity and returns field type)
+             # Note: visit_MemberAccess evaluates the OBJECT and checks field existence.
+             target_type = self.visit(node.target)
+             
+             if target_type != value_type:
+                  raise Exception(f"Type Error: Cannot assign '{value_type}' to member of type '{target_type}'")
+        else:
+             raise Exception("Invalid assignment target")
 
     def visit_BinaryExpr(self, node):
         left_type = self.visit(node.left)
@@ -444,7 +482,10 @@ class SemanticAnalyzer:
         return 'i32' # Result type
 
     def visit_IntegerLiteral(self, node):
-        return 'i32'
+        return 'i32' # Default
+
+    def visit_BooleanLiteral(self, node):
+        return 'bool'
 
     def visit_StringLiteral(self, node):
         return 'string'
@@ -460,39 +501,90 @@ class SemanticAnalyzer:
         return var_info['type']
 
     def visit_CallExpr(self, node):
+        # Intrinsics
+        if node.callee == 'print':
+            for arg in node.args:
+                self.visit(arg)
+            return 'void'
+        elif node.callee == 'memcpy':
+            if len(node.args) != 3: raise Exception("memcpy requires 3 args")
+            # Validation logic? dest and src should be pointers.
+            dest_ty = self.visit(node.args[0])
+            src_ty = self.visit(node.args[1])
+            size_ty = self.visit(node.args[2])
+            if size_ty != 'i32': raise Exception("memcpy size must be i32")
+            return 'void'
+            
+        elif node.callee == 'malloc':
+             if len(node.args) != 1: raise Exception("malloc takes 1 arg")
+             size_type = self.visit(node.args[0])
+             if size_type != 'i32': raise Exception("malloc expects i32")
+             return 'u8*'
+             
+        elif node.callee == 'free':
+             if len(node.args) != 1: raise Exception("free takes 1 arg")
+             self.visit(node.args[0])
+             return 'void'
+             
+        elif node.callee == 'realloc':
+             if len(node.args) != 2: raise Exception("realloc takes 2 args")
+             self.visit(node.args[0])
+             self.visit(node.args[1])
+             return 'u8*'
+             
+        elif node.callee == 'panic':
+            if len(node.args) != 1: raise Exception("panic expects 1 arg")
+            self.visit(node.args[0])
+            return 'void'
+            
+        elif node.callee == 'assert':
+            if len(node.args) != 2: raise Exception("assert expects 2 args")
+            self.visit(node.args[0])
+            self.visit(node.args[1])
+            return 'void'
+            
+        elif node.callee == 'gpu::global_id':
+             return 'i32'
+             
+        elif node.callee.startswith('cast<'):
+             target_type = node.callee[5:-1]
+             if len(node.args) != 1: raise Exception("cast takes 1 arg")
+             self.visit(node.args[0])
+             return target_type
+             
+        elif node.callee.startswith('sizeof<'):
+             return 'i32'
+             
+        elif node.callee.startswith('ptr_offset<'):
+             target_type = node.callee[11:-1]
+             if len(node.args) != 2: raise Exception("ptr_offset expects 2 args")
+             self.visit(node.args[0])
+             self.visit(node.args[1])
+             return f"{target_type}*"
+
+        # Generic Instantiation if needed
         if '<' in node.callee:
              self.instantiate_generic_function(node.callee)
-             
+        
+        # Standard Function Call
         if node.callee in self.functions:
-            if node.callee == 'print':
-                for arg in node.args:
-                    self.visit(arg)
-                return 'void'
-            elif node.callee == 'panic':
-                if len(node.args) != 1:
-                    raise Exception("Semantic Error: panic() expects 1 argument (message)")
-                self.visit(node.args[0])
-                return 'void'
-            elif node.callee == 'assert':
-                if len(node.args) != 2:
-                    raise Exception("Semantic Error: assert() expects 2 arguments (condition, message)")
-                cond_type = self.visit(node.args[0])
-                # We don't have explicit bool type in semantic yet? visit_BinaryExpr returns 'i32'.
-                # Let's assume i32 for now (0=false, !0=true)
-                self.visit(node.args[1])
-                return 'void'
-            elif node.callee == 'gpu::global_id':
-                return 'i32'
-            else:
-                 # User function call
-                 for arg in node.args:
-                     self.visit(arg)
+             for arg in node.args:
+                 self.visit(arg)
                  
-                 # Look up return type
-                 if node.callee in self.function_defs:
-                     return self.function_defs[node.callee].return_type
-                 else:
-                     return 'void' # Should not happen if in self.functions
+             if node.callee in self.function_defs:
+                 return self.function_defs[node.callee].return_type
+             else:
+                 return 'STD_MISSING'
+                 
+        elif node.callee in self.structs:
+             for arg in node.args:
+                 self.visit(arg)
+                 
+             if node.callee in self.function_defs:
+                 return self.function_defs[node.callee].return_type
+             else:
+                 return 'STD_MISSING'
+                 
         elif node.callee in self.structs:
             # Struct Instantiation
             fields = self.structs[node.callee]
@@ -503,7 +595,7 @@ class SemanticAnalyzer:
                 self.visit(arg)
             return node.callee
             
-        # Check for Enum Variant: Enum::Variant
+        # Enum Variant: Enum::Variant
         elif '::' in node.callee:
             parts = node.callee.rsplit('::', 1)
             enum_name = parts[0]
@@ -574,25 +666,12 @@ class SemanticAnalyzer:
                 
             payloads = variants[case.variant_name]
             
-            # Check pattern args? 
-            # Current Match Case syntax: Variant(var)
-            # We assume single variable binding for payload?
-            # Or if payload is empty, no variable.
-            
             if payloads:
                  # Expecting variable binding
                  if not case.var_name:
-                      # If payload exists but no var bound, maybe allow? (ignore payload)
-                      # For now, require binding if payload exists?
-                      # Or maybe syntax is just Variant without parens?
-                      # Lexer/Parser: Variant or Variant(var)
                       pass
                       
                  if case.var_name:
-                      # Register variable in case scope
-                      # Enter scope for case
-                      # But semantic analyzer visit structure for case body?
-                      # We need to wrap body visit in scope
                       pass
                       
             else:
@@ -613,5 +692,88 @@ class SemanticAnalyzer:
             self.exit_scope()
 
     def visit_ReturnStmt(self, node):
-        self.visit(node.value)
+        if node.value: self.visit(node.value)
         # Should check against function return type
+
+    def substitute_generics(self, node, mapping):
+        # Recursive substitution of types in AST nodes
+        if isinstance(node, list):
+             for x in node: self.substitute_generics(x, mapping)
+             return
+             
+        if isinstance(node, VarDecl):
+             if node.type_name:
+                 node.type_name = self.apply_submap(node.type_name, mapping)
+             if node.initializer:
+                 self.substitute_generics(node.initializer, mapping)
+        
+        elif isinstance(node, CallExpr):
+             # Handle TurboFish or generic calls
+             if '<' in node.callee:
+                  # ID<T> -> ID<i32>
+                  node.callee = self.apply_submap(node.callee, mapping)
+             
+             # Handle intrinsics
+             if 'cast<' in node.callee or 'sizeof<' in node.callee or 'ptr_offset<' in node.callee:
+                 node.callee = self.apply_submap(node.callee, mapping)
+
+             for arg in node.args:
+                  self.substitute_generics(arg, mapping)
+                  
+        elif isinstance(node, IfStmt):
+             self.substitute_generics(node.condition, mapping)
+             self.substitute_generics(node.then_branch, mapping)
+             if node.else_branch: self.substitute_generics(node.else_branch, mapping)
+             
+        elif isinstance(node, WhileStmt):
+             self.substitute_generics(node.condition, mapping)
+             self.substitute_generics(node.body, mapping)
+             
+        elif isinstance(node, ReturnStmt):
+             if node.value: self.substitute_generics(node.value, mapping)
+             
+        elif isinstance(node, Assignment):
+             if isinstance(node.target, (UnaryExpr, IndexAccess, MemberAccess)):
+                  self.substitute_generics(node.target, mapping) 
+             self.substitute_generics(node.value, mapping)
+             
+        elif isinstance(node, BinaryExpr):
+             self.substitute_generics(node.left, mapping)
+             self.substitute_generics(node.right, mapping)
+             
+        elif isinstance(node, UnaryExpr):
+             self.substitute_generics(node.operand, mapping)
+             
+        elif isinstance(node, MatchExpr):
+             self.substitute_generics(node.value, mapping)
+             for case in node.cases:
+                 self.substitute_generics(case.body, mapping)
+        
+        elif isinstance(node, MemberAccess):
+             self.substitute_generics(node.object, mapping)
+             
+        elif isinstance(node, IndexAccess):
+             self.substitute_generics(node.object, mapping)
+             self.substitute_generics(node.index, mapping)
+             
+    def apply_submap(self, type_str, mapping):
+        if not type_str: return type_str
+        
+        # Pointer
+        if type_str.endswith('*'):
+             inner = type_str[:-1]
+             return self.apply_submap(inner, mapping) + '*'
+             
+        # Generic: Name<Args>
+        if '<' in type_str and type_str.endswith('>'):
+             base = type_str[:type_str.find('<')]
+             inside = type_str[type_str.find('<')+1:-1]
+             args = [x.strip() for x in inside.split(',')]
+             new_args = [self.apply_submap(a, mapping) for a in args]
+             return f"{base}<{','.join(new_args)}>"
+             
+        # Base type
+        if type_str in mapping:
+             return mapping[type_str]
+             
+        return type_str
