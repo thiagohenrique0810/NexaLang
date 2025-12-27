@@ -60,7 +60,9 @@ python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit ll --ou
 
 ### Emit `.spv` (requires external tools)
 
-This requires `llvm-as` and `llvm-spirv` available in your PATH.
+Preferred: `llc` with SPIR-V targets enabled (LLVM 20+).
+
+Fallback: `llvm-as` + `llvm-spirv` (SPIRV-LLVM-Translator).
 
 ```bash
 python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit spv --out output.spv
@@ -70,6 +72,14 @@ python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit spv --o
 
 ```bash
 python tools/check_spirv_toolchain.py
+```
+
+### Activate toolchain (this repo)
+
+If you created the environment under `Y:\tools\nexalang-spirv`, you can activate it for the current PowerShell session:
+
+```powershell
+.\tools\activate_spirv_env.ps1
 ```
 
 ---

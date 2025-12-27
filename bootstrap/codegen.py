@@ -1,10 +1,11 @@
 from llvmlite import ir
-from parser import StructDef, EnumDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral
+from parser import StructDef, EnumDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess
 
 class CodeGen:
-    def __init__(self, target: str = "native"):
+    def __init__(self, target: str = "native", emit_kernels_only: bool = False):
         self.module = ir.Module(name="nexalang_module")
         self.target = target
+        self.emit_kernels_only = emit_kernels_only
         # Set a more appropriate module triple for SPIR(-V) translation paths.
         # Note: actual .spv emission depends on external tooling (llvm-spirv).
         if self.target == "spirv":
@@ -25,10 +26,12 @@ class CodeGen:
         # When target=spirv, we also provide a placeholder builtin global that
         # external SPIR-V translation tools can optionally map.
         i32 = ir.IntType(32)
-        gv = ir.GlobalVariable(self.module, i32, name="__gpu_global_id")
-        gv.linkage = "internal"
-        gv.initializer = ir.Constant(i32, 0)
-        self.gpu_global_id = gv
+        # Only create the CPU-mock global when we are not emitting kernels-only SPIR-V.
+        if not (self.target == "spirv" and self.emit_kernels_only):
+            gv = ir.GlobalVariable(self.module, i32, name="__gpu_global_id")
+            gv.linkage = "internal"
+            gv.initializer = ir.Constant(i32, 0)
+            self.gpu_global_id = gv
 
         # Placeholder for SPIR-V builtin mapping (best-effort).
         # Many pipelines use special naming/addrspaces; we keep it simple here and
@@ -285,11 +288,15 @@ class CodeGen:
         # Pass 2: Function Headers
         for node in ast:
             if isinstance(node, FunctionDef):
+                if self.emit_kernels_only and not node.is_kernel:
+                    continue
                 self._declare_function(node)
                 
         # Pass 3: Bodies
         for node in ast:
             if not isinstance(node, (StructDef, EnumDef)):
+                if isinstance(node, FunctionDef) and self.emit_kernels_only and not node.is_kernel:
+                    continue
                 self.visit(node)
                 
         return str(self.module)
@@ -490,6 +497,44 @@ class CodeGen:
                   self.builder.store(val, ptr_val)
              else:
                   raise Exception("Invalid assignment target")
+
+        elif isinstance(node.target, IndexAccess):
+             # ptr[i] = val  OR  arr[i] = val
+             index_val = self.visit(node.target.index)
+
+             # If object is a variable, prefer addressable access.
+             if isinstance(node.target.object, VariableExpr):
+                  entry = None
+                  for scope in reversed(self.scopes):
+                       if node.target.object.name in scope:
+                            entry = scope[node.target.object.name]
+                            break
+                  if not entry:
+                       raise Exception(f"Undefined var {node.target.object.name}")
+
+                  obj_ptr, type_name = entry
+
+                  # Array alloca: gep (0, idx)
+                  if isinstance(obj_ptr.type.pointee, ir.ArrayType):
+                       zero = ir.Constant(ir.IntType(32), 0)
+                       elem_ptr = self.builder.gep(obj_ptr, [zero, index_val])
+                       self.builder.store(val, elem_ptr)
+                       return
+
+                  # Pointer alloca: load base ptr then gep (idx)
+                  base_ptr = self.builder.load(obj_ptr)
+                  elem_ptr = self.builder.gep(base_ptr, [index_val])
+                  self.builder.store(val, elem_ptr)
+                  return
+
+             # Fallback: if object evaluates to a pointer value
+             obj_val = self.visit(node.target.object)
+             if isinstance(obj_val.type, ir.PointerType):
+                  elem_ptr = self.builder.gep(obj_val, [index_val])
+                  self.builder.store(val, elem_ptr)
+                  return
+
+             raise Exception("Index assignment requires array or pointer base")
 
         elif isinstance(node.target, MemberAccess):
              # Assign to struct field: struct.field = val

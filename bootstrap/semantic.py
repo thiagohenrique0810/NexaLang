@@ -542,6 +542,12 @@ class SemanticAnalyzer:
                        raise Exception(f"Type Error: Cannot assign '{value_type}' to dereference of type '{target_type}'")
              else:
               raise Exception("Invalid assignment target")
+
+        elif isinstance(node.target, IndexAccess):
+            # arr[i] = x  OR  ptr[i] = x
+            target_elem_type = self.visit(node.target)  # visit_IndexAccess returns element type
+            if target_elem_type != value_type:
+                raise Exception(f"Type Error: Cannot assign '{value_type}' to indexed element of type '{target_elem_type}'")
               
         elif isinstance(node.target, MemberAccess):
              # Assign to struct field

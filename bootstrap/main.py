@@ -37,7 +37,9 @@ def main():
         return
 
     # 4. Code Generation
-    codegen = CodeGen(target=args.target)
+    # For SPIR-V emission we emit kernels-only to avoid illegal calls into kernels.
+    emit_kernels_only = args.target == "spirv" and args.emit == "spv"
+    codegen = CodeGen(target=args.target, emit_kernels_only=emit_kernels_only)
     llvm_ir = codegen.generate(ast)
 
     if args.emit == "ll":

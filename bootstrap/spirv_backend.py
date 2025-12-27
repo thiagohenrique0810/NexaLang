@@ -12,27 +12,32 @@ def emit_spirv_from_llvm_ir(llvm_ir: str, out_spv_path: str) -> None:
     """
     Convert LLVM IR (text) -> SPIR-V binary using external tools when available.
 
-    Requires:
+    Preferred (LLVM native SPIR-V backend):
+    - llc (with spirv64 target)
+
+    Fallback (SPIRV-LLVM-Translator):
     - llvm-as   (to turn .ll into .bc)
-    - llvm-spirv (SPIRV-LLVM-Translator)
+    - llvm-spirv (to turn .bc into .spv)
     """
+    llc = _which("llc")
     llvm_as = _which("llvm-as")
     llvm_spirv = _which("llvm-spirv")
 
-    missing = []
-    if not llvm_as:
-        missing.append("llvm-as")
-    if not llvm_spirv:
-        missing.append("llvm-spirv")
-
-    if missing:
+    if not llc and (not llvm_as or not llvm_spirv):
+        missing = []
+        if not llc:
+            missing.append("llc (with spirv64 target)")
+        if not llvm_as:
+            missing.append("llvm-as")
+        if not llvm_spirv:
+            missing.append("llvm-spirv")
         raise RuntimeError(
-            "SPIR-V emission requires external tools not found in PATH: "
+            "SPIR-V emission requires tools not found in PATH: "
             + ", ".join(missing)
             + ".\n"
             + "Install options:\n"
-            + "- SPIRV-LLVM-Translator (provides llvm-spirv)\n"
-            + "- LLVM tools (provides llvm-as)\n"
+            + "- LLVM (preferred): llc with SPIR-V targets enabled\n"
+            + "- Or SPIRV-LLVM-Translator: llvm-as + llvm-spirv\n"
         )
 
     out_spv_path = os.path.abspath(out_spv_path)
@@ -44,10 +49,15 @@ def emit_spirv_from_llvm_ir(llvm_ir: str, out_spv_path: str) -> None:
         with open(ll_path, "w", encoding="utf-8") as f:
             f.write(llvm_ir)
 
-        # llvm-as module.ll -o module.bc
-        subprocess.check_call([llvm_as, ll_path, "-o", bc_path])
+        # Preferred: llc module.ll -> out.spv
+        if llc:
+            subprocess.check_call(
+                [llc, "-mtriple=spirv64-unknown-unknown", ll_path, "-filetype=obj", "-o", out_spv_path]
+            )
+            return
 
-        # llvm-spirv module.bc -o out.spv
+        # Fallback: llvm-as + llvm-spirv
+        subprocess.check_call([llvm_as, ll_path, "-o", bc_path])
         subprocess.check_call([llvm_spirv, bc_path, "-o", out_spv_path])
 
 

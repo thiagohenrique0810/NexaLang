@@ -1,0 +1,14 @@
+kernel fn fill(buf: Buffer<i32>) {
+    let i: i32 = gpu::global_id()
+    if (i < buf.len) {
+        let p: *i32 = buf.ptr
+        p[i] = i
+    }
+}
+
+fn main() {
+    # Host-side: not emitted in --target spirv --emit spv (kernels-only)
+    print("SPIR-V kernels-only build")
+}
+
+

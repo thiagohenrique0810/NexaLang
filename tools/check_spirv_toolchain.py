@@ -22,6 +22,7 @@ def main() -> int:
     _print_header("PATH checks")
 
     checks = [
+        ("llc", "LLVM backend driver (preferred for .ll -> .spv if SPIR-V targets are enabled)"),
         ("llvm-as", "LLVM tools (turn .ll into .bc)"),
         ("llvm-spirv", "SPIRV-LLVM-Translator (turn .bc into .spv)"),
         ("spirv-val", "SPIR-V Tools (validate .spv)"),
@@ -39,18 +40,20 @@ def main() -> int:
             print(f"{'':10} {'':8}  -> {path}")
 
     _print_header("What you need to emit .spv from this repo")
-    missing_required = [c for c in ("llvm-as", "llvm-spirv") if not found.get(c)]
-    if not missing_required:
+    has_llc = bool(found.get("llc"))
+    has_translator = bool(found.get("llvm-as")) and bool(found.get("llvm-spirv"))
+
+    if has_llc or has_translator:
         print("OK: Required tools found. You can run:")
         print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out output.spv")
         if found.get("spirv-val"):
             print("  spirv-val output.spv")
         return 0
 
-    print("Missing required tools:", ", ".join(missing_required))
+    print("Missing required tools: need either `llc` OR (`llvm-as` + `llvm-spirv`).")
     print("\nInstall guidance (high level):")
-    print("- Install LLVM tools so `llvm-as` is available in PATH.")
-    print("- Install SPIRV-LLVM-Translator so `llvm-spirv` is available in PATH.")
+    print("- Preferred: Install LLVM with SPIR-V targets enabled so `llc` can emit `.spv`.")
+    print("- Fallback: Install LLVM tools so `llvm-as` is available in PATH, and SPIRV-LLVM-Translator so `llvm-spirv` is available.")
     print("- (Optional) Install SPIR-V Tools for `spirv-val`/`spirv-dis`.")
     print("\nAfter installing, re-run this script and then run:")
     print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out output.spv")
