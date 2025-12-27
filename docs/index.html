@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NexaLang - Documentação Completa</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <aside class="sidebar">
+            <h2>NexaLang</h2>
+            <nav>
+                <ul>
+                    <li><a href="#introducao" class="active">Introdução</a></li>
+                    <li><a href="#instalacao">Instalação</a></li>
+                    <li><a href="#sintaxe">Sintaxe Básica</a></li>
+                    <li><a href="#tipos">Tipos de Dados</a></li>
+                    <li><a href="#funcoes">Funções</a></li>
+                    <li><a href="#structs">Structs</a></li>
+                    <li><a href="#enums">Enums</a></li>
+                    <li><a href="#generics">Generics</a></li>
+                    <li><a href="#ownership">Ownership & Borrowing</a></li>
+                    <li><a href="#regions">Regions</a></li>
+                    <li><a href="#gpu">GPU Kernels</a></li>
+                    <li><a href="#controle">Controle de Fluxo</a></li>
+                    <li><a href="#arrays">Arrays & Slices</a></li>
+                    <li><a href="#ponteiros">Ponteiros</a></li>
+                    <li><a href="#stdlib">Standard Library</a></li>
+                    <li><a href="#ferramentas">Ferramentas</a></li>
+                    <li><a href="#exemplos">Exemplos</a></li>
+                </ul>
+            </nav>
+        </aside>
+
+        <main class="main-content">
+            <div class="header">
+                <h1>NexaLang <span class="badge badge-version">v0.1</span> <span class="badge badge-status">Em Desenvolvimento</span></h1>
+                <p>A Linguagem Universal de Sistemas - Combinando segurança moderna com poder de baixo nível</p>
+            </div>
+
+            <section id="introducao">
+                <h2>🚀 Introdução</h2>
+                <p>
+                    <strong>NexaLang</strong> é uma linguagem de programação de sistemas moderna e de alta performance, 
+                    projetada para unificar computação CPU e GPU. Ela combina a segurança de linguagens modernas com 
+                    o poder bruto de controle de baixo nível, tudo sem um coletor de lixo.
+                </p>
+
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <h4>🧠 Gerenciamento Híbrido de Memória</h4>
+                        <p>Seguro por padrão, manual quando necessário. NexaLang usa <strong>Affine Ownership</strong> 
+                        para prevenir vazamentos e data races em tempo de compilação, mas permite gerenciamento baseado 
+                        em <strong>Regions</strong> e blocos <code>unsafe</code> para drivers de hardware.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <h4>⚡ Kernels GPU Nativos</h4>
+                        <p>Pare de escrever strings CUDA C++ no seu código. NexaLang trata a GPU como cidadão de primeira classe. 
+                        Escreva kernels diretamente na sintaxe padrão NexaLang e dispare-os perfeitamente.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <h4>🔌 Interop Zero-Cost</h4>
+                        <p>Ligue diretamente com bibliotecas C e C++ sem overhead. Gere bindings Python e JavaScript 
+                        automaticamente com a toolchain <code>nx</code>.</p>
+                    </div>
+                </div>
+
+                <h3>Filosofia</h3>
+                <p><em>"Control by Choice, Safety by Default"</em></p>
+                <p>
+                    NexaLang oferece controle total quando você precisa, mas segurança por padrão. Você pode optar por 
+                    usar blocos <code>unsafe</code> quando necessário, mas o compilador garante que você está ciente dos riscos.
+                </p>
+            </section>
+
+            <section id="instalacao">
+                <h2>🛠️ Instalação</h2>
+                <p>Atualmente, NexaLang está em fase de desenvolvimento. O compilador bootstrap está disponível em Python.</p>
+
+                <h3>Requisitos</h3>
+                <ul>
+                    <li>Python 3.8+</li>
+                    <li>LLVM (para geração de código)</li>
+                    <li>SPIRV-Tools (opcional, para suporte SPIR-V)</li>
+                </ul>
+
+                <h3>Uso Básico</h3>
+                <pre><code># Compilar e executar um arquivo
+python nx.py run examples/hello.nxl
+
+# Compilar para LLVM IR
+python bootstrap/main.py examples/hello.nxl --emit ll --out output.ll
+
+# Compilar para SPIR-V (GPU)
+python bootstrap/main.py examples/gpu_kernel.nxl --target spirv --emit spv --out kernel.spv</code></pre>
+            </section>
+
+            <section id="sintaxe">
+                <h2>📝 Sintaxe Básica</h2>
+
+                <h3>Hello World</h3>
+                <pre><code>fn main() {
+    print("Hello, NexaLang!")
+}</code></pre>
+
+                <h3>Variáveis</h3>
+                <pre><code># Declaração com tipo explícito
+let x: i32 = 42
+
+# Inferência de tipo
+let y = 100  # tipo inferido como i32
+
+# Mutabilidade (padrão é imutável)
+let mut counter = 0
+counter = counter + 1</code></pre>
+
+                <h3>Comentários</h3>
+                <pre><code># Comentário de linha única
+
+# Comentários multi-linha
+# são feitos com múltiplas linhas
+# começando com #</code></pre>
+            </section>
+
+            <section id="tipos">
+                <h2>🔢 Tipos de Dados</h2>
+
+                <h3>Tipos Primitivos</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Tipo</th>
+                            <th>Descrição</th>
+                            <th>Tamanho</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>i32</code></td>
+                            <td>Inteiro com sinal de 32 bits</td>
+                            <td>4 bytes</td>
+                        </tr>
+                        <tr>
+                            <td><code>i64</code></td>
+                            <td>Inteiro com sinal de 64 bits</td>
+                            <td>8 bytes</td>
+                        </tr>
+                        <tr>
+                            <td><code>u8</code></td>
+                            <td>Inteiro sem sinal de 8 bits</td>
+                            <td>1 byte</td>
+                        </tr>
+                        <tr>
+                            <td><code>bool</code></td>
+                            <td>Booleano (true/false)</td>
+                            <td>1 byte</td>
+                        </tr>
+                        <tr>
+                            <td><code>f32</code></td>
+                            <td>Ponto flutuante de 32 bits</td>
+                            <td>4 bytes</td>
+                        </tr>
+                        <tr>
+                            <td><code>char</code></td>
+                            <td>Caractere Unicode</td>
+                            <td>4 bytes</td>
+                        </tr>
+                        <tr>
+                            <td><code>string</code></td>
+                            <td>String (equivalente a <code>i8*</code>)</td>
+                            <td>Ponteiro</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>Literais</h3>
+                <pre><code>let int_literal = 42
+let float_literal = 3.14
+let bool_literal = true
+let char_literal = 'A'
+let string_literal = "Hello"</code></pre>
+            </section>
+
+            <section id="funcoes">
+                <h2>⚙️ Funções</h2>
+
+                <h3>Definição de Funções</h3>
+                <pre><code># Função sem retorno
+fn greet(name: string) {
+    print(name)
+}
+
+# Função com retorno
+fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+# Função com expressão de retorno implícita
+fn multiply(x: i32, y: i32) -> i32 {
+    x * y  # última expressão é retornada
+}</code></pre>
+
+                <h3>Chamada de Funções</h3>
+                <pre><code>greet("NexaLang")
+let result = add(10, 20)</code></pre>
+            </section>
+
+            <section id="structs">
+                <h2>🏗️ Structs</h2>
+
+                <h3>Definição</h3>
+                <pre><code>struct Vector3 {
+    x: i32,
+    y: i32,
+    z: i32
+}</code></pre>
+
+                <h3>Instanciação</h3>
+                <pre><code>let v: Vector3 = Vector3(10, 20, 30)
+print(v.x)  # 10
+print(v.y)  # 20</code></pre>
+
+                <h3>Métodos (impl blocks)</h3>
+                <pre><code>struct Vector {
+    x: i32,
+    y: i32
+}
+
+impl Vector {
+    # Método estático
+    fn new(x: i32, y: i32) -> Vector {
+        return Vector(x, y)
+    }
+    
+    # Método de instância (referência imutável)
+    fn dot(&self, other: Vector) -> i32 {
+        let a = self.x * other.x
+        let b = self.y * other.y
+        return a + b
+    }
+}
+
+fn main() {
+    let v1 = Vector::new(10, 20)
+    let v2 = Vector::new(3, 4)
+    let prod = v1.dot(v2)  # Método de instância
+}</code></pre>
+            </section>
+
+            <section id="enums">
+                <h2>🎲 Enums</h2>
+
+                <h3>Definição</h3>
+                <pre><code>enum Result {
+    Ok(i32),
+    Err(i32)
+}</code></pre>
+
+                <h3>Uso com Pattern Matching</h3>
+                <pre><code>let res: Result = Result::Ok(42)
+
+match res {
+    Ok(val) => print(val),
+    Err(code) => panic("Erro")
+}</code></pre>
+
+                <div class="alert alert-info">
+                    <strong>Nota:</strong> O pattern matching deve ser exaustivo - todos os casos devem ser cobertos.
+                </div>
+            </section>
+
+            <section id="generics">
+                <h2>🔀 Generics</h2>
+
+                <h3>Structs Genéricos</h3>
+                <pre><code>struct Box&lt;T&gt; {
+    item: T
+}
+
+let b = Box::&lt;i32&gt;(123)</code></pre>
+
+                <h3>Funções Genéricas</h3>
+                <pre><code>fn id&lt;T&gt;(x: T) -> T {
+    return x
+}
+
+let n = id::&lt;i32&gt;(456)</code></pre>
+
+                <div class="alert alert-info">
+                    <strong>TurboFish:</strong> Use <code>::&lt;Tipo&gt;</code> para especificar tipos genéricos explicitamente.
+                </div>
+            </section>
+
+            <section id="ownership">
+                <h2>🔒 Ownership & Borrowing</h2>
+
+                <p>
+                    NexaLang usa um sistema de <strong>Affine Ownership</strong> similar ao Rust. Por padrão, 
+                    tipos não-Copy são movidos quando atribuídos ou passados como argumentos.
+                </p>
+
+                <h3>Move Semântics</h3>
+                <pre><code>struct Foo {
+    x: i32
+}
+
+fn take(foo: Foo) {
+    print(foo.x)
+}
+
+fn main() {
+    let f: Foo = Foo(123)
+    take(f)        # move - ownership transferido
+    print(f.x)     # ERRO: use after move
+}</code></pre>
+
+                <h3>Borrowing (Empréstimo)</h3>
+                <pre><code># Borrow imutável (&T)
+fn read(foo: &Foo) {
+    print(foo.x)  # Apenas leitura
+}
+
+# Borrow mutável (&mut T)
+fn modify(foo: &mut Foo) {
+    foo.x = 999  # Modificação permitida
+}
+
+fn main() {
+    let mut f = Foo(123)
+    read(&f)           # Múltiplos borrows imutáveis OK
+    modify(&mut f)    # Apenas um borrow mutável por vez
+}</code></pre>
+
+                <div class="alert alert-warning">
+                    <strong>Regras de Borrowing:</strong>
+                    <ul>
+                        <li>Múltiplos borrows imutáveis são permitidos simultaneamente</li>
+                        <li>Apenas um borrow mutável por vez</li>
+                        <li>Não é possível ter borrow mutável e imutável ao mesmo tempo</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="regions">
+                <h2>🗂️ Regions (Arenas)</h2>
+
+                <p>
+                    <strong>Regions</strong> permitem gerenciamento de memória baseado em arenas. 
+                    Toda a memória alocada em uma região é liberada quando a região sai de escopo.
+                </p>
+
+                <pre><code>fn process_transaction() {
+    region temp_arena {
+        let user = User::new(in temp_arena)
+        let cart = Cart::new(in temp_arena)
+        # ... processamento pesado ...
+    }  # temp_arena dropped aqui - desalocação O(1) instantânea
+}</code></pre>
+
+                <div class="alert alert-success">
+                    <strong>Vantagem:</strong> Desalocação em O(1) - toda a memória da arena é liberada de uma vez.
+                </div>
+            </section>
+
+            <section id="gpu">
+                <h2>🎮 GPU Kernels</h2>
+
+                <p>
+                    Uma das features principais do NexaLang é tratar a GPU como um contexto de execução padrão. 
+                    Você pode escrever kernels diretamente em NexaLang usando a palavra-chave <code>kernel</code>.
+                </p>
+
+                <h3>Definição de Kernel</h3>
+                <pre><code>kernel fn compute_physics(particles: Buffer&lt;Particle&gt;) {
+    let i = gpu::global_id().x
+    # Lógica executa na GPU
+    particles[i].velocity = particles[i].velocity * 0.99
+}</code></pre>
+
+                <h3>Dispatch de Kernel</h3>
+                <pre><code>fn main() {
+    let particles = load_particles()
+    # Dispara kernel na GPU
+    gpu::dispatch(compute_physics, args: (particles,), threads: 1024)
+}</code></pre>
+
+                <h3>SPIR-V Backend</h3>
+                <p>O compilador pode gerar código SPIR-V para execução em GPUs compatíveis:</p>
+                <pre><code>python bootstrap/main.py examples/gpu_kernel.nxl --target spirv --emit spv --out kernel.spv</code></pre>
+
+                <div class="alert alert-info">
+                    <strong>Suporte Vulkan:</strong> O compilador suporta ambiente Vulkan com <code>--spirv-env vulkan</code>.
+                </div>
+            </section>
+
+            <section id="controle">
+                <h2>🔄 Controle de Fluxo</h2>
+
+                <h3>If/Else</h3>
+                <pre><code>if (x > 10) {
+    print("Maior que 10")
+} else {
+    print("Menor ou igual a 10")
+}</code></pre>
+
+                <h3>While Loops</h3>
+                <pre><code>let mut i = 0
+while (i < 10) {
+    print(i)
+    i = i + 1
+}</code></pre>
+
+                <h3>Match (Pattern Matching)</h3>
+                <pre><code>match status {
+    Ok(val) => print("Sucesso: " + val),
+    Err(e) => print("Erro: " + e),
+    _ => print("Desconhecido")
+}</code></pre>
+            </section>
+
+            <section id="arrays">
+                <h2>📦 Arrays & Slices</h2>
+
+                <h3>Arrays</h3>
+                <pre><code># Array de tamanho fixo
+let arr: [i32:5] = [1, 2, 3, 4, 5]
+print(arr[0])  # 1
+
+# Acesso por índice
+arr[2] = 99</code></pre>
+
+                <h3>Slices</h3>
+                <pre><code># Criar slice a partir de array
+let arr: [i32:10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+let slice = slice_from_array(&arr)
+
+# Acesso a slice
+print(slice.len)  # 10
+print(slice[0])   # 1</code></pre>
+            </section>
+
+            <section id="ponteiros">
+                <h2>📍 Ponteiros</h2>
+
+                <h3>Tipos de Ponteiro</h3>
+                <pre><code># Ponteiro imutável
+let x: i32 = 42
+let ptr: *i32 = &x
+
+# Ponteiro mutável
+let mut y: i32 = 100
+let mut_ptr: *mut i32 = &mut y
+
+# Dereferenciação
+*ptr = 99
+print(*ptr)  # 99</code></pre>
+
+                <h3>Operações com Ponteiros</h3>
+                <pre><code># Aritmética de ponteiros
+let next = ptr_offset::&lt;i32&gt;(ptr, 1)
+
+# Tamanho de tipo
+let size = sizeof::&lt;i32&gt;()  # 4
+
+# Cast de ponteiros
+let raw: *u8 = cast::&lt;*u8&gt;(ptr)</code></pre>
+            </section>
+
+            <section id="stdlib">
+                <h2>📚 Standard Library</h2>
+
+                <h3>Funções Built-in</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Função</th>
+                            <th>Descrição</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>print(value)</code></td>
+                            <td>Imprime um valor no console</td>
+                        </tr>
+                        <tr>
+                            <td><code>panic(message)</code></td>
+                            <td>Aborta o programa com mensagem de erro</td>
+                        </tr>
+                        <tr>
+                            <td><code>assert(condition, message)</code></td>
+                            <td>Verifica condição e aborta se falsa</td>
+                        </tr>
+                        <tr>
+                            <td><code>malloc(size: i32) -> *u8</code></td>
+                            <td>Aloca memória dinamicamente</td>
+                        </tr>
+                        <tr>
+                            <td><code>free(ptr: *u8)</code></td>
+                            <td>Libera memória alocada</td>
+                        </tr>
+                        <tr>
+                            <td><code>memcpy(dest, src, size)</code></td>
+                            <td>Copia memória</td>
+                        </tr>
+                        <tr>
+                            <td><code>fs::read_file(path: string) -> Buffer&lt;u8&gt;</code></td>
+                            <td>Lê arquivo do sistema de arquivos</td>
+                        </tr>
+                        <tr>
+                            <td><code>fs::write_file(path, data, len)</code></td>
+                            <td>Escreve arquivo no sistema de arquivos</td>
+                        </tr>
+                        <tr>
+                            <td><code>gpu::global_id() -> i32</code></td>
+                            <td>Retorna ID global do thread GPU</td>
+                        </tr>
+                        <tr>
+                            <td><code>gpu::dispatch(kernel, args, threads)</code></td>
+                            <td>Dispara kernel na GPU</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>Tipos Built-in</h3>
+                <ul>
+                    <li><code>Buffer&lt;T&gt;</code> - Buffer genérico (usado para GPU)</li>
+                    <li><code>Slice&lt;T&gt;</code> - Slice genérico</li>
+                    <li><code>Vec&lt;T&gt;</code> - Vetor dinâmico</li>
+                    <li><code>Option&lt;T&gt;</code> - Tipo opcional (enum)</li>
+                    <li><code>Result&lt;T, E&gt;</code> - Tipo de resultado (enum)</li>
+                </ul>
+            </section>
+
+            <section id="ferramentas">
+                <h2>🛠️ Ferramentas</h2>
+
+                <h3>CLI `nx`</h3>
+                <p>Ferramenta de linha de comando para gerenciar projetos NexaLang:</p>
+                <pre><code># Executar arquivo
+python nx.py run examples/hello.nxl
+
+# Compilar para SPIR-V
+python nx.py build examples/gpu_kernel.nxl --target spirv --emit spv --spv-out kernel.spv
+
+# Validar SPIR-V
+python nx.py val spirv kernel.spv</code></pre>
+
+                <h3>VSCode Extension</h3>
+                <p>Extensão de syntax highlighting para VSCode disponível em <code>vscode-nexalang/</code>.</p>
+
+                <h3>Ferramentas de Build</h3>
+                <ul>
+                    <li><strong>Compilador Bootstrap:</strong> Python-based, gera LLVM IR</li>
+                    <li><strong>Targets:</strong> Native, SPIR-V (OpenCL/Vulkan)</li>
+                    <li><strong>Output:</strong> LLVM IR (.ll), SPIR-V (.spv), Binário nativo</li>
+                </ul>
+            </section>
+
+            <section id="exemplos">
+                <h2>💡 Exemplos</h2>
+
+                <h3>Exemplo 1: Hello World</h3>
+                <pre><code>fn main() {
+    print("Hello, NexaLang!")
+}</code></pre>
+
+                <h3>Exemplo 2: Struct com Métodos</h3>
+                <pre><code>struct Point {
+    x: i32,
+    y: i32
+}
+
+impl Point {
+    fn new(x: i32, y: i32) -> Point {
+        return Point(x, y)
+    }
+    
+    fn distance(&self, other: &Point) -> f32 {
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        # Cálculo simplificado
+        return cast::&lt;f32&gt;(dx * dx + dy * dy)
+    }
+}
+
+fn main() {
+    let p1 = Point::new(0, 0)
+    let p2 = Point::new(3, 4)
+    print(p1.distance(&p2))
+}</code></pre>
+
+                <h3>Exemplo 3: GPU Kernel</h3>
+                <pre><code>kernel fn vector_add(a: Buffer&lt;f32&gt;, b: Buffer&lt;f32&gt;, result: Buffer&lt;f32&gt;) {
+    let i = gpu::global_id().x
+    if (i < a.len) {
+        result[i] = a[i] + b[i]
+    }
+}
+
+fn main() {
+    let a = create_buffer(1000)
+    let b = create_buffer(1000)
+    let result = create_buffer(1000)
+    
+    gpu::dispatch(vector_add, args: (a, b, result), threads: 1000)
+}</code></pre>
+            </section>
+
+            <div class="footer">
+                <p>NexaLang - The Universal Systems Language</p>
+                <p>Designed by <strong>Thiago Henrique</strong></p>
+                <p>Versão 0.1 - Em Desenvolvimento</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="highlight.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>
+
