@@ -1,5 +1,5 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
+from parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
 import sys
 import copy
 class SemanticAnalyzer:
@@ -8,6 +8,7 @@ class SemanticAnalyzer:
         self.scopes = [{}] 
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
+        self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
 
     def is_copy_type(self, type_name: str) -> bool:
         """
@@ -19,7 +20,7 @@ class SemanticAnalyzer:
         """
         if not type_name:
             return False
-        if type_name in ('i32', 'i64', 'u8', 'bool', 'f32', 'string', 'char'):
+        if type_name in ('i32', 'i64', 'u64', 'u8', 'bool', 'f32', 'string', 'char'):
             return True
         if type_name.endswith('*'):
             return True
@@ -126,6 +127,11 @@ class SemanticAnalyzer:
 
     def register_impl_methods(self, node):
         struct_name = node.struct_name
+        
+        # Initialize methods dict for this struct if needed
+        if struct_name not in self.struct_methods:
+            self.struct_methods[struct_name] = {}
+        
         # Mangle method names and fix 'self' types
         for method in node.methods:
              # Check for duplicate?
@@ -140,6 +146,12 @@ class SemanticAnalyzer:
                            method.params[0] = ('self', struct_name)
                        elif ptype == '&Self': 
                            method.params[0] = ('self', f"{struct_name}*")
+                       elif ptype == '&mut Self':
+                           method.params[0] = ("self", f"{struct_name}*")
+             
+             
+             # Register method in struct_methods for resolution
+             self.struct_methods[struct_name][method.name] = method
              
              # Mangle name
              mangled_name = f"{struct_name}_{method.name}"
@@ -171,6 +183,48 @@ class SemanticAnalyzer:
         ty = fields[node.member]
         node.type_name = ty
         return ty
+
+    def visit_MethodCall(self, node):
+        # Resolve obj.method(args) and annotate for code generation
+        # 1. Get receiver type
+        receiver_type = self.visit(node.receiver)
+        
+        # Strip references to get base type
+        base_type = receiver_type.lstrip('&')
+        if base_type.startswith('mut '):
+            base_type = base_type[4:]
+        if base_type.endswith('*'):
+            base_type = base_type[:-1]
+        
+        # 2. Look up method
+        if base_type not in self.struct_methods:
+            raise Exception(f"Semantic Error: Type '{base_type}' has no methods")
+        
+        methods = self.struct_methods[base_type]
+        if node.method_name not in methods:
+            raise Exception(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'")
+        
+        method_def = methods[node.method_name]
+        
+        # 3. Type-check arguments
+        # The first parameter is 'self', so skip it when checking args
+        method_params = method_def.params[1:] if method_def.params and method_def.params[0][0] == 'self' else method_def.params
+        
+        if len(node.args) != len(method_params):
+            raise Exception(f"Type Error: Method '{node.method_name}' expects {len(method_params)} arguments, got {len(node.args)}")
+        
+        for i, arg in enumerate(node.args):
+            arg_type = self.visit(arg)
+            expected_type = method_params[i][1]
+            # Type checking would go here
+        
+        # 4. Annotate for codegen
+        node.struct_type = base_type
+        node.receiver_type = receiver_type
+        node.return_type = method_def.return_type
+        
+        return method_def.return_type
+
 
     def visit_ArrayLiteral(self, node):
         if not node.elements:
@@ -317,19 +371,16 @@ class SemanticAnalyzer:
 
             # Bind payload variable if present (single payload supported)
             self.enter_scope()
-            if case.var_name:
-                if len(payloads) == 0:
-                    raise Exception(
-                        f"Semantic Error: Variant '{case.variant_name}' has no payload, but matched with variable '{case.var_name}'"
-                    )
-                if len(payloads) > 1:
-                    # TODO: support multiple payload bindings
-                    pass
-                self.declare_variable(case.var_name, payloads[0])
+            if case.var_names:
+                if len(case.var_names) != len(payloads):
+                     raise Exception(f"Semantic Error: Variant '{case.variant_name}' has {len(payloads)} fields, but matched with {len(case.var_names)} variables")
+                
+                for i, vname in enumerate(case.var_names):
+                     self.declare_variable(vname, payloads[i])
             else:
                 if len(payloads) > 0:
-                    # Payload can be ignored for now; keep permissive in bootstrap.
-                    pass
+                     # Payload ignored
+                     pass
 
             self.visit(case.body)
             self.exit_scope()
@@ -581,20 +632,17 @@ class SemanticAnalyzer:
              # Borrow Check: No mutation while borrowed
              if var_info['readers'] > 0:
                   raise Exception(f"Borrow Error: Cannot assign to '{name}' because it is borrowed")
-             if var_info['writer']:
-                  raise Exception(f"Borrow Error: Cannot assign to '{name}' because it is borrowed mutable")
-
-             target_type = var_info['type']
              
-             # Check type mismatch
+             target_type = var_info['type']
              if target_type != value_type:
-                  # Allow explicit pointer assignment?
-                  pass
-             if target_type != value_type:
-                  raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
-                  
-             # Revive variable
+                 raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
              var_info['moved'] = False
+
+        elif isinstance(node.target, MemberAccess):
+             # Visit target
+             target_type = self.visit(node.target)
+             if target_type != value_type:
+                 raise Exception(f"Type Error: Mismatch assignment to member {target_type} != {value_type}")
 
         elif isinstance(node.target, UnaryExpr):
              if node.target.op == '*':
@@ -638,9 +686,9 @@ class SemanticAnalyzer:
              raise Exception(f"Type Error: Operands must be same type. Got '{left_type}' and '{right_type}'")
 
         # Arithmetic
-        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH'):
-            if left_type not in ('i32', 'f32'):
-                raise Exception(f"Type Error: Arithmetic only supported for i32/f32. Got '{left_type}'")
+        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'):
+            if left_type not in ('i32', 'i64', 'u64', 'u8', 'f32'):
+                raise Exception(f"Type Error: Arithmetic only supported for primitives. Got '{left_type}'")
             node.type_name = left_type
             return left_type
 
@@ -813,11 +861,7 @@ class SemanticAnalyzer:
              return callee_name[5:-1]
         elif callee_name.startswith('sizeof<'):
              return 'i32'
-        elif callee_name.startswith('ptr_offset<'):
-             target_type = callee_name[11:-1]
-             self.visit(node.args[0])
-             self.visit(node.args[1])
-             return f"{target_type}*"
+
 
         # Generic Instantiation
         if '<' in callee_name:
@@ -867,8 +911,8 @@ class SemanticAnalyzer:
                  self.exit_scope()
                  return enum_name
 
-        raise Exception(f"Semantic Error: Call to undefined function '{callee_name}'")
-        elif node.callee == 'slice_from_array':
+        # raise Exception(...) - Moved to end
+        if node.callee == 'slice_from_array':
             # slice_from_array(&arr) -> Slice<T>
             if len(node.args) != 1:
                 raise Exception("slice_from_array expects 1 arg: &arr where arr is [T:N]")
@@ -982,14 +1026,7 @@ class SemanticAnalyzer:
         elif node.callee.startswith('sizeof<'):
              return 'i32'
              
-        elif node.callee.startswith('ptr_offset<'):
-             target_type = node.callee[11:-1]
-             if len(node.args) != 2: raise Exception("ptr_offset expects 2 args")
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.visit(node.args[1])
-             self.exit_scope()
-             return f"{target_type}*"
+
 
         # Generic Instantiation if needed
         if '<' in node.callee:

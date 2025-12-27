@@ -50,9 +50,9 @@ class MatchExpr(ASTNode):
         self.cases = cases # list of CaseArm
 
 class CaseArm(ASTNode):
-    def __init__(self, variant_name, var_name, body):
+    def __init__(self, variant_name, var_names, body):
         self.variant_name = variant_name # "Ok"
-        self.var_name = var_name         # "val" (bound variable) or None
+        self.var_names = var_names       # list of bound variables
         self.body = body
 
 class MemberAccess(ASTNode):
@@ -62,6 +62,16 @@ class MemberAccess(ASTNode):
     
     def __repr__(self):
         return f"{self.object}.{self.member}"
+
+class MethodCall(ASTNode):
+    def __init__(self, receiver, method_name, args):
+        self.receiver = receiver
+        self.method_name = method_name
+        self.args = args
+    
+    def __repr__(self):
+        return f"{self.receiver}.{self.method_name}(...)"
+
 
 class CallExpr(ASTNode):
     def __init__(self, callee, args):
@@ -135,6 +145,8 @@ class UnaryExpr(ASTNode):
             return self.parse_if()
         elif token.type == 'WHILE':
             return self.parse_while()
+        elif token.type == 'MATCH':
+            return self.parse_match()
         elif token.type == 'IDENTIFIER':
             # Could be assignment or expression statement
             # For now, simplistic check
@@ -274,7 +286,7 @@ class Parser:
             if self.peek().type == 'LPAREN':
                 self.consume('LPAREN')
                 while self.peek().type != 'RPAREN':
-                    payloads.append(self.consume('IDENTIFIER').value) # Type name
+                    payloads.append(self.parse_type()) # Type name
                     if self.peek().type == 'COMMA':
                         self.consume('COMMA')
                 self.consume('RPAREN')
@@ -302,14 +314,26 @@ class Parser:
         self.consume('LPAREN')
         params = []
         while self.peek().type != 'RPAREN':
-            # Handle self
+            # Handle self parameters
             if self.peek().type == 'SELF':
                  self.consume('SELF')
                  params.append(('self', 'Self'))
-            elif self.peek().type == 'AMPERSAND' and self.peek(1).type == 'SELF':
+            elif self.peek().type == 'AMPERSAND':
+                 # Could be &self or &mut self
                  self.consume('AMPERSAND')
-                 self.consume('SELF')
-                 params.append(('self', '&Self'))
+                 if self.peek().type == 'MUT':
+                     self.consume('MUT')
+                     self.consume('SELF')
+                     params.append(('self', '&mut Self'))
+                 elif self.peek().type == 'SELF':
+                     self.consume('SELF')
+                     params.append(('self', '&Self'))
+                 else:
+                     # Regular reference parameter &name: Type
+                     param_name = self.consume('IDENTIFIER').value
+                     self.consume('COLON')
+                     param_type = '&' + self.parse_type()
+                     params.append((param_name, param_type))
             else:
                  param_name = self.consume('IDENTIFIER').value
                  self.consume('COLON')
@@ -337,11 +361,8 @@ class Parser:
 
     def parse_statement(self):
         token = self.peek()
-        print(f"DEBUG: parse_statement peek: {token}. type='{token.type}' == LET? {token.type == 'LET'}")
         if token.type == 'LET':
-            # print(f"DEBUG: LET check passed")
             return self.parse_var_decl()
-        print(f"DEBUG: Checking others. type='{token.type}'")
         elif token.type == 'RETURN':
             return self.parse_return()
         elif token.type == 'IF':
@@ -454,7 +475,9 @@ class Parser:
              
     def parse_return(self):
         self.consume('RETURN')
-        value = self.parse_expression()
+        value = None
+        if self.peek().type != 'SEMICOLON':
+            value = self.parse_expression()
         return ReturnStmt(value)
         
     def parse_match(self):
@@ -465,10 +488,13 @@ class Parser:
         cases = []
         while self.peek().type != 'RBRACE':
             variant_name = self.consume('IDENTIFIER').value
-            var_name = None
+            var_names = []
             if self.peek().type == 'LPAREN':
                 self.consume('LPAREN')
-                var_name = self.consume('IDENTIFIER').value
+                while self.peek().type != 'RPAREN':
+                    var_names.append(self.consume('IDENTIFIER').value)
+                    if self.peek().type == 'COMMA':
+                        self.consume('COMMA')
                 self.consume('RPAREN')
             
             self.consume('FAT_ARROW')
@@ -479,7 +505,7 @@ class Parser:
             # Wait, if we use braces it might be block?
             # Basic version: Single statement.
             body = self.parse_statement()
-            cases.append(CaseArm(variant_name, var_name, body))
+            cases.append(CaseArm(variant_name, var_names, body))
             
             # Optional comma?
             if self.peek().type == 'COMMA':
@@ -544,7 +570,15 @@ class Parser:
 
     def parse_expression_stmt(self):
         expr = self.parse_expression()
-        # Expect semicolon? For now optional/not implemented
+        if self.peek().type == 'EQ':
+            self.consume('EQ')
+            rhs = self.parse_expression()
+            if self.peek().type == 'SEMICOLON':
+                self.consume('SEMICOLON')
+            return Assignment(expr, rhs)
+        
+        if self.peek().type == 'SEMICOLON':
+            self.consume('SEMICOLON')
         return expr
 
     def parse_expression(self):
@@ -586,7 +620,7 @@ class Parser:
 
     def get_precedence(self, op_type):
         if op_type in ('PLUS', 'MINUS'): return 1
-        if op_type in ('STAR', 'SLASH'): return 2
+        if op_type in ('STAR', 'SLASH', 'PERCENT'): return 2
         if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 0
         return -1
 
@@ -594,7 +628,10 @@ class Parser:
         token = self.peek()
         expr = None
         
-        if token.type == 'NUMBER':
+        if token.type == 'SELF':
+            self.consume('SELF')
+            expr = VariableExpr('self')
+        elif token.type == 'NUMBER':
             self.consume('NUMBER')
             expr = IntegerLiteral(int(token.value))
         elif token.type == 'CHAR':
@@ -681,14 +718,19 @@ class Parser:
             start = max(0, self.pos - 10)
             end = min(len(self.tokens), self.pos + 10)
             context = self.tokens[start:end]
-            raise Exception(f"Unexpected token in primary: {token}. Type: '{token.type}'. Context: {context}")
+            raise Exception(f"Unexpected token in primary: {token}. Type: '{token.type}'. Prev: {self.tokens[self.pos-1] if self.pos > 0 else 'START'} Next: {self.tokens[self.pos+1] if self.pos+1 < len(self.tokens) else 'EOF'}")
             
         # Postfix Handlers (Member Access, Index Access, Call)
         while True:
             if self.peek().type == 'DOT':
                 self.consume('DOT')
                 member = self.consume('IDENTIFIER').value
-                expr = MemberAccess(expr, member)
+                # Check if this is a method call (followed by '(')
+                if self.peek().type == 'LPAREN':
+                    args = self.parse_call_arguments()
+                    expr = MethodCall(expr, member, args)
+                else:
+                    expr = MemberAccess(expr, member)
             elif self.peek().type == 'LBRACKET':
                 self.consume('LBRACKET')
                 index = self.parse_expression()

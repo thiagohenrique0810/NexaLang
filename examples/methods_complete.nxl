@@ -1,0 +1,32 @@
+struct Point {
+    x: i32,
+    y: i32
+}
+
+impl Point {
+    fn new(x: i32, y: i32) -> Point {
+        let p: Point = Point(x, y);
+        return p;
+    }
+    
+    fn distance(&self) -> i32 {
+        return self.x * self.x + self.y * self.y;
+    }
+    
+    fn move(&mut self, dx: i32, dy: i32) {
+        self.x = self.x + dx;
+        self.y = self.y + dy;
+    }
+}
+
+fn main() -> i32 {
+    let p: Point = Point::new(3, 4);
+    print(p.distance());
+    
+    let mut q: Point = Point::new(0, 0);
+    q.move(10, 20);
+    print(q.x);
+    print(q.y);
+    
+    return 0;
+}

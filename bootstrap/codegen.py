@@ -1,5 +1,5 @@
 from llvmlite import ir
-from parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, FloatLiteral, IndexAccess, CharLiteral
+from parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, MethodCall, FloatLiteral, IndexAccess, CharLiteral
 
 class CodeGen:
     def __init__(
@@ -326,6 +326,8 @@ class CodeGen:
             return ir.IntType(32)
         elif type_name == 'i64':
              return ir.IntType(64)
+        elif type_name == 'u64':
+             return ir.IntType(64)
         elif type_name == 'f32':
              return ir.FloatType()
         elif type_name == 'u8':
@@ -382,50 +384,50 @@ class CodeGen:
         variant_tags = {}
         variant_payload_types = {}
         
+        # Helper for recursive types: Register proper placeholder (not i8!)
+        placeholder_padding = ir.ArrayType(ir.IntType(8), 256)
+        placeholder_enum = ir.LiteralStructType([ir.IntType(32), placeholder_padding])
+        self.enum_definitions[node.name] = (placeholder_enum, {})
+
         # For this phase, assume only i32 payloads for simplicity of size calc
         # i32 = 4 bytes
         
         for i, (vname, payloads) in enumerate(node.variants):
             variant_tags[vname] = i
             if payloads:
-                # Assume single payload for now
-                ptype = payloads[0]
-                if ptype == 'i32':
-                    max_size = max(max_size, 4)
-                    variant_payload_types[vname] = ir.IntType(32)
-                elif ptype == 'string':
-                    max_size = max(max_size, 8) # Pointer size
-                    variant_payload_types[vname] = ir.IntType(8).as_pointer()
-                elif ptype in self.struct_types or ptype in self.enum_definitions:
-                    # Struct or Enum payload
-                    # For simplicity, treat as by-value, but size might be large.
-                    # Or maybe we store structs as pointers in enums?
-                    # Let's say we support stored structs.
-                    # Need size of struct.
-                    # self.struct_types[ptype] is ir.LiteralStructType.
-                    # We can't easily get size in bytes from llvmlite without target data layout.
-                    # Hack: assume large defaults or skip for now?
-                    # Let's Skip arbitrary structs for now to avoid complexity, or assume 64 bytes?
-                     max_size = max(max_size, 64) # Hacky max size
-                     enum_ty = None
-                     if ptype in self.struct_types: enum_ty = self.struct_types[ptype]
-                     else: enum_ty, _ = self.enum_definitions[ptype]
-                     variant_payload_types[vname] = enum_ty
-                elif ptype.endswith('*') or ptype.startswith('['):
-                     # Pointers/Arrays
-                     max_size = max(max_size, 8)
-                     # Need actual type
-                     pass
-                else: 
-                     # Try generic fallback
-                     max_size = max(max_size, 8)
-                     variant_payload_types[vname] = ir.IntType(32) # Placeholder? Dangerous
+                # Map all payload types to LLVM types
+                llvm_types = []
+                current_size = 0
+                for ptype in payloads:
+                     lty = self.get_llvm_type(ptype)
+                     llvm_types.append(lty)
+                     
+                     # Rough size estimation (bootstrap limitation)
+                     if isinstance(lty, ir.IntType):
+                         current_size += lty.width // 8
+                     elif isinstance(lty, ir.PointerType):
+                         current_size += 8
+                     else:
+                         current_size += 64 # Struct/Array fallback
+                
+                max_size = max(max_size, current_size)
+                
+                if len(llvm_types) == 1:
+                    variant_payload_types[vname] = llvm_types[0]
+                else:
+                    variant_payload_types[vname] = ir.LiteralStructType(llvm_types)
             else:
                  variant_payload_types[vname] = None
         
-        # Create LLVM type
         # Tag (i32) + Payload (Array of i8)
-        padding_ty = ir.ArrayType(ir.IntType(8), max_size)
+        # Use Fixed Size (Universal Enum)
+        # max_size = max(max_size, current_size) # We ignore calculated max
+        final_size = 256
+        padding_ty = ir.ArrayType(ir.IntType(8), final_size)
+        
+        # Check if any variant exceeds limit?
+        if max_size > final_size:
+             print(f"WARNING: Enum {node.name} payload size {max_size} exceeds fixed limit {final_size}")
         enum_ty = ir.LiteralStructType([ir.IntType(32), padding_ty])
         
         self.enum_types[node.name] = variant_tags
@@ -437,6 +439,15 @@ class CodeGen:
              self.visit(method)
 
     def generate(self, ast):
+        # Pre-Pass: Register Universal Enum Types to handle recursion
+        enum_payload_size = 256
+        placeholder_padding = ir.ArrayType(ir.IntType(8), enum_payload_size)
+        placeholder_enum = ir.LiteralStructType([ir.IntType(32), placeholder_padding])
+        
+        for node in ast:
+            if isinstance(node, EnumDef):
+                self.enum_definitions[node.name] = (placeholder_enum, {})
+
         # Pass 1: Types (Structs, Enums)
         for node in ast:
             if isinstance(node, (StructDef, EnumDef)):
@@ -523,8 +534,56 @@ class CodeGen:
         if not hasattr(node, 'struct_type'):
              raise Exception("CodeGen Error: MemberAccess node missing 'struct_type' annotation from Semantic phase.")
         struct_name = node.struct_type
-        field_index = self.struct_fields[struct_name][node.member]
-        return self.builder.extract_value(struct_val, field_index)
+        
+        # Determine if we have value or pointer
+        if isinstance(struct_val.type, ir.PointerType):
+             # GEP + Load
+             param_ptr = struct_val
+             
+             # Need to find field index
+             field_idx = self.struct_fields[struct_name][node.member]
+             
+             ptr = self.builder.gep(param_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
+             return self.builder.load(ptr)
+        else:
+             # Extract Value
+             field_index = self.struct_fields[struct_name][node.member]
+             return self.builder.extract_value(struct_val, field_index)
+
+    def visit_MethodCall(self, node):
+        # Desugar obj.method(args) -> Type_method(obj, args)
+        # 1. Visit receiver
+        receiver_val = self.visit(node.receiver)
+        
+        # 2. Get struct type from semantic analysis
+        struct_type = node.struct_type
+        
+        # 3. Build mangled function name
+        func_name = f"{struct_type}_{node.method_name}"
+        
+        if func_name not in self.module.globals:
+            raise Exception(f"CodeGen Error: Method '{func_name}' not found in module")
+        
+        func = self.module.globals[func_name]
+        
+        # 4. Prepare receiver argument
+        # Check if method expects a pointer (for &self or &mut self)
+        expected_param_type = func.function_type.args[0]
+        
+        if isinstance(expected_param_type, ir.PointerType) and not isinstance(receiver_val.type, ir.PointerType):
+            # Method expects pointer but we have value - need to take address
+            # Allocate temporary, store value, pass address
+            temp = self.builder.alloca(receiver_val.type, name="method_self_tmp")
+            self.builder.store(receiver_val, temp)
+            receiver_arg = temp
+        else:
+            receiver_arg = receiver_val
+        
+        # 5. Prepare all arguments: [receiver, ...args]
+        args = [receiver_arg] + [self.visit(arg) for arg in node.args]
+        
+        # 6. Call the mangled function
+        return self.builder.call(func, args)
 
     def visit_ArrayLiteral(self, node):
         # Create array value
@@ -734,6 +793,21 @@ class CodeGen:
              if not ptr: raise Exception(f"Undefined var {node.target.name}")
              self.builder.store(val, ptr)
              
+        elif isinstance(node.target, MemberAccess):
+             struct_val = self.visit(node.target.object)
+             # print(f"DEBUG ASSIGN MEMBER: {struct_val.type}")
+             # if not hasattr(node.target, 'struct_type'): raise Exception('Missing struct_type')
+             if not isinstance(struct_val.type, ir.PointerType):
+                 obj_repr = repr(node.target.object) if hasattr(node.target, 'object') else 'unknown'
+                 raise Exception(f"Cannot assign to member '{node.target.member}' of Value-type struct (object={obj_repr}): {struct_val.type} (is_ptr={isinstance(struct_val.type, ir.PointerType)})")
+             struct_name = node.target.struct_type
+             field_idx = self.struct_fields[struct_name][node.target.member]
+             if isinstance(struct_val.type, ir.PointerType):
+                 ptr = self.builder.gep(struct_val, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
+                 self.builder.store(val, ptr)
+             else:
+                 raise Exception('Cannot assign to member of Value-type struct')
+
         elif isinstance(node.target, UnaryExpr):
              if node.target.op == '*':
                   # *ptr = val
@@ -863,6 +937,10 @@ class CodeGen:
             if left.type == ir.FloatType():
                 return self.builder.fdiv(left, right, name="fdivtmp")
             return self.builder.sdiv(left, right, name="divtmp")
+        elif node.op == 'PERCENT':
+            if left.type == ir.FloatType():
+                return self.builder.frem(left, right, name="fremtmp")
+            return self.builder.srem(left, right, name="remtmp")
         elif node.op == 'EQEQ':
             if left.type == ir.FloatType():
                 return self.builder.fcmp_ordered('==', left, right, name="feqtmp")
@@ -1317,6 +1395,8 @@ class CodeGen:
                      target_ty = ir.IntType(32)
                  elif target_type_name == 'u8':
                      target_ty = ir.IntType(8)
+                 elif target_type_name == 'u64' or target_type_name == 'i64':
+                     target_ty = ir.IntType(64)
                  elif target_type_name == 'bool':
                      target_ty = ir.IntType(1)
                  else:
@@ -1502,8 +1582,8 @@ class CodeGen:
             # Scope for this case (so bound variables don't leak between arms)
             self.scopes.append({})
             
-            # Bound Variable
-            if case.var_name:
+            # Bound Variables
+            if case.var_names:
                 # Get Payload Address
                 zero = ir.Constant(ir.IntType(32), 0)
                 one = ir.Constant(ir.IntType(32), 1)
@@ -1514,9 +1594,21 @@ class CodeGen:
                 if payload_ty:
                     cast_ptr = self.builder.bitcast(data_ptr, payload_ty.as_pointer())
                     
-                    # Register in scope as (ptr, type_name)
-                    type_name = self._infer_type_name_from_llvm(payload_ty)
-                    self.scopes[-1][case.var_name] = (cast_ptr, type_name)
+                    if len(case.var_names) == 1:
+                        # Single bind: bind entire payload
+                        type_name = self._infer_type_name_from_llvm(payload_ty)
+                        self.scopes[-1][case.var_names[0]] = (cast_ptr, type_name)
+                    else:
+                        # Multiple binds: destructure struct
+                        for i, vname in enumerate(case.var_names):
+                             z = ir.Constant(ir.IntType(32), 0)
+                             idx = ir.Constant(ir.IntType(32), i)
+                             field_ptr = self.builder.gep(cast_ptr, [z, idx])
+                             
+                             field_ty = payload_ty.elements[i]
+                             type_name = self._infer_type_name_from_llvm(field_ty)
+                             # Store info
+                             self.scopes[-1][vname] = (field_ptr, type_name)
                 
             # Execute body
             self.visit(case.body)
@@ -1637,6 +1729,8 @@ class CodeGen:
         
         # Process body
         for stmt in node.body:
+            if self.builder.block.is_terminated:
+                break
             self.visit(stmt)
             
         # Add return void/undef if missing

@@ -1,0 +1,86 @@
+﻿python : Traceback (most recent call 
+last):
+No linha:1 caractere:1
++ python bootstrap/main.py 
+selfhost/stage5_full.nxl --target 
+native --r ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpe 
+   cified: (Traceback (most recent   
+  call last)::String) [], RemoteEx   
+ ception
+    + FullyQualifiedErrorId : Native 
+   CommandError
+ 
+  File 
+"Y:\WWW\NexaLang\bootstrap\main.py", 
+line 94, in <module>
+    main()
+    ~~~~^^
+  File 
+"Y:\WWW\NexaLang\bootstrap\main.py", 
+line 33, in main
+    ast = parser.parse()
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 210, in parse
+    nodes.append(self.parse_function(
+is_kernel=False))
+                 
+~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 331, in parse_function
+    
+body.append(self.parse_statement())
+                
+~~~~~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 347, in parse_statement
+    return self.parse_while()
+           ~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 523, in parse_while
+    
+body.append(self.parse_statement())
+                
+~~~~~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 347, in parse_statement
+    return self.parse_while()
+           ~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 523, in parse_while
+    
+body.append(self.parse_statement())
+                
+~~~~~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 349, in parse_statement
+    return self.parse_match()
+           ~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 478, in parse_match
+    body = self.parse_statement()
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 356, in parse_statement
+    
+stmts.append(self.parse_statement())
+                 
+~~~~~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 349, in parse_statement
+    return self.parse_match()
+           ~~~~~~~~~~~~~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 469, in parse_match
+    self.consume('RPAREN')
+    ~~~~~~~~~~~~^^^^^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\par
+ser.py", line 202, in consume
+    raise Exception(f"Expected token 
+type {type}, found 
+{self.tokens[self.pos].type if 
+self.pos < len(self.tokens) else 
+'EOF'}")
+Exception: Expected token type 
+RPAREN, found COMMA

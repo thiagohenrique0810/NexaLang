@@ -102,6 +102,9 @@ class Lexer:
             elif char == '/':
                 tokens.append(Token('SLASH', '/'))
                 self.pos += 1
+            elif char == '%':
+                tokens.append(Token('PERCENT', '%'))
+                self.pos += 1
             elif char == '&':
                 tokens.append(Token('AMPERSAND', '&'))
                 self.pos += 1

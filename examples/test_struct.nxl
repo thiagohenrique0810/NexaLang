@@ -1,0 +1,2 @@
+struct Point { x: i32 }
+fn test() -> Point { let p: Point = Point(5); return p; }

@@ -1,0 +1,17 @@
+struct Point {
+    x: i32,
+    y: i32
+}
+
+impl Point {
+    fn distance(&self) -> i32 {
+        return self.x;
+    }
+}
+
+fn main() -> i32 {
+    let p: Point = Point(3, 4);
+    let d: i32 = p.distance();
+    print(d);
+    return 0;
+}

@@ -96,3 +96,101 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [ ] **Tooling**
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
     - [x] Syntax highlighter extension (VSCode) (TextMate grammar under `vscode-nexalang/`).
+
+## Phase 6: Advanced Language Features 🎯
+
+### 6.1 Complete OOP Support (CURRENT PRIORITY)
+- [x] **Struct Methods - Foundation**
+  - [x] Parse `impl Type { }` blocks
+  - [x] Basic method declarations in codegen
+- [ ] **Instance Methods**
+  - [ ] Parser: Handle `self`, `&self`, `&mut self` parameters
+  - [ ] Semantic: Type-check self receivers
+  - [ ] Codegen: Pass struct as first argument (by value, reference, or mutable reference)
+  - [ ] Method call syntax: `obj.method()` instead of `Type::method(obj)`
+- [ ] **Static Methods**
+  - [x] Call syntax: `Type::method()`
+  - [ ] Ensure no `self` parameter for static methods
+- [ ] **Method Resolution**
+  - [ ] Resolve method calls in semantic analysis
+  - [ ] Handle method overloading (same name, different receiver types)
+  - [ ] Support method chaining: `obj.method1().method2()`
+
+### 6.2 Enhanced Standard Library
+- [ ] **Vec<T> Complete Implementation**
+  - [ ] `Vec::new()` - constructor
+  - [ ] `push(&mut self, item: T)` - add element
+  - [ ] `pop(&mut self) -> Option<T>` - remove last
+  - [ ] `len(&self) -> i32` - get length
+  - [ ] `get(&self, idx: i32) -> Option<&T>` - safe access
+  - [ ] `clear(&mut self)` - remove all
+  - [ ] Iterator support (for future for-loops)
+- [ ] **String Manipulation**
+  - [ ] `String::from(s: &str)` - convert from string literal
+  - [ ] `len(&self) -> i32`
+  - [ ] `concat(&self, other: &str) -> String`
+  - [ ] `substring(&self, start: i32, len: i32) -> String`
+  - [ ] `contains(&self, needle: &str) -> bool`
+  - [ ] `split(&self, delimiter: char) -> Vec<String>`
+
+### 6.3 Module System & Code Organization
+- [ ] **Basic Modules**
+  - [ ] `mod module_name;` syntax
+  - [ ] File-based modules (one file = one module)
+  - [ ] Multi-file compilation in `nx.py`
+- [ ] **Visibility & Privacy**
+  - [ ] `pub` keyword for public items
+  - [ ] Default private visibility
+  - [ ] Privacy checking in semantic analysis
+- [ ] **Import System**
+  - [ ] `use module::item;` syntax
+  - [ ] `use module::*;` glob imports
+  - [ ] Path resolution across modules
+- [ ] **Module Hierarchy**
+  - [ ] Nested modules (`mod parent { mod child { } }`)
+  - [ ] Directory-based modules (`mod.nxl` or `mod/mod.nxl`)
+
+### 6.4 Control Flow Enhancements
+- [ ] **For Loops**
+  - [ ] Range syntax: `0..10`, `0..=10` (inclusive)
+  - [ ] `for item in collection` syntax
+  - [ ] Iterator trait (simple version)
+  - [ ] Desugar to while loops in codegen
+- [ ] **Loop Control**
+  - [ ] `break` statement
+  - [ ] `continue` statement
+  - [ ] Labeled loops: `'outer: loop { }`
+
+### 6.5 Developer Experience
+- [ ] **Better Error Messages**
+  - [ ] Show file, line, and column numbers
+  - [ ] Pretty-print error context with caret (^) pointing to error
+  - [ ] Suggestion system ("did you mean X?")
+  - [ ] Error codes and documentation links
+- [ ] **Warnings System**
+  - [ ] Unused variable warnings
+  - [ ] Dead code detection
+  - [ ] Type coercion warnings
+
+## Phase 7: Advanced Type System 🔧
+- [ ] **Traits (Interfaces)**
+  - [ ] `trait Name { }` syntax
+  - [ ] Trait methods (required and provided)
+  - [ ] `impl Trait for Type` syntax
+  - [ ] Trait bounds in generics: `fn foo<T: Display>(x: T)`
+- [ ] **Advanced Generics**
+  - [ ] Multiple type parameters
+  - [ ] Const generics: `Array<T, const N: usize>`
+  - [ ] Associated types in traits
+- [ ] **Type Aliases**
+  - [ ] `type Name = ExistingType;`
+
+## Phase 8: Future Directions 🚀
+- [ ] Closures and lambdas
+- [ ] Async/await (future consideration)
+- [ ] Procedural macros
+- [ ] Foreign Function Interface (FFI) for C interop
+- [ ] Package manager (`nxpkg`)
+- [ ] Build system improvements
+- [ ] Standard library expansion (HashMap, File I/O, etc.)
+

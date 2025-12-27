@@ -1,0 +1,16 @@
+struct Counter {
+    value: i32
+}
+
+impl Counter {
+    fn get(&self) -> i32 {
+        return 5;
+    }
+}
+
+fn main() -> i32 {
+    let c: Counter = Counter(10);
+    let val: i32 = c.get();
+    print(val);
+    return 0;
+}

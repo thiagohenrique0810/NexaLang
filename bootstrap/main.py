@@ -16,6 +16,7 @@ def main():
     ap.add_argument("--spirv-vulkan-descriptors", choices=["on", "off"], default="on", help="(vulkan) Patch DescriptorSet/Binding decorations for __nexa_* interface vars (requires spirv-as).")
     ap.add_argument("--spirv-vulkan-descriptor-set", type=int, default=0, help="(vulkan) DescriptorSet number to use for kernel args")
     ap.add_argument("--spirv-vulkan-binding-base", type=int, default=0, help="(vulkan) First binding number to assign to kernel args")
+    ap.add_argument("--run-jit", action="store_true", help="Run the generated code immediately using JIT (no external compiler required)")
     ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
     args = ap.parse_args()
 
@@ -26,12 +27,10 @@ def main():
     # 1. Lexing
     lexer = Lexer(source)
     tokens = lexer.tokenize()
-    # print("Tokens:", tokens)
 
     # 2. Parsing
     parser = Parser(tokens)
     ast = parser.parse()
-    # print("AST:", ast)
 
     # 3. Semantic Analysis
     from semantic import SemanticAnalyzer
@@ -43,9 +42,8 @@ def main():
         return
 
     # 4. Code Generation
-    # For SPIR-V emission we emit kernels-only to avoid illegal calls into kernels.
-    emit_kernels_only = args.target == "spirv" and args.emit == "spv"
     spirv_env = args.spirv_env if args.target == "spirv" else "opencl"
+    emit_kernels_only = args.target == "spirv" and args.emit == "spv"
     codegen = CodeGen(
         target=args.target,
         emit_kernels_only=emit_kernels_only,
@@ -54,13 +52,19 @@ def main():
     )
     llvm_ir = codegen.generate(ast)
 
+    if args.run_jit and args.target == "native":
+        from jit import run_jit
+        print("[JIT] Starting JIT...")
+        ret = run_jit(str(llvm_ir))
+        print(f"[JIT] Finished with code {ret}")
+        return
+
     if args.emit == "ll":
         out_path = args.out or "output.ll"
-        print(llvm_ir)
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(llvm_ir)
         print(f"\n[SUCCESS] LLVM IR compiled to '{out_path}'")
-        if args.target == "native":
+        if args.target == "native" and not args.run_jit:
             print("To run (requires clang): clang output.ll -o output.exe && ./output.exe")
         return
 
