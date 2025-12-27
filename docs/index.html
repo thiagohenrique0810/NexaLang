@@ -619,6 +619,25 @@ fn main() {
 
     <script src="highlight.js"></script>
     <script src="main.js"></script>
+    <script>
+        // Força execução após tudo estar carregado
+        window.addEventListener('load', function() {
+            setTimeout(function() {
+                if (typeof window.highlightNexaLang === 'function') {
+                    window.highlightNexaLang();
+                }
+            }, 100);
+        });
+        
+        // Também executa quando o DOM estiver pronto
+        if (document.readyState === 'complete') {
+            setTimeout(function() {
+                if (typeof window.highlightNexaLang === 'function') {
+                    window.highlightNexaLang();
+                }
+            }, 200);
+        }
+    </script>
 </body>
 </html>
 

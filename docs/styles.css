@@ -200,38 +200,46 @@ pre code {
 }
 
 /* Syntax Highlighting */
-pre code .keyword { 
-    color: #c792ea; 
+pre code .keyword,
+pre code span.keyword { 
+    color: #c792ea !important; 
     font-weight: 500; 
 }
 
-pre code .string { 
-    color: #c3e88d; 
+pre code .string,
+pre code span.string { 
+    color: #c3e88d !important; 
 }
 
-pre code .number { 
-    color: #f78c6c; 
+pre code .number,
+pre code span.number { 
+    color: #f78c6c !important; 
 }
 
-pre code .comment { 
-    color: #546e7a; 
+pre code .comment,
+pre code span.comment { 
+    color: #546e7a !important; 
     font-style: italic; 
 }
 
-pre code .function { 
-    color: #82aaff; 
+pre code .function,
+pre code span.function { 
+    color: #82aaff !important; 
 }
 
-pre code .type { 
-    color: #ffcb6b; 
+pre code .type,
+pre code span.type { 
+    color: #ffcb6b !important; 
 }
 
-pre code .operator { 
-    color: #89ddff; 
+pre code .operator,
+pre code span.operator { 
+    color: #89ddff !important; 
 }
 
-pre code .punctuation { 
-    color: #c792ea; 
+pre code .punctuation,
+pre code span.punctuation { 
+    color: #c792ea !important; 
 }
 
 /* Cards */
