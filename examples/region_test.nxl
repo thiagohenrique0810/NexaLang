@@ -1,0 +1,11 @@
+fn main() {
+    print("Start Region Test");
+    
+    region r {
+        print("Inside Region");
+        let x: i32 = 10;
+        print(x);
+    }
+    
+    print("End Region Test");
+}

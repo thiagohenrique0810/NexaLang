@@ -1,0 +1,15 @@
+struct Foo {
+    x: i32
+}
+
+fn take(foo: Foo) {
+    print(foo.x)
+}
+
+fn main() {
+    let f: Foo = Foo(123)
+    take(f)        # move
+    print(f.x)     # should fail: use after move
+}
+
+

@@ -48,4 +48,30 @@ nx run
 
 ---
 
+## 🧩 SPIR-V Backend (Bootstrap)
+
+The bootstrap compiler can **emit LLVM IR prepared for SPIR-V** and can optionally **emit `.spv`** if you have external tools installed.
+
+### Generate SPIR-V-flavored LLVM IR
+
+```bash
+python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit ll --out output.spirv.ll
+```
+
+### Emit `.spv` (requires external tools)
+
+This requires `llvm-as` and `llvm-spirv` available in your PATH.
+
+```bash
+python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit spv --out output.spv
+```
+
+### Check toolchain
+
+```bash
+python tools/check_spirv_toolchain.py
+```
+
+---
+
 *Designed by **Thiago Henrique**.*

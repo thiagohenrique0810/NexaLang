@@ -28,21 +28,21 @@ fn string_new(s: *u8) -> String {
     return String(ptr, len, cap);
 }
 
-fn string_concat(s1: String, s2: String) -> String {
-    let len: i32 = s1.len + s2.len;
+fn string_concat(s1: *String, s2: *String) -> String {
+    let len: i32 = (*s1).len + (*s2).len;
     let cap: i32 = len + 1;
     
     let ptr: *u8 = malloc(cap);
     
     # Copy s1
-    if (s1.len > 0) {
-        memcpy(ptr, s1.ptr, s1.len);
+    if ((*s1).len > 0) {
+        memcpy(ptr, (*s1).ptr, (*s1).len);
     }
     
     # Copy s2
-    if (s2.len > 0) {
-        let dest: *u8 = ptr_offset::<u8>(ptr, s1.len);
-        memcpy(dest, s2.ptr, s2.len);
+    if ((*s2).len > 0) {
+        let dest: *u8 = ptr_offset::<u8>(ptr, (*s1).len);
+        memcpy(dest, (*s2).ptr, (*s2).len);
     }
     
     # Null terminate
@@ -52,19 +52,19 @@ fn string_concat(s1: String, s2: String) -> String {
     return String(ptr, len, cap);
 }
 
-fn print_string(s: String) {
-    print(s.ptr);
+fn print_string(s: *String) {
+    print((*s).ptr);
 }
 
 fn main() {
     let h: String = string_new("Hello");
     let w: String = string_new(" World");
     
-    let hw: String = string_concat(h, w);
+    let hw: String = string_concat(&h, &w);
     
-    print_string(h);
-    print_string(w);
-    print_string(hw);
+    print_string(&h);
+    print_string(&w);
+    print_string(&hw);
     
     print(hw.len);
     

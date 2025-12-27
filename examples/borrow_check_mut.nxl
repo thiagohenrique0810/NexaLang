@@ -1,0 +1,13 @@
+
+fn main() {
+    let x: i32 = 10;
+    
+    # Immutable borrow
+    let r1: *i32 = &x;
+    
+    # Attempt Mutable borrow while r1 is active
+    # Should fail: "Cannot borrow 'x' as mutable because it is already borrowed as immutable"
+    let r2: *i32 = &mut x;
+    
+    print(*r1);
+}

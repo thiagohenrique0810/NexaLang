@@ -145,9 +145,18 @@ class BooleanLiteral(ASTNode):
     def __init__(self, value):
         self.value = value
 
+class FloatLiteral(ASTNode):
+    def __init__(self, value):
+        self.value = value
+
 class VariableExpr(ASTNode):
     def __init__(self, name):
         self.name = name
+
+class RegionStmt(ASTNode):
+    def __init__(self, name, body):
+        self.name = name
+        self.body = body
 
 class Parser:
     def __init__(self, tokens):
@@ -289,6 +298,8 @@ class Parser:
             return self.parse_while()
         elif token.type == 'MATCH':
             return self.parse_match()
+        elif token.type == 'REGION':
+            return self.parse_region()
         else:
             # General Expression or Assignment
             # Try parsing as expression
@@ -446,6 +457,18 @@ class Parser:
         
         return WhileStmt(cond, body)
 
+    def parse_region(self):
+        self.consume('REGION')
+        name = self.consume('IDENTIFIER').value
+        self.consume('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
+        self.consume('RBRACE')
+        return RegionStmt(name, body)
+
     def parse_expression_stmt(self):
         expr = self.parse_expression()
         # Expect semicolon? For now optional/not implemented
@@ -462,8 +485,13 @@ class Parser:
             return UnaryExpr('*', operand)
         elif token.type == 'AMPERSAND':
             self.consume('AMPERSAND')
-            operand = self.parse_unary()
-            return UnaryExpr('&', operand)
+            if self.peek().type == 'MUT':
+                self.consume('MUT')
+                operand = self.parse_unary()
+                return UnaryExpr('&mut', operand)
+            else:
+                operand = self.parse_unary()
+                return UnaryExpr('&', operand)
         else:
             return self.parse_primary()
 
@@ -496,6 +524,9 @@ class Parser:
         if token.type == 'NUMBER':
             self.consume('NUMBER')
             expr = IntegerLiteral(int(token.value))
+        elif token.type == 'FLOAT':
+            self.consume('FLOAT')
+            expr = FloatLiteral(float(token.value))
         elif token.type == 'STRING':
             self.consume('STRING')
             expr = StringLiteral(token.value)

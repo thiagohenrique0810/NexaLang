@@ -116,13 +116,26 @@ class Lexer:
                 tokens.append(Token('STRING', value))
                 self.pos += 1
             
-            # Numbers (Integers for now)
+            # Numbers: integer or float (e.g. 123, 3.14)
             elif char.isdigit():
                 start = self.pos
                 while self.pos < self.length and self.source[self.pos].isdigit():
                     self.pos += 1
+
+                is_float = False
+                # Float: digits '.' digits
+                if (
+                    self.pos + 1 < self.length
+                    and self.source[self.pos] == '.'
+                    and self.source[self.pos + 1].isdigit()
+                ):
+                    is_float = True
+                    self.pos += 1  # consume '.'
+                    while self.pos < self.length and self.source[self.pos].isdigit():
+                        self.pos += 1
+
                 value = self.source[start:self.pos]
-                tokens.append(Token('NUMBER', value))
+                tokens.append(Token('FLOAT' if is_float else 'NUMBER', value))
 
             # Identifiers and Keywords
             elif char.isalpha() or char == '_':
@@ -138,6 +151,8 @@ class Lexer:
                      tokens.append(Token('STRUCT', value))
                 elif value == 'enum':
                      tokens.append(Token('ENUM', value))
+                elif value == 'region':
+                     tokens.append(Token('REGION', value))
                 elif value == 'let':
                     tokens.append(Token('LET', value))
                 elif value == 'return':
@@ -154,6 +169,8 @@ class Lexer:
                     tokens.append(Token('TRUE', value))
                 elif value == 'false':
                     tokens.append(Token('FALSE', value))
+                elif value == 'mut':
+                    tokens.append(Token('MUT', value))
                 else:
                     tokens.append(Token('IDENTIFIER', value))
             else:

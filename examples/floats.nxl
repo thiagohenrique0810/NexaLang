@@ -1,0 +1,14 @@
+fn main() {
+    let a: f32 = 1.5
+    let b: f32 = 2.25
+    let c: f32 = a + b
+    print(c)
+    
+    if (c > 3.0) {
+        print("c > 3.0")
+    } else {
+        print("c <= 3.0")
+    }
+}
+
+

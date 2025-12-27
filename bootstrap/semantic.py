@@ -1,5 +1,5 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr
+from parser import Parser, FunctionDef, StructDef, EnumDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral
 import sys
 import copy
 class SemanticAnalyzer:
@@ -9,10 +9,46 @@ class SemanticAnalyzer:
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
 
+    def is_copy_type(self, type_name: str) -> bool:
+        """
+        Bootstrap 'Copy' rule:
+        - Primitive scalars are copy: i32, i64, u8, bool, f32
+        - Pointers are copy: T*
+        - 'string' (i8*) is treated as copy in the bootstrap
+        Everything else is treated as move-only (structs/enums/arrays).
+        """
+        if not type_name:
+            return False
+        if type_name in ('i32', 'i64', 'u8', 'bool', 'f32', 'string'):
+            return True
+        if type_name.endswith('*'):
+            return True
+        return False
+
+    def move_var(self, name: str):
+        """
+        Marks a variable as moved (consumed) if it is move-only.
+        Also enforces: cannot move while borrowed (readers/writer active).
+        """
+        var_info = self.lookup(name)
+        if not var_info:
+            raise Exception(f"Semantic Error: Move of undefined variable '{name}'")
+
+        if var_info.get('moved'):
+            raise Exception(f"Ownership Error: Use of moved variable '{name}'")
+
+        # Disallow moving while borrowed (bootstrap rule).
+        if var_info.get('readers', 0) > 0:
+            raise Exception(f"Borrow Error: Cannot move '{name}' because it is borrowed")
+        if var_info.get('writer'):
+            raise Exception(f"Borrow Error: Cannot move '{name}' because it is borrowed mutable")
+
+        var_info['moved'] = True
+
     def analyze(self, ast):
         self.ast_root = ast
         # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id', 'panic', 'assert'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
         self.enums = {} # name -> {variant: [payload_types]}
@@ -40,6 +76,19 @@ class SemanticAnalyzer:
                      # Variants: list of (name, payload_types)
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
+        
+        # Built-in generic Buffer<T> (for GPU/heterogeneous APIs):
+        # struct Buffer<T> { ptr: *T, len: i32 }
+        # This stays as a generic template and gets monomorphized when used.
+        if 'Buffer' not in self.generic_structs and 'Buffer' not in self.structs:
+            self.generic_structs['Buffer'] = StructDef(
+                'Buffer',
+                fields=[('ptr', 'T*'), ('len', 'i32')],
+                generics=['T'],
+            )
+
+        # Inject Built-in Arena
+        self.structs['Arena'] = {'chunk': 'u8*', 'offset': 'i32', 'capacity': 'i32'}
 
         # 2. Analyze bodies
         for node in ast:
@@ -91,21 +140,24 @@ class SemanticAnalyzer:
         # 1. Analyze object
         obj_type = self.visit(node.object)
         
-        # 2. Verify it is an array
-        if not (obj_type.startswith('[') and obj_type.endswith(']')):
-             raise Exception(f"Type Error: Indexing non-array type '{obj_type}'")
-        
-        # Parse type string [T:N]
-        content = obj_type[1:-1]
-        elem_type, size_str = content.split(':')
-        
-        # 3. Analyze index
+        # 2. Analyze index
         index_type = self.visit(node.index)
         if index_type != 'i32':
              raise Exception(f"Type Error: Array index must be i32, got {index_type}")
-             
-        base_elem_type = obj_type[1:].split(':')[0] # Use obj_type instead of undefined array_type
-        return base_elem_type
+
+        # 3. Arrays: [T:N]
+        if obj_type.startswith('[') and obj_type.endswith(']'):
+            # Parse type string [T:N]
+            content = obj_type[1:-1]
+            elem_type, _size_str = content.split(':', 1)
+            return elem_type
+
+        # 4. Pointers: T*
+        # Allow pointer indexing as syntactic sugar for ptr_offset + deref.
+        if obj_type.endswith('*'):
+            return obj_type[:-1]
+
+        raise Exception(f"Type Error: Indexing non-array/non-pointer type '{obj_type}'")
 
     def visit_UnaryExpr(self, node):
         operand_type = self.visit(node.operand)
@@ -125,12 +177,8 @@ class SemanticAnalyzer:
                      raise Exception(f"Semantic Error: Borrow of undefined variable '{var_name}'")
                 
                 # Check Borrow Rules
-                try:
-                    if var_info['writer']:
-                         raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as immutable because it is already borrowed as mutable")
-                except KeyError:
-                    print(f"DEBUG: KeyError accessing 'writer' for '{var_name}'. Info: {var_info}")
-                    raise
+                if var_info['writer']:
+                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as immutable because it is already borrowed as mutable")
                 
                 # Register Reader
                 
@@ -148,56 +196,82 @@ class SemanticAnalyzer:
                 
             return f"{operand_type}*"
             
+        elif node.op == '&mut':
+             # Mutable Reference
+             if isinstance(node.operand, VariableExpr):
+                var_name = node.operand.name
+                var_info = self.lookup(var_name)
+                if not var_info:
+                     raise Exception(f"Semantic Error: Borrow of undefined variable '{var_name}'")
+                
+                # Check Borrow Rules
+                if var_info['writer']:
+                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as mutable because it is already borrowed as mutable")
+                if var_info['readers'] > 0:
+                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as mutable because it is already borrowed as immutable")
+
+                # Register Writer
+                var_info['writer'] = True
+                
+                if 'active_borrows' not in self.scopes[-1]:
+                     self.scopes[-1]['active_borrows'] = []
+                self.scopes[-1]['active_borrows'].append((var_name, 'writer'))
+                
+             return f"{operand_type}*"
+            
         return operand_type
 
     def visit_MatchExpr(self, node):
-        # 1. Analyze value
-        val_type = self.visit(node.value)
-        if val_type not in self.enums:
-             raise Exception(f"Semantic Error: Match on non-enum type '{val_type}'")
-             
-        # Annotate for CodeGen
-        node.enum_name = val_type
-        
-        enum_variants = self.enums[val_type]
-        
-        # 2. Check coverage (basic)
+        """
+        Type-check `match` expressions and bind variant payload variables (single payload for now).
+
+        Notes:
+        - Supports generic enums by instantiating `Option<i32>`-style types on demand.
+        - Enforces basic exhaustiveness (all variants must be covered).
+        - Uses enter_scope/exit_scope to properly release borrows via `active_borrows`.
+        """
+        expr_type = self.visit(node.value)
+
+        # Instantiate generic enum if needed (e.g., Option<i32>)
+        if expr_type and '<' in expr_type:
+            self.instantiate_generic_type(expr_type)
+
+        if expr_type not in self.enums:
+            raise Exception(f"Type Error: Match expression must be an Enum, got '{expr_type}'")
+
+        node.enum_name = expr_type
+        variants = self.enums[expr_type]
+
         covered = set()
-        
         for case in node.cases:
-            if case.variant_name not in enum_variants:
-                 raise Exception(f"Semantic Error: Enum '{val_type}' has no variant '{case.variant_name}'")
-            
+            if case.variant_name not in variants:
+                raise Exception(f"Semantic Error: Enum '{expr_type}' has no variant '{case.variant_name}'")
+
             covered.add(case.variant_name)
-            
-            # Check payload count
-            expected_payloads = enum_variants[case.variant_name]
-            # Case has 0 or 1 variable binding for now (we parsed var_name as single string)
-            # If enum has payload, we must bind it? Or can ignore?
-            # Creating scope for case body
-            self.scopes.append({})
-            
+            payloads = variants[case.variant_name]
+
+            # Bind payload variable if present (single payload supported)
+            self.enter_scope()
             if case.var_name:
-                if len(expected_payloads) == 0:
-                     raise Exception(f"Semantic Error: Variant '{case.variant_name}' has no payload, but matched with variable '{case.var_name}'")
-                elif len(expected_payloads) > 1:
-                     # Nested tuple unpacking not yet supported
-                     pass 
-                
-                # Register bound variable
-                # Assuming single payload for now
-                payload_type = expected_payloads[0]
-                self.declare(case.var_name, payload_type)
-            
-            # Visit body
+                if len(payloads) == 0:
+                    raise Exception(
+                        f"Semantic Error: Variant '{case.variant_name}' has no payload, but matched with variable '{case.var_name}'"
+                    )
+                if len(payloads) > 1:
+                    # TODO: support multiple payload bindings
+                    pass
+                self.declare_variable(case.var_name, payloads[0])
+            else:
+                if len(payloads) > 0:
+                    # Payload can be ignored for now; keep permissive in bootstrap.
+                    pass
+
             self.visit(case.body)
-            
-            self.scopes.pop()
-            
-        # Check exhaustive (simple check)
-        if len(covered) != len(enum_variants):
-             missing = set(enum_variants.keys()) - covered
-             raise Exception(f"Semantic Error: Match not exhaustive. Missing: {missing}")
+            self.exit_scope()
+
+        if len(covered) != len(variants):
+            missing = set(variants.keys()) - covered
+            raise Exception(f"Semantic Error: Match not exhaustive. Missing: {missing}")
 
     def enter_scope(self):
         self.scopes.append({})
@@ -217,7 +291,7 @@ class SemanticAnalyzer:
                         
         self.scopes.pop()
 
-    def declare(self, name, type_name):
+    def declare_variable(self, name, type_name):
         if name in self.scopes[-1]:
              raise Exception(f"Semantic Error: Variable '{name}' already declared in this scope")
         # Initialize borrow state: readers=0 (set needed?), writer=False
@@ -238,7 +312,24 @@ class SemanticAnalyzer:
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
 
     def instantiate_generic_type(self, name_with_args):
-        if '<' not in name_with_args: return
+        if not name_with_args:
+            return
+
+        # Handle pointer types like "Vec<i32>*": instantiate the inner type ("Vec<i32>")
+        # instead of accidentally trying to monomorphize a synthetic struct named "Vec<i32>*".
+        if name_with_args.endswith('*'):
+            self.instantiate_generic_type(name_with_args[:-1])
+            return
+
+        # Handle array types like "[T:3]" or "[Vec<i32>:3]" by instantiating the element type.
+        if name_with_args.startswith('[') and name_with_args.endswith(']'):
+            content = name_with_args[1:-1]
+            elem_type = content.split(':', 1)[0].strip()
+            self.instantiate_generic_type(elem_type)
+            return
+
+        if '<' not in name_with_args:
+            return
 
         base_name = name_with_args.split('<', 1)[0]
         
@@ -365,16 +456,7 @@ class SemanticAnalyzer:
         print(f"DEBUG: Key '{name_with_args}' added to function_defs with type '{new_return}'")
 
 
-    def declare(self, name, type_name):
-        if name in self.scopes[-1]:
-            raise Exception(f"Semantic Error: Variable '{name}' already declared in this scope.")
-        self.scopes[-1][name] = {'type': type_name, 'moved': False}
-
-    def lookup(self, name):
-        for scope in reversed(self.scopes):
-            if name in scope:
-                return scope[name]
-        return None
+    # NOTE: `declare()` removed: use `declare_variable()` everywhere to keep borrow state consistent.
 
     def visit_FunctionDef(self, node):
         if node.generics:
@@ -391,7 +473,7 @@ class SemanticAnalyzer:
         for pname, ptype in node.params:
              if '<' in ptype:
                   self.instantiate_generic_type(ptype)
-             self.declare(pname, ptype)
+             self.declare_variable(pname, ptype)
              
         for stmt in node.body:
             self.visit(stmt)
@@ -414,9 +496,13 @@ class SemanticAnalyzer:
 
         if init_type != node.type_name:
              raise Exception(f"DEBUG: init_type='{init_type}', node.type='{node.type_name}'. Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
+
+        # Ownership: `let y = x` moves `x` if it's move-only.
+        if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_type):
+            self.move_var(node.initializer.name)
         
         # 3. Declare variable
-        self.declare(node.name, node.type_name)
+        self.declare_variable(node.name, node.type_name)
 
     def visit_Assignment(self, node):
         value_type = self.visit(node.value)
@@ -444,7 +530,7 @@ class SemanticAnalyzer:
                   
              # Revive variable
              var_info['moved'] = False
-             
+
         elif isinstance(node.target, UnaryExpr):
              if node.target.op == '*':
                   # *ptr = val
@@ -468,21 +554,37 @@ class SemanticAnalyzer:
         else:
              raise Exception("Invalid assignment target")
 
+        # Ownership: assigning from a variable moves it if move-only (x = y)
+        # (also applies to `*ptr = y` and `obj.field = y`).
+        if isinstance(node.value, VariableExpr) and not self.is_copy_type(value_type):
+            self.move_var(node.value.name)
+
     def visit_BinaryExpr(self, node):
         left_type = self.visit(node.left)
         right_type = self.visit(node.right)
         
         if left_type != right_type:
              raise Exception(f"Type Error: Operands must be same type. Got '{left_type}' and '{right_type}'")
-             
-        # For now, everything is i32
-        if left_type != 'i32':
-             raise Exception(f"Type Error: Arithmetic only supported for i32. Got '{left_type}'")
-             
-        return 'i32' # Result type
+
+        # Arithmetic
+        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH'):
+            if left_type not in ('i32', 'f32'):
+                raise Exception(f"Type Error: Arithmetic only supported for i32/f32. Got '{left_type}'")
+            return left_type
+
+        # Comparisons
+        if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'):
+            if left_type not in ('i32', 'f32', 'bool'):
+                raise Exception(f"Type Error: Comparison not supported for type '{left_type}'")
+            return 'bool'
+
+        raise Exception(f"Semantic Error: Unsupported binary operator '{node.op}'")
 
     def visit_IntegerLiteral(self, node):
         return 'i32' # Default
+
+    def visit_FloatLiteral(self, node):
+        return 'f32'
 
     def visit_BooleanLiteral(self, node):
         return 'bool'
@@ -503,53 +605,92 @@ class SemanticAnalyzer:
     def visit_CallExpr(self, node):
         # Intrinsics
         if node.callee == 'print':
+            self.enter_scope()
             for arg in node.args:
                 self.visit(arg)
+            self.exit_scope()
             return 'void'
         elif node.callee == 'memcpy':
             if len(node.args) != 3: raise Exception("memcpy requires 3 args")
             # Validation logic? dest and src should be pointers.
+            self.enter_scope()
             dest_ty = self.visit(node.args[0])
             src_ty = self.visit(node.args[1])
             size_ty = self.visit(node.args[2])
+            self.exit_scope()
             if size_ty != 'i32': raise Exception("memcpy size must be i32")
             return 'void'
             
         elif node.callee == 'malloc':
              if len(node.args) != 1: raise Exception("malloc takes 1 arg")
+             self.enter_scope()
              size_type = self.visit(node.args[0])
+             self.exit_scope()
              if size_type != 'i32': raise Exception("malloc expects i32")
              return 'u8*'
              
         elif node.callee == 'free':
              if len(node.args) != 1: raise Exception("free takes 1 arg")
+             self.enter_scope()
              self.visit(node.args[0])
+             self.exit_scope()
              return 'void'
              
         elif node.callee == 'realloc':
              if len(node.args) != 2: raise Exception("realloc takes 2 args")
+             self.enter_scope()
              self.visit(node.args[0])
              self.visit(node.args[1])
+             self.exit_scope()
              return 'u8*'
              
         elif node.callee == 'panic':
             if len(node.args) != 1: raise Exception("panic expects 1 arg")
+            self.enter_scope()
             self.visit(node.args[0])
+            self.exit_scope()
             return 'void'
             
         elif node.callee == 'assert':
             if len(node.args) != 2: raise Exception("assert expects 2 args")
+            self.enter_scope()
             self.visit(node.args[0])
             self.visit(node.args[1])
+            self.exit_scope()
             return 'void'
             
         elif node.callee == 'gpu::global_id':
              return 'i32'
+
+        elif node.callee == 'gpu::dispatch':
+            # gpu::dispatch(kernel_fn, threads?)
+            # This is a bootstrap/mock dispatch; the first arg is treated as a function reference.
+            if len(node.args) not in (1, 2):
+                raise Exception("gpu::dispatch expects 1 or 2 args: (kernel_fn, threads?)")
+
+            fn_arg = node.args[0]
+            if not isinstance(fn_arg, VariableExpr):
+                raise Exception("gpu::dispatch first argument must be a function name (identifier)")
+
+            # The function name is a reference, not a variable lookup.
+            fn_name = fn_arg.name
+            if fn_name not in self.functions and fn_name not in self.function_defs and fn_name not in self.generic_functions:
+                raise Exception(f"Semantic Error: gpu::dispatch unknown function '{fn_name}'")
+
+            # Optional threads argument
+            if len(node.args) == 2:
+                threads_ty = self.visit(node.args[1])
+                if threads_ty != 'i32':
+                    raise Exception(f"Type Error: gpu::dispatch threads must be i32, got '{threads_ty}'")
+
+            return 'void'
              
         elif node.callee.startswith('cast<'):
              target_type = node.callee[5:-1]
              if len(node.args) != 1: raise Exception("cast takes 1 arg")
+             self.enter_scope()
              self.visit(node.args[0])
+             self.exit_scope()
              return target_type
              
         elif node.callee.startswith('sizeof<'):
@@ -558,45 +699,45 @@ class SemanticAnalyzer:
         elif node.callee.startswith('ptr_offset<'):
              target_type = node.callee[11:-1]
              if len(node.args) != 2: raise Exception("ptr_offset expects 2 args")
+             self.enter_scope()
              self.visit(node.args[0])
              self.visit(node.args[1])
+             self.exit_scope()
              return f"{target_type}*"
 
         # Generic Instantiation if needed
         if '<' in node.callee:
              self.instantiate_generic_function(node.callee)
         
-        # Standard Function Call
-        if node.callee in self.functions:
-             for arg in node.args:
-                 self.visit(arg)
-                 
-             if node.callee in self.function_defs:
-                 return self.function_defs[node.callee].return_type
-             else:
-                 return 'STD_MISSING'
-                 
-        elif node.callee in self.structs:
-             for arg in node.args:
-                 self.visit(arg)
-                 
-             if node.callee in self.function_defs:
-                 return self.function_defs[node.callee].return_type
-             else:
-                 return 'STD_MISSING'
-                 
-        elif node.callee in self.structs:
-            # Struct Instantiation
-            fields = self.structs[node.callee]
-            if len(node.args) != len(fields):
-                raise Exception(f"Semantic Error: Struct '{node.callee}' expects {len(fields)} arguments, got {len(node.args)}")
-            
+        # 1) Regular function call
+        # Note: `self.functions` may include intrinsics; those returned above.
+        if node.callee in self.function_defs:
+            fn = self.function_defs[node.callee]
+            # Visit and apply moves based on parameter types (by-value move-only).
+            self.enter_scope()
+            for i, arg in enumerate(node.args):
+                arg_ty = self.visit(arg)
+                if i < len(fn.params):
+                    _pname, ptype = fn.params[i]
+                    if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
+                        self.move_var(arg.name)
+            self.exit_scope()
+            return self.function_defs[node.callee].return_type
+
+        # 2) Struct constructor call (TypeName(...))
+        if node.callee in self.structs:
+            # Keep permissive in bootstrap: only validate arg expressions,
+            # since field ordering/overloads are still evolving.
+            self.enter_scope()
             for arg in node.args:
-                self.visit(arg)
+                arg_ty = self.visit(arg)
+                if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
+                    self.move_var(arg.name)
+            self.exit_scope()
             return node.callee
             
         # Enum Variant: Enum::Variant
-        elif '::' in node.callee:
+        if '::' in node.callee:
             parts = node.callee.rsplit('::', 1)
             enum_name = parts[0]
             variant_name = parts[1]
@@ -614,10 +755,16 @@ class SemanticAnalyzer:
                  if len(node.args) != len(payloads):
                       raise Exception(f"Semantic Error: Variant '{node.callee}' expects {len(payloads)} arguments, got {len(node.args)}")
                  
+                 self.enter_scope()
                  for i, arg in enumerate(node.args):
                       arg_type = self.visit(arg)
                       if arg_type != payloads[i]:
                            raise Exception(f"Type Error: Variant '{variant_name}' arg {i} expected '{payloads[i]}', got '{arg_type}'")
+
+                      # Move payload variables if the payload type is move-only
+                      if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
+                          self.move_var(arg.name)
+                 self.exit_scope()
                  
                  return enum_name
             else:
@@ -648,51 +795,21 @@ class SemanticAnalyzer:
             self.visit(stmt)
         self.exit_scope()
 
-    def visit_MatchExpr(self, node):
-        expr_type = self.visit(node.value)
+    def visit_RegionStmt(self, node):
+        print(f"DEBUG: Analyzing RegionStmt '{node.name}'")
+        self.enter_scope()
+        # Declare the region variable (Arena)
+        self.declare_variable(node.name, 'Arena')
         
-        if '<' in expr_type:
-             self.instantiate_generic_type(expr_type)
-             
-        if expr_type not in self.enums:
-            raise Exception(f"Type Error: Match expression must be an Enum, got '{expr_type}'")
-            
-        node.enum_name = expr_type
-        variants = self.enums[expr_type]
-        
-        for case in node.cases:
-            if case.variant_name not in variants:
-                raise Exception(f"Semantic Error: Enum '{expr_type}' has no variant '{case.variant_name}'")
-                
-            payloads = variants[case.variant_name]
-            
-            if payloads:
-                 # Expecting variable binding
-                 if not case.var_name:
-                      pass
-                      
-                 if case.var_name:
-                      pass
-                      
-            else:
-                 if case.var_name:
-                      raise Exception(f"Type Error: Variant '{case.variant_name}' has no payload, but variable '{case.var_name}' bound")
-
-            # Check Duplicate Scope?
-            # We need to visit body with Bound Variable
-            self.enter_scope()
-            if case.var_name:
-                 # Assume single payload for now
-                 if len(payloads) != 1:
-                      # TODO: logic for multiple payloads or struct payloads
-                      pass
-                 self.declare(case.var_name, payloads[0])
-            
-            self.visit(case.body)
-            self.exit_scope()
+        for stmt in node.body:
+            self.visit(stmt)
+        self.exit_scope()
 
     def visit_ReturnStmt(self, node):
-        if node.value: self.visit(node.value)
+        if node.value:
+            ret_ty = self.visit(node.value)
+            if isinstance(node.value, VariableExpr) and not self.is_copy_type(ret_ty):
+                self.move_var(node.value.name)
         # Should check against function return type
 
     def substitute_generics(self, node, mapping):

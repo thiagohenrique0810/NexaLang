@@ -1,0 +1,11 @@
+fn take_i32(x: i32) {
+    print(x)
+}
+
+fn main() {
+    let a: i32 = 7
+    take_i32(a)  # copy
+    print(a)     # ok
+}
+
+

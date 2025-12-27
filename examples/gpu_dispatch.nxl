@@ -1,0 +1,12 @@
+kernel fn compute() {
+    let id: i32 = gpu::global_id()
+    print("ID = ")
+    print(id)
+}
+
+fn main() {
+    print("Dispatching kernel (mock CPU loop)...")
+    gpu::dispatch(compute, 4)
+}
+
+
