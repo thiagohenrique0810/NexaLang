@@ -57,11 +57,23 @@ class Lexer:
                 tokens.append(Token('RBRACE', '}'))
                 self.pos += 1
             elif char == '.':
-                tokens.append(Token('DOT', '.'))
-                self.pos += 1
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '.':
+                    if self.pos + 2 < self.length and self.source[self.pos+2] == '=':
+                        tokens.append(Token('DOT_DOT_EQ', '..='))
+                        self.pos += 3
+                    else:
+                        tokens.append(Token('DOT_DOT', '..'))
+                        self.pos += 2
+                else:
+                    tokens.append(Token('DOT', '.'))
+                    self.pos += 1
             elif char == ':':
-                tokens.append(Token('COLON', ':'))
-                self.pos += 1
+                if self.pos + 1 < self.length and self.source[self.pos+1] == ':':
+                    tokens.append(Token('DOUBLE_COLON', '::'))
+                    self.pos += 2
+                else:
+                    tokens.append(Token('COLON', ':'))
+                    self.pos += 1
             elif char == ',':
                 tokens.append(Token('COMMA', ','))
                 self.pos += 1
@@ -81,11 +93,19 @@ class Lexer:
                    tokens.append(Token('EQ', '='))
                    self.pos += 1
             elif char == '<':
-                tokens.append(Token('LT', '<'))
-                self.pos += 1
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
+                   tokens.append(Token('LTE', '<='))
+                   self.pos += 2
+                else:
+                   tokens.append(Token('LT', '<'))
+                   self.pos += 1
             elif char == '>':
-                tokens.append(Token('GT', '>'))
-                self.pos += 1
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
+                   tokens.append(Token('GTE', '>='))
+                   self.pos += 2
+                else:
+                   tokens.append(Token('GT', '>'))
+                   self.pos += 1
             elif char == '+':
                 tokens.append(Token('PLUS', '+'))
                 self.pos += 1
@@ -119,15 +139,26 @@ class Lexer:
             # String Literals
             elif char == '"':
                 self.pos += 1
-                start = self.pos
+                value = ""
                 while self.pos < self.length:
                     if self.source[self.pos] == '"':
                         break
                     if self.source[self.pos] == '\\' and self.pos + 1 < self.length:
-                        self.pos += 2 # Skip escape sequence
+                        esc = self.source[self.pos + 1]
+                        if esc == 'n':
+                            value += '\n'
+                        elif esc == 't':
+                            value += '\t'
+                        elif esc == '\\':
+                            value += '\\'
+                        elif esc == '"':
+                            value += '"'
+                        else:
+                            value += '\\' + esc
+                        self.pos += 2
                     else:
+                        value += self.source[self.pos]
                         self.pos += 1
-                value = self.source[start:self.pos]
                 tokens.append(Token('STRING', value))
                 self.pos += 1
 
@@ -242,6 +273,14 @@ class Lexer:
                     tokens.append(Token('OR', value))
                 elif value == 'and':
                     tokens.append(Token('AND', value))
+                elif value == 'mod':
+                    tokens.append(Token('MOD', value))
+                elif value == 'pub':
+                    tokens.append(Token('PUB', value))
+                elif value == 'for':
+                    tokens.append(Token('FOR', value))
+                elif value == 'in':
+                    tokens.append(Token('IN', value))
                 else:
                     tokens.append(Token('IDENTIFIER', value))
             else:

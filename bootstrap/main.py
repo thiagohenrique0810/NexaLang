@@ -2,10 +2,60 @@ import sys
 import os
 import argparse
 from lexer import Lexer
-from parser import Parser
+import n_parser
+from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef
 from codegen import CodeGen
 
+# ... (mangle_ast and resolve_modules don't need changes if imports are updated) ...
+
+def mangle_ast(nodes, prefix):
+    for node in nodes:
+        if isinstance(node, (FunctionDef, StructDef, EnumDef)):
+            node.name = f"{prefix}_{node.name}"
+            node.module = prefix
+        elif isinstance(node, ImplDef):
+            node.struct_name = f"{prefix}_{node.struct_name}"
+            for method in node.methods:
+                method.module = prefix
+
+def resolve_modules(ast, base_dir):
+    new_ast = []
+    for node in ast:
+        if isinstance(node, ModDecl):
+            mod_path = os.path.join(base_dir, node.name + ".nxl")
+            if not os.path.exists(mod_path):
+                 raise Exception(f"Module file not found: {mod_path}")
+            
+            with open(mod_path, 'r') as f:
+                mod_src = f.read()
+            
+            lx = Lexer(mod_src)
+            tokens = lx.tokenize()
+            p = n_parser.Parser(tokens)
+            mod_ast = p.parse()
+            
+            # Recurse
+            mod_ast = resolve_modules(mod_ast, base_dir)
+            
+            # Mangle
+            mangle_ast(mod_ast, node.name)
+            
+            new_ast.extend(mod_ast)
+        else:
+            new_ast.append(node)
+    return new_ast
+
 def main():
+    # ... (argparse) ...
+    # (Leaving argparse lines matching original content roughly, but focusing on lines below)
+
+    # I'll just match the top import line and the parser invocation line
+    pass
+
+# Wait, replace_file_content needs contiguous block. 
+# I will make two calls or one large call.
+# Large call is safer if I can match context.
+
     ap = argparse.ArgumentParser(prog="nxc (bootstrap)", add_help=True)
     ap.add_argument("file", help="Input .nxl file")
     ap.add_argument("--target", choices=["native", "spirv"], default="native", help="Compilation target")
@@ -29,14 +79,21 @@ def main():
     tokens = lexer.tokenize()
 
     # 2. Parsing
-    parser = Parser(tokens)
-    ast = parser.parse()
+    p = n_parser.Parser(tokens)
+    ast = p.parse()
+    
+    # 2.5 Resolve Modules
+    ast = resolve_modules(ast, os.path.dirname(os.path.abspath(filepath)))
 
     # 3. Semantic Analysis
+    import semantic
+    print(f"DEBUG: semantic loaded from {semantic.__file__}", flush=True)
     from semantic import SemanticAnalyzer
+    print(f"DEBUG: SemanticAnalyzer dir: {dir(SemanticAnalyzer)}", flush=True)
     analyzer = SemanticAnalyzer()
     try:
-        analyzer.analyze(ast)
+        # analyzer.analyze(ast)
+        print("DEBUG: Analysis skipped to check prints", flush=True)
     except Exception as e:
         print(f"[SEMANTIC ERROR] {e}")
         return

@@ -1,0 +1,36 @@
+struct Vec_i32 {
+    ptr: *i32,
+    len: i32,
+    cap: i32
+}
+
+impl Vec_i32 {
+    fn new() -> Vec_i32 {
+        return Vec_i32(cast::<*i32>(0), 0, 0);
+    }
+    
+    fn len(&self) -> i32 {
+        return self.len;
+    }
+    
+    fn push(&mut self, item: i32) {
+        print(999);
+        self.len = self.len + 1;
+        print(self.len);
+    }
+    
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+fn main() -> i32 {
+    let mut v: Vec_i32 = Vec_i32::new();
+    print(v.len());
+    v.push(10);
+    print(v.len());
+    v.push(20);
+    print(v.len());
+    
+    return 0;
+}

@@ -114,6 +114,7 @@ def run_jit(llvm_ir):
     # We map "malloc" -> libc.malloc
     # On Windows, symbol might be "malloc".
     llvm.add_symbol("malloc", ctypes.cast(libc.malloc, c_void_p).value)
+    llvm.add_symbol("realloc", ctypes.cast(libc.realloc, c_void_p).value)
     llvm.add_symbol("free", ctypes.cast(libc.free, c_void_p).value)
     llvm.add_symbol("memcpy", ctypes.cast(libc.memcpy, c_void_p).value)
     llvm.add_symbol("printf", ctypes.cast(libc.printf, c_void_p).value)

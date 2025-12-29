@@ -1,0 +1,9 @@
+mod privacy_lib;
+
+fn main() {
+    print("Testing Privacy (Positive Case)...");
+    privacy_lib::public_api();
+    
+    let p = privacy_lib::PublicStruct { x: 10 };
+    print("PublicStruct created.");
+}

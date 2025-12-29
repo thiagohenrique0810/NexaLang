@@ -19,30 +19,37 @@ class IndexAccess(ASTNode):
         return f"{self.object}[{self.index}]"
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None):
+    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False):
         self.name = name
         self.params = params
         self.return_type = return_type
         self.body = body
         self.is_kernel = is_kernel
         self.generics = generics or []
+        self.is_pub = is_pub
+        self.module = ""
 
 class StructDef(ASTNode):
-    def __init__(self, name, fields, generics=None):
+    def __init__(self, name, fields, generics=None, is_pub=False):
         self.name = name
         self.fields = fields # list of (name, type) tuples
         self.generics = generics or []
+        self.is_pub = is_pub
+        self.module = ""
 
 class EnumDef(ASTNode):
-    def __init__(self, name, variants, generics=None):
+    def __init__(self, name, variants, generics=None, is_pub=False):
         self.name = name
         self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
         self.generics = generics or []
+        self.is_pub = is_pub
+        self.module = ""
 
 class ImplDef(ASTNode):
-    def __init__(self, struct_name, methods):
+    def __init__(self, struct_name, methods, generics=None):
         self.struct_name = struct_name
         self.methods = methods
+        self.generics = generics or []
 
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
@@ -107,6 +114,14 @@ class WhileStmt(ASTNode):
         self.condition = condition
         self.body = body
 
+class ForStmt(ASTNode):
+    def __init__(self, var_name, start_expr, end_expr, body, inclusive=False):
+        self.var_name = var_name
+        self.start_expr = start_expr
+        self.end_expr = end_expr
+        self.body = body
+        self.inclusive = inclusive
+
 class BinaryExpr(ASTNode):
     def __init__(self, left, op, right):
         self.left = left
@@ -123,6 +138,7 @@ class UnaryExpr(ASTNode):
 
     def parse_statement(self):
         token = self.peek()
+        # No debug print
         if token.type == 'LBRACE':
             self.consume('LBRACE')
             body = []
@@ -197,6 +213,11 @@ class RegionStmt(ASTNode):
         self.name = name
         self.body = body
 
+class ModDecl(ASTNode):
+    def __init__(self, name, is_pub=False):
+        self.name = name
+        self.is_pub = is_pub
+
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
@@ -209,38 +230,86 @@ class Parser:
 
     def consume(self, type):
         if self.pos < len(self.tokens) and self.tokens[self.pos].type == type:
+            # print(f"DEBUG CONSUME: {type}")
             self.pos += 1
             return self.tokens[self.pos - 1]
-        raise Exception(f"Expected token type {type}, found {self.tokens[self.pos].type if self.pos < len(self.tokens) else 'EOF'}")
+        
+        token = self.tokens[self.pos] if self.pos < len(self.tokens) else "EOF"
+        prev = self.tokens[self.pos-1] if self.pos > 0 else "START"
+        nxt = self.tokens[self.pos+1] if self.pos+1 < len(self.tokens) else "EOF"
+        raise Exception(f"Expected token type {type}, found {token} (Prev: {prev}, Next: {nxt})")
+
+
+
+# ...
 
     def parse(self):
         nodes = []
         while self.pos < len(self.tokens):
+            is_pub = False
+            if self.peek().type == 'PUB':
+                self.consume('PUB')
+                is_pub = True
+
             if self.peek().type == 'KERNEL':
-                nodes.append(self.parse_function(is_kernel=True))
+                nodes.append(self.parse_function(is_kernel=True, is_pub=is_pub))
             elif self.peek().type == 'FN':
-                nodes.append(self.parse_function(is_kernel=False))
+                nodes.append(self.parse_function(is_kernel=False, is_pub=is_pub))
             elif self.peek().type == 'STRUCT':
-                nodes.append(self.parse_struct())
+                nodes.append(self.parse_struct(is_pub=is_pub))
             elif self.peek().type == 'ENUM':
-                nodes.append(self.parse_enum())
+                nodes.append(self.parse_enum(is_pub=is_pub))
             elif self.peek().type == 'IMPL':
+                if is_pub: raise Exception("impl blocks cannot be declared public")
                 nodes.append(self.parse_impl())
+            elif self.peek().type == 'MOD':
+                nodes.append(self.parse_mod(is_pub=is_pub))
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
 
+    def parse_mod(self, is_pub=False):
+        self.consume('MOD')
+        name = self.consume('IDENTIFIER').value
+        self.consume('SEMICOLON')
+        return ModDecl(name, is_pub=is_pub)
+
+
+
     def parse_impl(self):
         self.consume('IMPL')
+        
+        generics = []
+        # Optional impl generics: impl<T>
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                generics.append(self.consume('IDENTIFIER').value)
+                if self.peek().type == 'COMMA': self.consume('COMMA')
+            self.consume('GT')
+
         struct_name = self.consume('IDENTIFIER').value
+        
+        # Optional struct generics: Struct<T>
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                self.consume('IDENTIFIER').value
+                if self.peek().type == 'COMMA': self.consume('COMMA')
+            self.consume('GT')
+
         self.consume('LBRACE')
         methods = []
         while self.peek().type != 'RBRACE':
-            methods.append(self.parse_function(is_kernel=False))
+            is_pub = False
+            if self.peek().type == 'PUB':
+                 self.consume('PUB')
+                 is_pub = True
+            methods.append(self.parse_function(is_kernel=False, is_pub=is_pub))
         self.consume('RBRACE')
-        return ImplDef(struct_name, methods)
+        return ImplDef(struct_name, methods, generics)
 
-    def parse_struct(self):
+    def parse_struct(self, is_pub=False):
         self.consume('STRUCT')
         name = self.consume('IDENTIFIER').value
         
@@ -256,6 +325,11 @@ class Parser:
         self.consume('LBRACE')
         fields = []
         while self.peek().type != 'RBRACE':
+            # Check for pub fields? 
+            # For now, let's assume struct fields are private by default or public? 
+            # Rust uses pub fields. NexaLang roadmap implies default private.
+            # I won't implement field privacy yet in this step to save complexity, 
+            # just struct privacy.
             field_name = self.consume('IDENTIFIER').value
             self.consume('COLON')
             field_type = self.parse_type() # Use parse_type instead of raw ID to support Generic Members
@@ -263,9 +337,9 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return StructDef(name, fields, generics)
+        return StructDef(name, fields, generics, is_pub=is_pub)
 
-    def parse_enum(self):
+    def parse_enum(self, is_pub=False):
         self.consume('ENUM')
         name = self.consume('IDENTIFIER').value
         
@@ -294,9 +368,9 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return EnumDef(name, variants, generics)
+        return EnumDef(name, variants, generics, is_pub=is_pub)
 
-    def parse_function(self, is_kernel=False):
+    def parse_function(self, is_kernel=False, is_pub=False):
         if is_kernel:
             self.consume('KERNEL')
         self.consume('FN')
@@ -356,7 +430,8 @@ class Parser:
             if self.peek().type == 'SEMICOLON':
                 self.consume('SEMICOLON')
         self.consume('RBRACE')
-        return FunctionDef(name, params, return_type, body, is_kernel, generics)
+        return FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub)
+
 
 
     def parse_statement(self):
@@ -369,6 +444,8 @@ class Parser:
             return self.parse_if()
         elif token.type == 'WHILE':
             return self.parse_while()
+        elif token.type == 'FOR':
+            return self.parse_for()
         elif token.type == 'MATCH':
             return self.parse_match()
         elif token.type == 'REGION':
@@ -400,6 +477,13 @@ class Parser:
 
     def parse_var_decl(self):
         self.consume('LET')
+        
+        # Check for optional 'mut'
+        is_mut = False
+        if self.peek().type == 'MUT':
+            self.consume('MUT')
+            is_mut = True
+        
         name = self.consume('IDENTIFIER').value
         
         type_name = None
@@ -409,11 +493,21 @@ class Parser:
             
         self.consume('EQ')
         initializer = self.parse_expression()
-        return VarDecl(name, type_name, initializer)
+        
+        # Create VarDecl with mutability flag
+        var_decl = VarDecl(name, type_name, initializer)
+        var_decl.is_mut = is_mut
+        return var_decl
 
     def parse_type(self):
         if self.peek().type == 'IDENTIFIER':
             name = self.consume('IDENTIFIER').value
+            
+            # Support Namespaced Types (mod::Struct)
+            while self.peek().type == 'DOUBLE_COLON':
+                self.consume('DOUBLE_COLON')
+                part = self.consume('IDENTIFIER').value
+                name = f"{name}_{part}"   
             
             # Check for Generic Arguments <T, U>
             if self.peek().type == 'LT':
@@ -432,6 +526,14 @@ class Parser:
                 name = f"{name}*"
             
             return name
+        elif self.peek().type == 'AMPERSAND':
+            self.consume('AMPERSAND')
+            is_mut = ""
+            if self.peek().type == 'MUT':
+                self.consume('MUT')
+                is_mut = "mut "
+            inner = self.parse_type()
+            return f"&{is_mut}{inner}"
         elif self.peek().type == 'STAR':
             self.consume('STAR')
             inner = self.parse_type()
@@ -540,6 +642,32 @@ class Parser:
             
         return IfStmt(cond, then_branch, else_branch)
 
+    def parse_for(self):
+        self.consume('FOR')
+        var_name = self.consume('IDENTIFIER').value
+        self.consume('IN')
+        
+        start_expr = self.parse_expression()
+        
+        inclusive = False
+        if self.peek().type == 'DOT_DOT_EQ':
+            self.consume('DOT_DOT_EQ')
+            inclusive = True
+        else:
+            self.consume('DOT_DOT')
+            
+        end_expr = self.parse_expression()
+        
+        self.consume('LBRACE')
+        body = []
+        while self.peek().type != 'RBRACE':
+            body.append(self.parse_statement())
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
+        self.consume('RBRACE')
+        
+        return ForStmt(var_name, start_expr, end_expr, body, inclusive)
+
     def parse_while(self):
         self.consume('WHILE')
         self.consume('LPAREN')
@@ -621,11 +749,12 @@ class Parser:
     def get_precedence(self, op_type):
         if op_type in ('PLUS', 'MINUS'): return 1
         if op_type in ('STAR', 'SLASH', 'PERCENT'): return 2
-        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 0
+        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE', 'AND', 'OR'): return 0
         return -1
 
     def parse_primary(self):
         token = self.peek()
+        # No debug print
         expr = None
         
         if token.type == 'SELF':
@@ -650,51 +779,109 @@ class Parser:
             self.consume('FALSE')
             expr = BooleanLiteral(False)
         elif token.type == 'IDENTIFIER':
-            # Check for namespace or TurboFish: ID :: ID or ID :: <Args>
-            if self.peek(1).type == 'DOUBLE_COLON':
-                 lhs = self.consume('IDENTIFIER').value
-                 self.consume('DOUBLE_COLON')
-                 
-                 full_name = lhs
-                 if self.peek().type == 'LT':
-                     # Turbo fish: ID :: <T, U>
-                     self.consume('LT')
-                     args = []
-                     while self.peek().type != 'GT':
-                         args.append(self.parse_type())
-                         if self.peek().type == 'COMMA': self.consume('COMMA')
-                     self.consume('GT')
-                     full_name = f"{lhs}<{','.join(args)}>"
-                     
-                     # Check for Variant chaining: :: Variant
-                     if self.peek().type == 'DOUBLE_COLON':
-                         self.consume('DOUBLE_COLON')
-                         rhs = self.consume('IDENTIFIER').value
-                         full_name = f"{full_name}::{rhs}"
-                         
-                     # Check for Call
-                     if self.peek().type == 'LPAREN':
-                         expr = self.parse_call_explicit(full_name)
-                     else:
-                         expr = VariableExpr(full_name)
-                 else:
-                     # Namespace: ID :: ID
-                     rhs = self.consume('IDENTIFIER').value
-                     # Check if it's a function call (Enum variant constructor)
-                     if self.peek().type == 'LPAREN':
-                         # We pass the full name "Enum::Variant" as callee
-                         full_name = f"{lhs}::{rhs}"
-                         expr = self.parse_call_explicit(full_name)
-                     else:
-                         # Enum variant without args (if supported) or variable
-                         full_name = f"{lhs}::{rhs}"
-                         expr = VariableExpr(full_name)
+            peek1 = self.peek(1).type
+            # 1. Struct Instantiation: Name { ... }
+            if peek1 == 'LBRACE':
+                name = self.consume('IDENTIFIER').value
+                self.consume('LBRACE')
+                args = []
+                while self.peek().type != 'RBRACE':
+                    self.consume('IDENTIFIER') # field name
+                    self.consume('COLON')
+                    args.append(self.parse_expression())
+                    if self.peek().type == 'COMMA': self.consume('COMMA')
+                self.consume('RBRACE')
+                expr = CallExpr(name, args)
             
-            elif self.peek(1).type == 'LPAREN':
-                 expr = self.parse_call()
+            # 2. Templated Intrinsics: cast<T>(x), sizeof<T>()
+            elif token.value in ('cast', 'sizeof') and peek1 == 'LT':
+                name = self.consume('IDENTIFIER').value
+                self.consume('LT')
+                types = []
+                while self.peek().type != 'GT':
+                    types.append(self.parse_type())
+                    if self.peek().type == 'COMMA': self.consume('COMMA')
+                self.consume('GT')
+                full_name = f"{name}<{','.join(types)}>"
+                expr = VariableExpr(full_name) # Let postfix handler handle '('
+            
+            # 3. Namespaces or TurboFish: ID :: ...
+            elif peek1 == 'DOUBLE_COLON':
+                lhs = self.consume('IDENTIFIER').value
+                self.consume('DOUBLE_COLON')
+                
+                full_name = lhs
+                if self.peek().type == 'LT':
+                    # Turbo fish: ID :: <T, U>
+                    self.consume('LT')
+                    types = []
+                    while self.peek().type != 'GT':
+                        types.append(self.parse_type())
+                        if self.peek().type == 'COMMA': self.consume('COMMA')
+                    self.consume('GT')
+                    full_name = f"{lhs}<{','.join(types)}>"
+                    
+                    # Check for Variant chaining: :: Variant
+                    if self.peek().type == 'DOUBLE_COLON':
+                        self.consume('DOUBLE_COLON')
+                        rhs = self.consume('IDENTIFIER').value
+                        full_name = f"{full_name}::{rhs}"
+                else:
+                    # Namespace: ID :: ID
+                    rhs = self.consume('IDENTIFIER').value
+                    full_name = f"{lhs}::{rhs}"
+                
+                
+                # Check for Struct Instantiation: Mod::Struct { ... }
+                if self.peek().type == 'LBRACE':
+                    self.consume('LBRACE')
+                    args = []
+                    while self.peek().type != 'RBRACE':
+                        # self.consume('IDENTIFIER') # field name (not consumed in call args logic usually? Wait.)
+                        # Logic in lines 752: self.consume('IDENTIFIER'); consume('COLON'); parse_expr()
+                        # call args usually list of exprs.
+                        # But struct instantiation logic uses field names?
+                        # My CallExpr supports named args? 
+                        # Review line 757: CallExpr(name, args). args is list of exprs.
+                        # Wait, StructDef stores fields. 
+                        # Compiler needs to know field order.
+                        # If I preserve fields?
+                        # bootstrap `visit_CallExpr` for struct (line 945 semantic.py) iterates `args` and visits them.
+                        # It assumes `args` are Expressions.
+                        # If I drop keys, I assume order matches?
+                        # Line 750 (existing Struct Instantiation)
+                        # self.consume('IDENTIFIER'); self.consume('COLON'); args.append(self.parse_expression())
+                        # It drops keys.
+                        # So I should do the same.
+                        
+                        self.consume('IDENTIFIER')
+                        self.consume('COLON')
+                        args.append(self.parse_expression())
+                        if self.peek().type == 'COMMA': self.consume('COMMA')
+                    self.consume('RBRACE')
+                    expr = CallExpr(full_name, args)
+                else:
+                    expr = VariableExpr(full_name) # Postfix handles '(' or '.'
+            
+            # 4. Standard Case: ID
             else:
-                 expr = VariableExpr(token.value)
-                 self.consume('IDENTIFIER')
+                expr = VariableExpr(token.value)
+                self.consume('IDENTIFIER')
+
+        elif token.type == 'STRUCT':
+            # Struct Instantiation: struct Name { fields }
+            self.consume('STRUCT')
+            name = self.consume('IDENTIFIER').value
+            self.consume('LBRACE')
+            args = []
+            while self.peek().type != 'RBRACE':
+                self.consume('IDENTIFIER') # field name
+                self.consume('COLON')
+                args.append(self.parse_expression())
+                if self.peek().type == 'COMMA': self.consume('COMMA')
+            self.consume('RBRACE')
+            # Treat as CallExpr with struct name for codegen
+            expr = CallExpr(name, args)
 
         elif token.type == 'LPAREN':
             self.consume('LPAREN')
@@ -713,6 +900,8 @@ class Parser:
                     self.consume('COMMA')
             self.consume('RBRACKET')
             expr = ArrayLiteral(elements)
+        elif token.type == 'STAR':
+            return self.parse_unary()
         else:
             # Print context
             start = max(0, self.pos - 10)
@@ -753,6 +942,7 @@ class Parser:
         return CallExpr(name, self.parse_call_arguments())
 
     def parse_call_arguments(self):
+        # No debug print
         self.consume('LPAREN')
         args = []
         if self.peek().type != 'RPAREN':

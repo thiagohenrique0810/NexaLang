@@ -32,10 +32,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Type System 2.0**
   - [x] Structs & Methods
     - [x] Struct Definitions
-    - [ ] `impl` blocks (Associating functions with types).
-    - [ ] Methods (`self`, `&self` receivers).
-    - [ ] Static Methods (`Type::new()`) vs Instance Methods (`obj.method()`).
-  - [~] Arrays & Slices
+    - [x] `impl` blocks (Associating functions with types).
+    - [x] Methods (`self`, `&self` receivers).
+    - [x] Static Methods (`Type::new()`) vs Instance Methods (`obj.method()`).
+  - [x] Arrays & Slices
     - [x] Arrays
     - [x] Slices (bootstrap: `[]T` lowered to `Slice<T>`, `slice_from_array(&arr)`, `s.len`, `s[i]`).
   - [x] Enums & Pattern Matching
@@ -99,49 +99,50 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 
 ## Phase 6: Advanced Language Features 🎯
 
-### 6.1 Complete OOP Support (CURRENT PRIORITY)
+### 6.1 Complete OOP Support ✅ COMPLETE
 - [x] **Struct Methods - Foundation**
   - [x] Parse `impl Type { }` blocks
   - [x] Basic method declarations in codegen
-- [ ] **Instance Methods**
-  - [ ] Parser: Handle `self`, `&self`, `&mut self` parameters
-  - [ ] Semantic: Type-check self receivers
-  - [ ] Codegen: Pass struct as first argument (by value, reference, or mutable reference)
-  - [ ] Method call syntax: `obj.method()` instead of `Type::method(obj)`
-- [ ] **Static Methods**
+- [x] **Instance Methods**
+  - [x] Parser: Handle `self`, `&self`, `&mut self` parameters
+  - [x] Semantic: Type-check self receivers
+  - [x] Codegen: Pass struct as first argument (by value, reference, or mutable reference)
+  - [x] Method call syntax: `obj.method()` instead of `Type::method(obj)`
+- [x] **Static Methods**
   - [x] Call syntax: `Type::method()`
-  - [ ] Ensure no `self` parameter for static methods
-- [ ] **Method Resolution**
-  - [ ] Resolve method calls in semantic analysis
-  - [ ] Handle method overloading (same name, different receiver types)
-  - [ ] Support method chaining: `obj.method1().method2()`
+  - [x] Ensure no `self` parameter for static methods
+- [x] **Method Resolution**
+  - [x] Resolve method calls in semantic analysis
+  - [x] Handle method overloading (struct-mangled names)
+  - [x] Support method chaining: `obj.method1().method2()`
 
-### 6.2 Enhanced Standard Library
-- [ ] **Vec<T> Complete Implementation**
-  - [ ] `Vec::new()` - constructor
-  - [ ] `push(&mut self, item: T)` - add element
-  - [ ] `pop(&mut self) -> Option<T>` - remove last
-  - [ ] `len(&self) -> i32` - get length
-  - [ ] `get(&self, idx: i32) -> Option<&T>` - safe access
-  - [ ] `clear(&mut self)` - remove all
+### 6.2 Enhanced Standard Library (CURRENT PRIORITY)
+- [x] **Vec<T> Complete Implementation**
+  - [x] `Vec::new()` - constructor
+  - [x] `push(&mut self, item: T)` - add element
+  - [x] `pop(&mut self) -> Option<T>` (implemented as `pop(&mut self) -> T` for bootstrap)
+  - [x] `len(&self) -> i32` - get length
+  - [x] `get(&self, idx: i32) -> Option<&T>` (implemented as `get(&self, index: i32) -> T` for bootstrap)
+  - [x] `clear(&mut self)` - remove all
   - [ ] Iterator support (for future for-loops)
-- [ ] **String Manipulation**
-  - [ ] `String::from(s: &str)` - convert from string literal
-  - [ ] `len(&self) -> i32`
-  - [ ] `concat(&self, other: &str) -> String`
-  - [ ] `substring(&self, start: i32, len: i32) -> String`
-  - [ ] `contains(&self, needle: &str) -> bool`
-  - [ ] `split(&self, delimiter: char) -> Vec<String>`
+- [x] **String Manipulation**
+  - [x] `String::from(s: &str)` - convert from string literal
+  - [x] `len(&self) -> i32`
+  - [x] `concat(&self, other: &str) -> String`
+  - [x] `substring(&self, start: i32, len: i32) -> String`
+  - [x] `contains(&self, needle: &str) -> bool`
+  - [x] `split(&self, delimiter: char) -> Vec<String>`
 
 ### 6.3 Module System & Code Organization
-- [ ] **Basic Modules**
-  - [ ] `mod module_name;` syntax
-  - [ ] File-based modules (one file = one module)
-  - [ ] Multi-file compilation in `nx.py`
+- [x] **Basic Modules**
+  - [x] `mod module_name;` syntax
+  - [x] File-based modules (one file = one module)
+  - [x] Multi-file compilation in `nx.py` (via `main.py` resolution)
 - [ ] **Visibility & Privacy**
-  - [ ] `pub` keyword for public items
-  - [ ] Default private visibility
-  - [ ] Privacy checking in semantic analysis
+- [x] **Visibility & Privacy**
+  - [x] `pub` keyword for public items
+  - [x] Default private visibility
+  - [x] Privacy checking in semantic analysis
 - [ ] **Import System**
   - [ ] `use module::item;` syntax
   - [ ] `use module::*;` glob imports

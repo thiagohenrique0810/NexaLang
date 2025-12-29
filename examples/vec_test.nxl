@@ -1,0 +1,57 @@
+struct Vec<T> {
+    ptr: *T,
+    len: i32,
+    cap: i32
+}
+
+impl<T> Vec<T> {
+    fn new() -> Vec<T> {
+        return Vec(cast::<*T>(0), 0, 0);
+    }
+    
+    fn len(&self) -> i32 {
+        return self.len;
+    }
+    
+    fn push(&mut self, item: T) {
+        if (self.len == self.cap) {
+            let mut new_cap: i32 = self.cap * 2;
+            if (self.cap == 0) {
+                new_cap = 4;
+            }
+            
+            let item_size: i32 = sizeof::<T>();
+            let new_ptr: *T = cast::<*T>(malloc(new_cap * item_size));
+            
+            if (self.cap > 0) {
+                memcpy(new_ptr, self.ptr, self.len * item_size);
+                # In a real impl, we'd free the old ptr here, but for bootstrap simplicity...
+            }
+            
+            self.ptr = new_ptr;
+            self.cap = new_cap;
+        }
+        
+        self.ptr[self.len] = item;
+        self.len = self.len + 1;
+    }
+    
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    
+    print(v.len());
+    
+    let mut v2: Vec<i32> = Vec::new();
+    v2.push(100);
+    print(v2.len());
+    
+    return 0;
+}

@@ -1,0 +1,273 @@
+struct StringList {
+    ptr: String*,
+    len: i32,
+    cap: i32
+}
+
+impl StringList {
+    fn new() -> StringList {
+         # Manually construct
+         let res = StringList {
+             ptr: cast<String*>(0),
+             len: 0,
+             cap: 0
+         };
+         return res;
+    }
+
+    fn push(&mut self, s: String) {
+        if (self.len >= self.cap) {
+            let n_cap = self.cap * 2;
+            if (n_cap == 0) { n_cap = 4; }
+            
+            # Size of String struct = 8 (ptr) + 4 (len) + 4 (cap) = 16 bytes
+            # alignment usually 8.
+            let size = 16; 
+            let n_ptr = realloc(cast<u8*>(self.ptr), n_cap * size);
+            self.ptr = cast<String*>(n_ptr);
+            self.cap = n_cap;
+        }
+        
+        # Array access on struct pointer: ptr[i]
+        # Since CodeGen supports pointer indexing:
+        
+        let dest = self.ptr + self.len;
+        *dest = s; 
+        
+        self.len = self.len + 1;
+    }
+    
+    fn get(&self, idx: i32) -> String {
+        return *(self.ptr + idx);
+    }
+}
+
+struct String {
+    ptr: u8*,
+    len: i32,
+    cap: i32
+}
+
+impl String {
+    fn from(s: string) -> String {
+        let l = 0;
+        let p_start = cast<u8*>(s);
+        let temp_ptr = p_start;
+        
+        let c = *temp_ptr;
+        while (c != cast<u8>(0)) {
+            l = l + 1;
+            temp_ptr = temp_ptr + 1;
+            c = *temp_ptr;
+        }
+
+        let p = malloc(l + 1);
+        memcpy(p, p_start, l);
+        
+        let term_dest = p + l;
+        *cast<u8*>(term_dest) = cast<u8>(0);
+
+        let res = String {
+            ptr: p,
+            len: l,
+            cap: l + 1
+        };
+        return res;
+    }
+
+    fn len(&self) -> i32 {
+        let res = self.len;
+        return res;
+    }
+
+    fn push(&mut self, c: u8) {
+        if (self.len + 1 >= self.cap) {
+            let n_cap = self.cap * 2;
+            let n_ptr = realloc(self.ptr, n_cap);
+            self.ptr = n_ptr;
+            self.cap = n_cap;
+        }
+        let t_ptr = self.ptr + self.len;
+        *cast<u8*>(t_ptr) = c;
+        self.len = self.len + 1;
+        
+        let trm_ptr = self.ptr + self.len;
+        *cast<u8*>(trm_ptr) = cast<u8>(0);
+    }
+
+    fn concat(&self, other: &String) -> String {
+        let new_len = self.len + other.len;
+        let p = malloc(new_len + 1);
+        
+        memcpy(p, self.ptr, self.len);
+        let second_half = p + self.len;
+        memcpy(second_half, other.ptr, other.len);
+        
+        let term_dest = p + new_len;
+        *cast<u8*>(term_dest) = cast<u8>(0);
+        
+        let res = String {
+            ptr: p,
+            len: new_len,
+            cap: new_len + 1
+        };
+        return res;
+    }
+
+    fn substring(&self, start: i32, len: i32) -> String {
+        let p = malloc(len + 1);
+        let src_start = self.ptr + start;
+        memcpy(p, src_start, len);
+        
+        let term_dest = p + len;
+        *cast<u8*>(term_dest) = cast<u8>(0);
+        
+        let res = String {
+            ptr: p,
+            len: len,
+            cap: len + 1
+        };
+        return res;
+    }
+
+    fn contains(&self, needle: string) -> bool {
+        let needle_len = 0;
+        let n_ptr = cast<u8*>(needle);
+        while (*n_ptr != cast<u8>(0)) {
+            needle_len = needle_len + 1;
+            n_ptr = n_ptr + 1;
+        }
+
+        if (needle_len == 0) { return true; }
+        if (self.len < needle_len) { return false; }
+
+        let i = 0;
+        let diff = self.len - needle_len;
+        while (i <= diff) {
+            let j = 0;
+            let match_found = true;
+            while (j < needle_len) {
+                let s_char = *(self.ptr + i + j);
+                let n_char = *(cast<u8*>(needle) + j);
+                if (s_char != n_char) {
+                    match_found = false;
+                    # break; // no break yet
+                    j = needle_len; # Force exit inner loop
+                } else {
+                    j = j + 1;
+                }
+            }
+            if (match_found) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    fn split(&self, delimiter: char) -> StringList {
+        let list = StringList::new();
+        let start = 0;
+        let i = 0;
+        
+        while (i < self.len) {
+            let c = *(cast<u8*>(self.ptr + i));
+            if (cast<char>(c) == delimiter) {
+                 # New substring from start to i
+                 let slice_len = i - start;
+                 let s = self.substring(start, slice_len);
+                 list.push(s);
+                 start = i + 1;
+            }
+            i = i + 1;
+        }
+        
+        # Push remaining part
+        if (start <= self.len) {
+             let last_len = self.len - start;
+             let s = self.substring(start, last_len);
+             list.push(s);
+        }
+        
+        return list;
+    }
+
+    fn print(&self) {
+        print(cast<string>(self.ptr));
+    }
+}
+
+fn main() -> i32 {
+    let s1 = String::from("Hello ");
+    let s2 = String::from("Nexa!");
+    
+    print("S1:");
+    s1.print();
+    print("S2:");
+    s2.print();
+
+    let s3 = s1.concat(&s2);
+    print("Concat Result (S3):");
+    s3.print();
+
+    if (s3.len() == 11) {
+        print("Concat length check passed!");
+    } else {
+        print("Concat length check failed!");
+    }
+
+    let sub = s3.substring(0, 5);
+    print("Substring(0, 5) of S3:");
+    sub.print();
+
+    if (sub.len() == 5) {
+        print("Substring length check passed!");
+    } else {
+        print("Substring length check failed!");
+    }
+
+    let sub2 = s3.substring(6, 4);
+    print("Substring(6, 4) of S3:");
+    sub2.print();
+
+    if (sub2.len() == 4) {
+        print("Substring 2 length check passed!");
+    } else {
+        print("Substring 2 length check failed!");
+    }
+
+    # Contains check
+    if (s3.contains("Nexa")) {
+        print("Contains 'Nexa' passed!");
+    } else {
+        print("Contains 'Nexa' FAILED!");
+    }
+    
+    if (s3.contains("World")) {
+        print("Contains 'World' FAILED (should be false)!");
+    } else {
+        print("Contains 'World' passed (correctly false)!");
+    }
+
+    # Split check
+    let s4 = String::from("a,b,c");
+    let parts = s4.split(','); # char literal
+    
+    print("Split 'a,b,c' by ',' -> parts len:");
+    print(parts.len);
+    
+    if (parts.len == 3) {
+        print("Split count passed!");
+    } else {
+        print("Split count FAILED!");
+    }
+    
+    print("Part 0:");
+    parts.get(0).print();
+    print("Part 1:");
+    parts.get(1).print();
+    print("Part 2:");
+    parts.get(2).print();
+
+    return 0;
+}

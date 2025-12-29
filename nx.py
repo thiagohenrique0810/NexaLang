@@ -89,9 +89,19 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     # Build native and run
     _ensure_dir(DEV_ARTIFACTS)
+    
+    cmd = _python() + [BOOTSTRAP_MAIN, args.file, "--target", "native"]
+    
+    if args.jit:
+        cmd.append("--run-jit")
+        return _run(cmd)
+
     exe = args.exe or os.path.join(DEV_ARTIFACTS, "output.exe")
     ll_out = args.ll_out or os.path.join(DEV_ARTIFACTS, "output.ll")
-    rc = _run(_python() + [BOOTSTRAP_MAIN, args.file, "--target", "native", "--emit", "ll", "--out", ll_out])
+    
+    cmd.extend(["--emit", "ll", "--out", ll_out])
+    
+    rc = _run(cmd)
     if rc != 0:
         return rc
     rc = _run(["clang", ll_out, "-o", exe])
@@ -140,6 +150,7 @@ def main() -> int:
     p_run.add_argument("file", help="Input .nxl")
     p_run.add_argument("--exe", default=None, help="Output exe path")
     p_run.add_argument("--ll-out", default=None, help="Output .ll path")
+    p_run.add_argument("--jit", action="store_true", help="Run using JIT (no clang required)")
     p_run.set_defaults(func=cmd_run)
 
     p_val = sub.add_parser("val", help="Validate artifacts (SPIR-V)")

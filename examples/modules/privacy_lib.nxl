@@ -1,0 +1,11 @@
+fn secret() {
+    print("This is secret");
+}
+
+pub fn public_api() {
+    print("Public API calling secret...");
+    secret(); 
+}
+
+struct PrivateStruct { x: i32 }
+pub struct PublicStruct { x: i32 }

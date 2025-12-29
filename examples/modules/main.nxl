@@ -1,0 +1,10 @@
+mod math_utils;
+
+fn main() {
+    print("Testing Modules...");
+    let s = math_utils::add(10, 20);
+    print(s);
+    
+    let d = math_utils::sub(30, 5);
+    print(d);
+}

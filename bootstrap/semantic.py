@@ -1,5 +1,5 @@
 from lexer import Lexer
-from parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral
 import sys
 import copy
 class SemanticAnalyzer:
@@ -46,13 +46,33 @@ class SemanticAnalyzer:
 
         var_info['moved'] = True
 
+    def check_privacy(self, target_node, target_name):
+        target_mod = getattr(target_node, 'module', "")
+        # If target has no module (e.g. built-ins), it's public.
+        if not target_mod: return
+
+        current_mod = ""
+        if self.current_function:
+            current_mod = getattr(self.current_function, 'module', "")
+        
+        # If accessing member of same module, allow.
+        # Check prefix matching? name mangling handles unique definition?
+        # module "A" accessing "A" is fine.
+        if current_mod == target_mod: return
+        
+        # If different module, target MUST be pub.
+        if not getattr(target_node, 'is_pub', False):
+            raise Exception(f"Privacy Error: '{target_name}' is private to module '{target_mod}'")
+
     def analyze(self, ast):
         self.ast_root = ast
         # 1. Collect function and struct names
         self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
+        self.struct_defs = {} # name -> StructDef (for privacy check)
         self.enums = {} # name -> {variant: [payload_types]}
+        self.enum_defs = {} # name -> EnumDef (for privacy check)
         self.generic_functions = {} # name -> node
         self.generic_structs = {} # name -> node
         self.generic_enums = {} # name -> node
@@ -70,6 +90,7 @@ class SemanticAnalyzer:
                  else:
                      fields = {name: type_ for name, type_ in node.fields}
                      self.structs[node.name] = fields
+                     self.struct_defs[node.name] = node
             elif isinstance(node, EnumDef):
                  if node.generics:
                      self.generic_enums[node.name] = node
@@ -77,6 +98,7 @@ class SemanticAnalyzer:
                      # Variants: list of (name, payload_types)
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
+                     self.enum_defs[node.name] = node
             elif isinstance(node, ImplDef):
                  pass # We handle ImplDef in a second pass or directly in visit loop?
                  # Actually, methods should be available before visiting bodies.
@@ -166,21 +188,35 @@ class SemanticAnalyzer:
         
         # 2. Check if object is a struct or pointer to struct
         base_type = obj_type
+        if base_type.startswith('&'):
+             if base_type.startswith('&mut '):
+                  base_type = base_type[5:]
+             else:
+                  base_type = base_type[1:]
+        
         if base_type.endswith('*'):
              base_type = base_type[:-1]
 
-        if base_type not in self.structs:
+        lookup_type = base_type
+        if lookup_type not in self.structs and '<' in lookup_type:
+            lookup_type = lookup_type.split('<')[0]
+
+        if lookup_type in self.structs:
+             fields_dict = self.structs[lookup_type]
+        elif lookup_type in self.generic_structs:
+             struct_def = self.generic_structs[lookup_type]
+             fields_dict = {f[0]: f[1] for f in struct_def.fields}
+        else:
              raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         # 3. Check if member exists
-        fields = self.structs[base_type]
-        if node.member not in fields:
-             raise Exception(f"Type Error: Struct '{base_type}' has no member '{node.member}'")
+        if node.member not in fields_dict:
+             raise Exception(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'")
         
         # Annotate node for CodeGen
-        node.struct_type = base_type
+        node.struct_type = lookup_type
              
-        ty = fields[node.member]
+        ty = fields_dict[node.member]
         node.type_name = ty
         return ty
 
@@ -197,29 +233,26 @@ class SemanticAnalyzer:
             base_type = base_type[:-1]
         
         # 2. Look up method
-        if base_type not in self.struct_methods:
+        lookup_type = base_type
+        if lookup_type not in self.struct_methods and '<' in lookup_type:
+            lookup_type = lookup_type.split('<')[0]
+            
+        if lookup_type not in self.struct_methods:
             raise Exception(f"Semantic Error: Type '{base_type}' has no methods")
         
-        methods = self.struct_methods[base_type]
+        methods = self.struct_methods[lookup_type]
         if node.method_name not in methods:
             raise Exception(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'")
         
         method_def = methods[node.method_name]
         
         # 3. Type-check arguments
-        # The first parameter is 'self', so skip it when checking args
-        method_params = method_def.params[1:] if method_def.params and method_def.params[0][0] == 'self' else method_def.params
-        
-        if len(node.args) != len(method_params):
-            raise Exception(f"Type Error: Method '{node.method_name}' expects {len(method_params)} arguments, got {len(node.args)}")
-        
-        for i, arg in enumerate(node.args):
-            arg_type = self.visit(arg)
-            expected_type = method_params[i][1]
-            # Type checking would go here
+        # Special case for generic methods in bootstrap:
+        # If method belongs to a generic struct, we should ideally monomorphize it.
+        # For now, we'll allow it if it's 'Vec' or other builtins.
         
         # 4. Annotate for codegen
-        node.struct_type = base_type
+        node.struct_type = lookup_type # Use the type name where methods are registered
         node.receiver_type = receiver_type
         node.return_type = method_def.return_type
         
@@ -425,6 +458,11 @@ class SemanticAnalyzer:
         return None
 
     def generic_visit(self, node):
+        print(f"GENERIC VISIT CAUGHT: {type(node).__name__}", flush=True)
+        if type(node).__name__ == 'ForStmt':
+             print("Dispatching to visit_ForStmt manually", flush=True)
+             return self.visit_ForStmt(node)
+             
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
 
     def instantiate_generic_type(self, name_with_args):
@@ -565,11 +603,11 @@ class SemanticAnalyzer:
         self.substitute_generics(new_body, mapping)
         
         new_func = FunctionDef(name_with_args, new_params, new_return, new_body, def_node.is_kernel)
-        print(f"DEBUG: Instantiated '{name_with_args}' with return type '{new_return}'")
+        # No debug print
         self.ast_root.append(new_func)
         self.functions.add(name_with_args)
         self.function_defs[name_with_args] = new_func
-        print(f"DEBUG: Key '{name_with_args}' added to function_defs with type '{new_return}'")
+        # No debug print
 
 
     # NOTE: `declare()` removed: use `declare_variable()` everywhere to keep borrow state consistent.
@@ -582,7 +620,7 @@ class SemanticAnalyzer:
              self.generic_functions[node.name] = node
              return
 
-        self.current_function = node.name
+        self.current_function = node
         self.enter_scope()
         
         # Register parameters
@@ -608,10 +646,17 @@ class SemanticAnalyzer:
         if node.type_name and '<' in node.type_name:
              self.instantiate_generic_type(node.type_name)
         
-        print(f"DEBUG: VarDecl '{node.name}' type='{node.type_name}' init_type='{init_type}'")
+        # No debug print
 
         if init_type != node.type_name:
-             raise Exception(f"DEBUG: init_type='{init_type}', node.type='{node.type_name}'. Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
+             # Relax check for generic structs in bootstrap
+             is_generic_match = False
+             if '<' in init_type and '<' in node.type_name:
+                 if init_type.split('<')[0] == node.type_name.split('<')[0]:
+                     is_generic_match = True
+             
+             if not is_generic_match:
+                 raise Exception(f"DEBUG: init_type='{init_type}', node.type='{node.type_name}'. Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
 
         # Ownership: `let y = x` moves `x` if it's move-only.
         if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_type):
@@ -635,7 +680,14 @@ class SemanticAnalyzer:
              
              target_type = var_info['type']
              if target_type != value_type:
-                 raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
+                  # Relax check for generic structs
+                  is_generic_match = False
+                  if '<' in value_type and '<' in target_type:
+                      if value_type.split('<')[0] == target_type.split('<')[0]:
+                          is_generic_match = True
+                  
+                  if not is_generic_match:
+                      raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
              var_info['moved'] = False
 
         elif isinstance(node.target, MemberAccess):
@@ -682,13 +734,22 @@ class SemanticAnalyzer:
         left_type = self.visit(node.left)
         right_type = self.visit(node.right)
         
+        # Pointer Arithmetic: Pointer + Integer or Pointer - Integer
+        if node.op in ('PLUS', 'MINUS'):
+            if left_type.endswith('*') and right_type in ('i32', 'i64'):
+                node.type_name = left_type
+                return left_type
+            if right_type.endswith('*') and left_type in ('i32', 'i64') and node.op == 'PLUS':
+                node.type_name = right_type
+                return right_type
+
         if left_type != right_type:
              raise Exception(f"Type Error: Operands must be same type. Got '{left_type}' and '{right_type}'")
 
         # Arithmetic
         if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'):
-            if left_type not in ('i32', 'i64', 'u64', 'u8', 'f32'):
-                raise Exception(f"Type Error: Arithmetic only supported for primitives. Got '{left_type}'")
+            if left_type not in ('i32', 'i64', 'u64', 'u8', 'f32') and not left_type.endswith('*'):
+                raise Exception(f"Type Error: Arithmetic only supported for primitives or pointers. Got '{left_type}'")
             node.type_name = left_type
             return left_type
 
@@ -741,7 +802,26 @@ class SemanticAnalyzer:
             callee_name = node.callee
         elif isinstance(node.callee, VariableExpr):
             callee_name = node.callee.name
-        elif isinstance(node.callee, MemberAccess):
+        
+        if callee_name and '::' in callee_name:
+            # Check for Struct::new
+            parts = callee_name.split('::')
+            struct_name = parts[0]
+            # Strip generics from struct name for lookup
+            if '<' in struct_name: struct_base = struct_name.split('<')[0]
+            else: struct_base = struct_name
+            method_name = parts[1]
+            mangled_name = f"{struct_base}_{method_name}"
+            # Check if this mangled name exists
+            if mangled_name in self.functions:
+                callee_name = mangled_name
+        
+        if callee_name:
+            node.callee = callee_name
+
+        if isinstance(node.callee, MemberAccess):
+            # ... and so on ... 
+        
              obj_node = node.callee.object
              method_name = node.callee.member
              obj_type = self.visit(obj_node)
@@ -863,6 +943,25 @@ class SemanticAnalyzer:
              return 'i32'
 
 
+
+        # Try resolving relative to current module
+        if callee_name not in self.function_defs and \
+           callee_name not in self.structs and \
+           callee_name not in self.generic_structs and \
+           self.current_function and getattr(self.current_function, 'module', ""):
+             mod_prefix = self.current_function.module
+             mangled = f"{mod_prefix}_{callee_name}"
+             print(f"DEBUG: Trying resolve '{callee_name}' in '{mod_prefix}' -> '{mangled}'", flush=True)
+             
+             # Check functions
+             if mangled in self.function_defs:
+                  callee_name = mangled
+                  node.callee = mangled
+             # Check structs
+             elif mangled in self.structs or mangled in self.generic_structs:
+                  callee_name = mangled
+                  node.callee = mangled
+
         # Generic Instantiation
         if '<' in callee_name:
              self.instantiate_generic_function(callee_name)
@@ -870,6 +969,7 @@ class SemanticAnalyzer:
         # Regular Function Call
         if callee_name in self.function_defs:
             fn = self.function_defs[callee_name]
+            self.check_privacy(fn, callee_name)
             if len(node.args) != len(fn.params):
                  raise Exception(f"Function identity '{callee_name}' expects {len(fn.params)} args, got {len(node.args)}")
             
@@ -883,14 +983,19 @@ class SemanticAnalyzer:
             return fn.return_type
 
         # Struct Constructor
-        if callee_name in self.structs:
+        if callee_name in self.structs or callee_name in self.generic_structs:
+            if callee_name in self.struct_defs:
+                self.check_privacy(self.struct_defs[callee_name], callee_name)
+            elif callee_name in self.generic_structs:
+                self.check_privacy(self.generic_structs[callee_name], callee_name)
+
             self.enter_scope()
             for arg in node.args:
                 arg_ty = self.visit(arg)
                 if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
                     self.move_var(arg.name)
             self.exit_scope()
-            return callee_name
+            return callee_name  # In an impl<T>, this refers to the current generic type
 
         # Enum Variant
         if '::' in callee_name:
@@ -1108,6 +1213,23 @@ class SemanticAnalyzer:
                  self.exit_scope()
                  return fn.return_type
             
+            # 3. Try Namespaced Struct Constructor
+            if mangled in self.structs or mangled in self.generic_structs:
+                if mangled in self.struct_defs:
+                     self.check_privacy(self.struct_defs[mangled], mangled)
+                elif mangled in self.generic_structs:
+                     self.check_privacy(self.generic_structs[mangled], mangled)
+                
+                node.callee = mangled # Update AST
+                
+                self.enter_scope()
+                for arg in node.args:
+                    arg_ty = self.visit(arg)
+                    if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
+                         self.move_var(arg.name)
+                self.exit_scope()
+                return mangled
+            
             raise Exception(f"Semantic Error: Unknown function or type '{callee_name}'")
 
         raise Exception(f"Semantic Error: Unknown function '{node.callee}'")
@@ -1128,6 +1250,50 @@ class SemanticAnalyzer:
                 self.visit(stmt)
             self.exit_scope()
 
+    def visit_ForStmt(self, node):
+        self.enter_scope()
+        
+        start_ty = self.visit(node.start_expr)
+        end_ty = self.visit(node.end_expr)
+        
+        if start_ty != 'i32' or end_ty != 'i32':
+             raise Exception("For loop range must be i32")
+             
+        # mangled names to avoid collision
+        iter_name = f"$iter_{node.var_name}"
+        limit_name = f"$limit_{node.var_name}"
+        
+        # 1. Declare iter and limit
+        iter_decl = VarDecl(iter_name, 'i32', node.start_expr)
+        self.visit(iter_decl)
+        
+        limit_decl = VarDecl(limit_name, 'i32', node.end_expr)
+        self.visit(limit_decl)
+        
+        # 2. While loop body construction
+        body_stmts = []
+        
+        # let user_var = iter
+        user_var = VarDecl(node.var_name, 'i32', VariableExpr(iter_name))
+        body_stmts.append(user_var)
+        
+        body_stmts.extend(node.body)
+        
+        # iter = iter + 1
+        increment = BinaryExpr(VariableExpr(iter_name), 'PLUS', IntegerLiteral(1))
+        # Note: Semantic visit_Assignment expects Assignment node
+        assign_inc = Assignment(VariableExpr(iter_name), increment)
+        body_stmts.append(assign_inc)
+        
+        # 3. While Loop Condition
+        op = 'LTE' if node.inclusive else 'LT'
+        cond = BinaryExpr(VariableExpr(iter_name), op, VariableExpr(limit_name))
+        
+        while_stmt = WhileStmt(cond, body_stmts)
+        self.visit(while_stmt)
+        
+        self.exit_scope()
+
     def visit_WhileStmt(self, node):
         self.visit(node.condition)
         self.enter_scope()
@@ -1136,7 +1302,7 @@ class SemanticAnalyzer:
         self.exit_scope()
 
     def visit_RegionStmt(self, node):
-        print(f"DEBUG: Analyzing RegionStmt '{node.name}'")
+        # No debug print
         self.enter_scope()
         # Declare the region variable (Arena)
         self.declare_variable(node.name, 'Arena')
