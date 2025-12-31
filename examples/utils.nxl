@@ -1,0 +1,13 @@
+pub fn help() {
+    print(999);
+}
+
+pub struct Helper {
+    val: i32
+}
+
+impl Helper {
+    pub fn new(v: i32) -> Helper {
+        Helper { val: v }
+    }
+}

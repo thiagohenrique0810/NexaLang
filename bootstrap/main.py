@@ -16,6 +16,7 @@ def mangle_ast(nodes, prefix):
             node.module = prefix
         elif isinstance(node, ImplDef):
             node.struct_name = f"{prefix}_{node.struct_name}"
+            node.module = prefix
             for method in node.methods:
                 method.module = prefix
 

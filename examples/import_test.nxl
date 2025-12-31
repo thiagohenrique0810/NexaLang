@@ -1,0 +1,11 @@
+mod utils;
+
+use utils::help;
+use utils::Helper;
+
+fn main() {
+    help();
+    
+    let h: Helper = Helper::new(1);
+    print(h.val);
+}

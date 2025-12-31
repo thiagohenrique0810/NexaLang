@@ -379,7 +379,8 @@ class CodeGen:
         # so that monomorphized instances (type erasure in bootstrap) can find them.
         
         # We need a way to avoid failing on generic parameter types like 'T'
-        self._current_generics = node.generics
+        # We need a way to avoid failing on generic parameter types like 'T'
+        self._current_generics = [g[0] for g in node.generics]
 
         if node.name not in self.struct_types:
              # Generic instantiation or dynamic creation
@@ -473,8 +474,11 @@ class CodeGen:
         self.enum_payloads[node.name] = variant_payload_types
         self.enum_definitions[node.name] = (enum_ty, max_size)
 
+    def visit_TraitDef(self, node):
+        pass # Traits are compile-time only for now (static dispatch)
+
     def visit_ImplDef(self, node):
-        self._current_generics = node.generics
+        self._current_generics = [g[0] for g in node.generics]
         for method in node.methods:
             self.visit(method)
         self._current_generics = []
@@ -507,7 +511,7 @@ class CodeGen:
                     continue
                 self._declare_function(node)
             elif isinstance(node, ImplDef):
-                self._current_generics = node.generics
+                self._current_generics = [g[0] for g in node.generics]
                 for method in node.methods:
                     self._declare_function(method)
                 self._current_generics = []
@@ -614,7 +618,7 @@ class CodeGen:
         receiver_arg = None
         if isinstance(expected_param_type, ir.PointerType) and not isinstance(receiver_val.type, ir.PointerType):
             # Method expects pointer but we have value.
-            from parser import VariableExpr
+            from n_parser import VariableExpr
             if isinstance(node.receiver, VariableExpr):
                 # Look up variable's address in all scopes
                 for scope in reversed(self.scopes):

@@ -47,11 +47,20 @@ class EnumDef(ASTNode):
         self.is_pub = is_pub
         self.module = ""
 
+class TraitDef(ASTNode):
+    def __init__(self, name, methods, generics=None, is_pub=False):
+        self.name = name
+        self.methods = methods # list of FunctionDef (likely without body)
+        self.generics = generics or []
+        self.is_pub = is_pub
+        self.module = ""
+
 class ImplDef(ASTNode):
-    def __init__(self, struct_name, methods, generics=None):
+    def __init__(self, struct_name, methods, generics=None, trait_name=None):
         self.struct_name = struct_name
         self.methods = methods
         self.generics = generics or []
+        self.trait_name = trait_name
 
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
@@ -134,6 +143,14 @@ class UnaryExpr(ASTNode):
     def __init__(self, op, operand):
         self.op = op
         self.operand = operand
+
+class UseStmt(ASTNode):
+    def __init__(self, path, is_pub=False):
+        self.path = path # list of strings
+        self.is_pub = is_pub
+        
+    def __repr__(self):
+        return f"use {'::'.join(self.path)}"
     # ... (rest of classes)
 
 # ... inside Parser class ...
@@ -272,6 +289,10 @@ class Parser:
                 nodes.append(self.parse_impl())
             elif self.peek().type == 'MOD':
                 nodes.append(self.parse_mod(is_pub=is_pub))
+            elif self.peek().type == 'TRAIT':
+                nodes.append(self.parse_trait(is_pub=is_pub))
+            elif self.peek().type == 'USE':
+                nodes.append(self.parse_use(is_pub=is_pub))
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
@@ -282,21 +303,50 @@ class Parser:
         self.consume('SEMICOLON')
         return ModDecl(name, is_pub=is_pub)
 
+    def parse_use(self, is_pub=False):
+        self.consume('USE')
+        path = []
+        path.append(self.consume('IDENTIFIER').value)
+        while self.peek().type == 'DOUBLE_COLON':
+            self.consume('DOUBLE_COLON')
+            path.append(self.consume('IDENTIFIER').value)
+        self.consume('SEMICOLON')
+        return UseStmt(path, is_pub=is_pub)
+
 
 
     def parse_impl(self):
-        self.consume('IMPL')
+        token = self.consume('IMPL')
         
         generics = []
-        # Optional impl generics: impl<T>
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
-                generics.append(self.consume('IDENTIFIER').value)
+                g_name = self.consume('IDENTIFIER').value
+                bound = None
+                if self.peek().type == 'COLON':
+                     self.consume('COLON')
+                     bound = self.consume('IDENTIFIER').value
+                generics.append((g_name, bound))
                 if self.peek().type == 'COMMA': self.consume('COMMA')
             self.consume('GT')
 
-        struct_name = self.consume('IDENTIFIER').value
+        # Check for 'impl Trait for Type'
+        # We read first identifier. It could be Trait or Type.
+        first_id = self.consume('IDENTIFIER').value
+        
+        trait_name = None
+        struct_name = None
+        
+        if self.peek().type == 'FOR':
+             self.consume('FOR')
+             # first_id was Trait
+             trait_name = first_id
+             # Next is Type (struct)
+             struct_name = self.consume('IDENTIFIER').value
+        else:
+             # Regular impl Type
+             struct_name = first_id
         
         # Optional struct generics: Struct<T>
         if self.peek().type == 'LT':
@@ -315,7 +365,37 @@ class Parser:
                  is_pub = True
             methods.append(self.parse_function(is_kernel=False, is_pub=is_pub))
         self.consume('RBRACE')
-        return ImplDef(struct_name, methods, generics)
+        node = ImplDef(struct_name, methods, generics, trait_name=trait_name)
+        node.line = token.line
+        node.column = token.column
+        return node
+
+    def parse_trait(self, is_pub=False):
+        self.consume('TRAIT')
+        name = self.consume('IDENTIFIER').value
+        
+        generics = []
+        if self.peek().type == 'LT':
+            self.consume('LT')
+            while self.peek().type != 'GT':
+                g_name = self.consume('IDENTIFIER').value
+                bound = None
+                if self.peek().type == 'COLON':
+                     self.consume('COLON')
+                     bound = self.consume('IDENTIFIER').value
+                generics.append((g_name, bound))
+                if self.peek().type == 'COMMA': self.consume('COMMA')
+            self.consume('GT')
+            
+        self.consume('LBRACE')
+        methods = []
+        while self.peek().type != 'RBRACE':
+             # Trait methods might not have bodies.
+             # Call parse_function with allow_empty_body=True
+             # But parse_function signature update needed.
+             methods.append(self.parse_function(allow_empty_body=True))
+        self.consume('RBRACE')
+        return TraitDef(name, methods, generics, is_pub=is_pub)
 
     def parse_struct(self, is_pub=False):
         self.consume('STRUCT')
@@ -325,7 +405,12 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
-                generics.append(self.consume('IDENTIFIER').value)
+                g_name = self.consume('IDENTIFIER').value
+                bound = None
+                if self.peek().type == 'COLON':
+                     self.consume('COLON')
+                     bound = self.consume('IDENTIFIER').value
+                generics.append((g_name, bound))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
             self.consume('GT')
@@ -359,7 +444,12 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
-                generics.append(self.consume('IDENTIFIER').value)
+                g_name = self.consume('IDENTIFIER').value
+                bound = None
+                if self.peek().type == 'COLON':
+                     self.consume('COLON')
+                     bound = self.consume('IDENTIFIER').value
+                generics.append((g_name, bound))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
             self.consume('GT')
@@ -382,7 +472,7 @@ class Parser:
         self.consume('RBRACE')
         return EnumDef(name, variants, generics, is_pub=is_pub)
 
-    def parse_function(self, is_kernel=False, is_pub=False):
+    def parse_function(self, is_kernel=False, is_pub=False, allow_empty_body=False):
         start_token = self.peek()
         if is_kernel:
             self.consume('KERNEL')
@@ -393,7 +483,12 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
-                generics.append(self.consume('IDENTIFIER').value)
+                g_name = self.consume('IDENTIFIER').value
+                bound = None
+                if self.peek().type == 'COLON':
+                     self.consume('COLON')
+                     bound = self.consume('IDENTIFIER').value
+                generics.append((g_name, bound))
                 if self.peek().type == 'COMMA':
                    self.consume('COMMA')
             self.consume('GT')
@@ -436,13 +531,17 @@ class Parser:
             self.consume('THIN_ARROW')
             return_type = self.parse_type()
             
-        self.consume('LBRACE')
-        body = []
-        while self.peek().type != 'RBRACE':
-            body.append(self.parse_statement())
-            if self.peek().type == 'SEMICOLON':
-                self.consume('SEMICOLON')
-        self.consume('RBRACE')
+        if self.peek().type == 'SEMICOLON' and allow_empty_body:
+            self.consume('SEMICOLON')
+            body = None
+        else:
+            self.consume('LBRACE')
+            body = []
+            while self.peek().type != 'RBRACE':
+                body.append(self.parse_statement())
+                if self.peek().type == 'SEMICOLON':
+                    self.consume('SEMICOLON')
+            self.consume('RBRACE')
         node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub)
         node.line = start_token.line
         node.column = start_token.column

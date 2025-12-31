@@ -261,7 +261,8 @@ class Lexer:
                     'else': 'ELSE', 'while': 'WHILE', 'match': 'MATCH', 'true': 'TRUE',
                     'false': 'FALSE', 'mut': 'MUT', 'impl': 'IMPL', 'self': 'SELF',
                     'or': 'OR', 'and': 'AND', 'mod': 'MOD', 'pub': 'PUB', 'for': 'FOR',
-                    'in': 'IN', 'break': 'BREAK', 'continue': 'CONTINUE'
+                    'in': 'IN', 'break': 'BREAK', 'continue': 'CONTINUE', 'trait': 'TRAIT',
+                    'use': 'USE'
                 }
                 
                 type_name = keywords.get(value, 'IDENTIFIER')

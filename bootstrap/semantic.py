@@ -1,5 +1,5 @@
 from lexer import Lexer
-from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt
 from errors import CompilerError
 import sys
 import copy
@@ -10,12 +10,56 @@ class SemanticAnalyzer:
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
+        self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
+        self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
+        self.impls = set() # {(struct_name, trait_name)}
+        self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_depth = 0
 
     def error(self, message, node=None, hint=None):
         line = node.line if node else None
         column = node.column if node else None
+        column = node.column if node else None
         raise CompilerError(message, line, column, hint=hint)
+
+    def resolve_type_name(self, name):
+        if not name: return name
+        
+        # 1. Alias Check (Direct)
+        if name in self.aliases:
+            return self.resolve_type_name(self.aliases[name])
+            
+        # 2. Generics Check
+        if '<' in name and name.endswith('>'):
+            try:
+                base = name.split('<', 1)[0]
+                resolved_base = self.resolve_type_name(base)
+                
+                inside = name[name.find('<')+1:-1]
+                # Split by comma but respect nested brackets
+                args = []
+                current = ""
+                depth = 0
+                for char in inside:
+                    if char == '<': depth += 1
+                    elif char == '>': depth -= 1
+                    elif char == ',' and depth == 0:
+                        args.append(current.strip())
+                        current = ""
+                        continue
+                    current += char
+                args.append(current.strip())
+                
+                resolved_args = [self.resolve_type_name(a) for a in args]
+                return f"{resolved_base}<{','.join(resolved_args)}>"
+            except:
+                return name # Fallback if parsing fails
+        
+        # 3. Canonicalize :: -> _
+        if '::' in name:
+             return name.replace('::', '_')
+            
+        return name
 
     def levenshtein_distance(self, s1, s2):
         if len(s1) < len(s2):
@@ -114,15 +158,12 @@ class SemanticAnalyzer:
         self.generic_functions = {} # name -> node
         self.generic_structs = {} # name -> node
         self.generic_enums = {} # name -> node
-        
+        self.traits = {} # name -> {method_name: method_signature_node}
+        self.trait_defs = {} # name -> TraitDef
+
+        # Pass 1: Collect Types (Structs, Enums, Traits)
         for node in ast:
-            if isinstance(node, FunctionDef):
-                if node.generics:
-                    self.generic_functions[node.name] = node
-                else:
-                    self.functions.add(node.name)
-                    self.function_defs[node.name] = node
-            elif isinstance(node, StructDef):
+            if isinstance(node, StructDef):
                  if node.generics:
                      self.generic_structs[node.name] = node
                  else:
@@ -133,14 +174,23 @@ class SemanticAnalyzer:
                  if node.generics:
                      self.generic_enums[node.name] = node
                  else:
-                     # Variants: list of (name, payload_types)
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
                      self.enum_defs[node.name] = node
+            elif isinstance(node, TraitDef):
+                 self.trait_defs[node.name] = node
+                 methods = {m.name: m for m in node.methods}
+                 self.traits[node.name] = methods
+
+        # Pass 2: Collect Functions and Impls
+        for node in ast:
+            if isinstance(node, FunctionDef):
+                if node.generics:
+                    self.generic_functions[node.name] = node
+                else:
+                    self.functions.add(node.name)
+                    self.function_defs[node.name] = node
             elif isinstance(node, ImplDef):
-                 pass # We handle ImplDef in a second pass or directly in visit loop?
-                 # Actually, methods should be available before visiting bodies.
-                 # So we should process ImplDef here (extract method signatures).
                  self.register_impl_methods(node)
         
         # Built-in generic Buffer<T> (for GPU/heterogeneous APIs):
@@ -165,14 +215,80 @@ class SemanticAnalyzer:
         # Inject Built-in Arena
         self.structs['Arena'] = {'chunk': 'u8*', 'offset': 'i32', 'capacity': 'i32'}
 
+        # 1.5 Process Imports (Use Statements)
+        for node in ast:
+             if isinstance(node, UseStmt):
+                  self.visit_UseStmt(node)
+
+        # 1.6 Canonicalize Types in Definitions (Module Scoping)
+        for node in ast:
+             self.canonicalize_type_refs(node)
+
         # 2. Analyze bodies
         for node in ast:
+            if type(node).__name__ == "UseStmt":
+                # print("DEBUG PASS 2 SKIPPING USESTMT", flush=True)
+                continue
+            if "UseStmt" in type(node).__name__:
+                 raise Exception(f"DEBUG CRASH: UseStmt slipped through Pass 2 check! Name='{type(node).__name__}'")
             self.visit(node)
 
+    def canonicalize_type_refs(self, node):
+        if hasattr(node, 'module') and node.module:
+             prefix = node.module
+             
+             if isinstance(node, FunctionDef):
+                  node.return_type = self.mangle_type_if_local(node.return_type, prefix)
+                  for i, (pname, ptype) in enumerate(node.params):
+                       node.params[i] = (pname, self.mangle_type_if_local(ptype, prefix))
+             elif isinstance(node, StructDef):
+                  node.fields = [(n, self.mangle_type_if_local(t, prefix)) for n, t in node.fields]
+                  # Update self.structs entry? 
+                  # self.structs[node.name] needs update. node.name is ALREADY mangled (utils_Helper).
+                  # self.structs values are types. They need update.
+                  self.structs[node.name] = {n: self.mangle_type_if_local(t, prefix) for n, t in node.fields}
+             elif isinstance(node, ImplDef):
+                  # print(f"DEBUG: Canonicalize Impl {node.struct_name} module={getattr(node, 'module', 'None')}", flush=True)
+                  for method in node.methods:
+                       old_ret = method.return_type
+                       method.return_type = self.mangle_type_if_local(method.return_type, prefix)
+                       if old_ret != method.return_type:
+                           print(f"DEBUG: Updated method return {old_ret} -> {method.return_type}", flush=True)
+                       for i, (pname, ptype) in enumerate(method.params):
+                            method.params[i] = (pname, self.mangle_type_if_local(ptype, prefix))
+
+    def mangle_type_if_local(self, type_name, prefix):
+        if not type_name: return type_name
+        
+        # Generics
+        if '<' in type_name and type_name.endswith('>'):
+             base = type_name.split('<', 1)[0]
+             base = self.mangle_type_if_local(base, prefix)
+             inside = type_name[type_name.find('<')+1:-1]
+             # simplistic split for now
+             args = [self.mangle_type_if_local(x.strip(), prefix) for x in inside.split(',')]
+             return f"{base}<{','.join(args)}>"
+             
+        mangled = f"{prefix}_{type_name}"
+        if mangled in self.structs or mangled in self.enums:
+             return mangled
+        return type_name
+
     def visit(self, node):
-        method_name = f'visit_{type(node).__name__}'
+        name = type(node).__name__
+        if "UseStmt" in name:
+             self.visit_UseStmt(node)
+             return
+        
+        if "Use" in name:
+             raise Exception(f"DEBUG PARADOX: name='{name}' ords={[ord(c) for c in name]}")
+
+        method_name = f'visit_{name}'
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
+
+    def visit_TraitDef(self, node):
+        pass # Signatures already collected in analyze pass 1
 
     def visit_StructDef(self, node):
         pass # Already collected
@@ -185,13 +301,40 @@ class SemanticAnalyzer:
         for method in node.methods:
              self.visit(method) # visit_FunctionDef
 
+    def visit_UseStmt(self, node):
+        full_name = "::".join(node.path)
+        alias = node.path[-1]
+        self.aliases[alias] = full_name
+
     def register_impl_methods(self, node):
         struct_name = node.struct_name
         
         # Initialize methods dict for this struct if needed
         if struct_name not in self.struct_methods:
             self.struct_methods[struct_name] = {}
-        
+            
+        # Validate Trait Impl
+        if node.trait_name:
+             if node.trait_name not in self.traits:
+                  hint = None
+                  suggestion = self.suggest_name(node.trait_name, self.traits.keys())
+                  if suggestion: hint = f"Did you mean '{suggestion}'?"
+                  self.error(f"Semantic Error: Unknown trait '{node.trait_name}'", node, hint=hint)
+             
+             trait_methods = self.traits[node.trait_name]
+             impl_method_names = set(m.name for m in node.methods)
+             
+             missing = []
+             for tm_name in trait_methods:
+                  if tm_name not in impl_method_names:
+                       missing.append(tm_name)
+             if missing:
+                  self.error(f"Semantic Error: Implementation of trait '{node.trait_name}' for '{struct_name}' is missing methods: {', '.join(missing)}", node)
+
+             self.impls.add((struct_name, node.trait_name))
+
+
+
         # Mangle method names and fix 'self' types
         for method in node.methods:
              # Check for duplicate?
@@ -219,6 +362,14 @@ class SemanticAnalyzer:
              
              self.functions.add(mangled_name)
              self.function_defs[mangled_name] = method
+
+    def check_trait_impl(self, type_name, trait_name):
+        if (type_name, trait_name) in self.impls: return True
+        # Check generic base (e.g. Box<i32> -> Box)
+        if '<' in type_name:
+             base = type_name.split('<')[0]
+             if (base, trait_name) in self.impls: return True
+        return False
 
     def visit_MemberAccess(self, node):
         # 1. Evaluate object
@@ -510,9 +661,8 @@ class SemanticAnalyzer:
         return None
 
     def generic_visit(self, node):
-        print(f"GENERIC VISIT CAUGHT: {type(node).__name__}", flush=True)
+        # Allow pass-through for some nodes if needed, or error
         if type(node).__name__ == 'ForStmt':
-             print("Dispatching to visit_ForStmt manually", flush=True)
              return self.visit_ForStmt(node)
              
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
@@ -568,7 +718,17 @@ class SemanticAnalyzer:
             raise Exception(f"Type Error: Generic '{base_name}' expects {len(def_node.generics)} args, got {len(args)}")
             
         # Monomorphize
-        mapping = dict(zip(def_node.generics, args))
+        # Monomorphize skipped
+        
+        
+        
+        # Check bounds
+        for (g_name, g_bound), arg_type in zip(def_node.generics, args):
+             if g_bound:
+                  if not self.check_trait_impl(arg_type, g_bound):
+                       raise Exception(f"Type Error: Type '{arg_type}' does not implement trait '{g_bound}' required by '{g_name}'")
+
+        mapping = dict(zip([g[0] for g in def_node.generics], args))
         
         new_fields = []
         for fname, ftype in def_node.fields:
@@ -640,7 +800,13 @@ class SemanticAnalyzer:
         if len(args) != len(def_node.generics):
              raise Exception(f"Type Error: Generic '{base_name}' expects {len(def_node.generics)} args, got {len(args)}")
              
-        mapping = dict(zip(def_node.generics, args))
+        # Check bounds
+        for (g_name, g_bound), arg_type in zip(def_node.generics, args):
+             if g_bound:
+                  if not self.check_trait_impl(arg_type, g_bound):
+                       raise Exception(f"Type Error: Type '{arg_type}' does not implement trait '{g_bound}' required by '{g_name}'")
+
+        mapping = dict(zip([g[0] for g in def_node.generics], args))
         
         new_params = []
         for pname, ptype in def_node.params:
@@ -717,7 +883,11 @@ class SemanticAnalyzer:
         self.enter_scope()
         
         # Register parameters
-        for pname, ptype in node.params:
+        for i, (pname, ptype) in enumerate(node.params):
+             # Resolve type alias
+             ptype = self.resolve_type_name(ptype)
+             node.params[i] = (pname, ptype) # Update AST
+             
              if '<' in ptype:
                   self.instantiate_generic_type(ptype)
              self.declare_variable(pname, ptype)
@@ -728,6 +898,10 @@ class SemanticAnalyzer:
         self.current_function = None
 
     def visit_VarDecl(self, node):
+        # 0. Resolve type alias in declaration
+        if node.type_name:
+             node.type_name = self.resolve_type_name(node.type_name)
+
         # 1. Analyze initializer
         init_type = self.visit(node.initializer)
         
@@ -906,18 +1080,28 @@ class SemanticAnalyzer:
         elif isinstance(node.callee, VariableExpr):
             callee_name = node.callee.name
         
+        # Check aliases
+        if callee_name in self.aliases:
+             callee_name = self.aliases[callee_name]
+        
         if callee_name and '::' in callee_name:
             # Check for Struct::new
             parts = callee_name.split('::')
             struct_name = parts[0]
+            struct_name = self.resolve_type_name(struct_name) # Handle alias/mangle
+            
             # Strip generics from struct name for lookup
             if '<' in struct_name: struct_base = struct_name.split('<')[0]
             else: struct_base = struct_name
+            
             method_name = parts[1]
             mangled_name = f"{struct_base}_{method_name}"
+            # print(f"DEBUG CALL: Orig='{callee_name}' Struct='{struct_name}' Mangled='{mangled_name}' Found={mangled_name in self.functions}", flush=True)
             # Check if this mangled name exists
             if mangled_name in self.functions:
                 callee_name = mangled_name
+            else:
+                pass
         
         if callee_name:
             node.callee = callee_name
@@ -945,6 +1129,7 @@ class SemanticAnalyzer:
                   callee_name = mangled_name
                   node.callee = callee_name 
              else:
+                  print(f"DEBUG: Failed to find method {method_name} for base {base_type}. Mangled: {mangled_name}. Functions: {list(self.functions)[:10]}...", flush=True)
                   raise Exception(f"Method '{method_name}' not found for type '{base_type}'")
 
         if not callee_name:
@@ -1271,6 +1456,7 @@ class SemanticAnalyzer:
         if '::' in callee_name:
             parts = callee_name.rsplit('::', 1)
             prefix = parts[0]
+            prefix = self.resolve_type_name(prefix)
             suffix = parts[1]
             
             # 1. Try Enum Variant

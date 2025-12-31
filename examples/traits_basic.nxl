@@ -1,0 +1,18 @@
+trait Printable {
+    fn print_me(&self);
+}
+
+struct Number {
+    val: i32
+}
+
+impl Printable for Number {
+    fn print_me(&self) {
+        print(self.val);
+    }
+}
+
+fn main() {
+    let n = Number(1234);
+    n.print_me();
+}

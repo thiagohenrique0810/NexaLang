@@ -1,0 +1,22 @@
+trait Speak {
+    fn say(&self);
+}
+
+struct Dog {
+    id: i32
+}
+
+impl Speak for Dog {
+    fn say(&self) {
+        print(111); # Bark
+    }
+}
+
+fn make_speak<T: Speak>(thing: T) {
+    thing.say();
+}
+
+fn main() {
+    let d = Dog(1);
+    make_speak::<Dog>(d);
+}

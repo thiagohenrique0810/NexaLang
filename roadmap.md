@@ -163,10 +163,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [ ] Labeled for circles (`'label: loop`) { }`
 
 ### 6.5 Developer Experience
-- [ ] **Better Error Messages**
-  - [ ] Show file, line, and column numbers
-  - [ ] Pretty-print error context with caret (^) pointing to error
-  - [ ] Suggestion system ("did you mean X?")
+- [x] **Better Error Messages**
+  - [x] Show file, line, and column numbers
+  - [x] Pretty-print error context with caret (^) pointing to error
+  - [x] Suggestion system ("did you mean X?")
   - [ ] Error codes and documentation links
 - [ ] **Warnings System**
   - [ ] Unused variable warnings
@@ -174,11 +174,12 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [ ] Type coercion warnings
 
 ## Phase 7: Advanced Type System 🔧
-- [ ] **Traits (Interfaces)**
-  - [ ] `trait Name { }` syntax
-  - [ ] Trait methods (required and provided)
-  - [ ] `impl Trait for Type` syntax
-  - [ ] Trait bounds in generics: `fn foo<T: Display>(x: T)`
+- [~] **Traits (Interfaces)**
+  - [x] `trait Name { }` syntax
+  - [x] Trait methods (required)
+  - [ ] Trait methods (provided/default)
+  - [x] `impl Trait for Type` syntax
+  - [x] Trait bounds in generics: `fn foo<T: Display>(x: T)`
 - [ ] **Advanced Generics**
   - [ ] Multiple type parameters
   - [ ] Const generics: `Array<T, const N: usize>`
