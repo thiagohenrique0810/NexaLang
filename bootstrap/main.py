@@ -5,6 +5,7 @@ from lexer import Lexer
 import n_parser
 from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef
 from codegen import CodeGen
+from errors import CompilerError
 
 # ... (mangle_ast and resolve_modules don't need changes if imports are updated) ...
 
@@ -86,16 +87,26 @@ def main():
     ast = resolve_modules(ast, os.path.dirname(os.path.abspath(filepath)))
 
     # 3. Semantic Analysis
-    import semantic
-    print(f"DEBUG: semantic loaded from {semantic.__file__}", flush=True)
     from semantic import SemanticAnalyzer
-    print(f"DEBUG: SemanticAnalyzer dir: {dir(SemanticAnalyzer)}", flush=True)
     analyzer = SemanticAnalyzer()
     try:
-        # analyzer.analyze(ast)
-        print("DEBUG: Analysis skipped to check prints", flush=True)
+        analyzer.analyze(ast)
+    except CompilerError as e:
+        print(f"Error: {e.message}")
+        if e.line:
+            lines = source.splitlines()
+            # print(f"DEBUG: Error at line {e.line}, col {e.column}")
+            if 0 <= e.line - 1 < len(lines):
+                 print(f"  --> {filepath}:{e.line}:{e.column}")
+                 print(f"   |")
+                 print(f"{e.line:3} | {lines[e.line-1]}")
+                 print(f"   | {' ' * (e.column-1)}^")
+        if getattr(e, 'hint', None):
+             print(f"  = help: {e.hint}")
+        sys.exit(1)
     except Exception as e:
         print(f"[SEMANTIC ERROR] {e}")
+        # import traceback; traceback.print_exc()
         return
 
     # 4. Code Generation

@@ -1,5 +1,6 @@
 from lexer import Lexer
-from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt
+from errors import CompilerError
 import sys
 import copy
 class SemanticAnalyzer:
@@ -9,6 +10,43 @@ class SemanticAnalyzer:
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
+        self.loop_depth = 0
+
+    def error(self, message, node=None, hint=None):
+        line = node.line if node else None
+        column = node.column if node else None
+        raise CompilerError(message, line, column, hint=hint)
+
+    def levenshtein_distance(self, s1, s2):
+        if len(s1) < len(s2):
+            return self.levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+
+    def suggest_name(self, name, candidates):
+        best_match = None
+        min_dist = float('inf')
+        for candidate in candidates:
+            dist = self.levenshtein_distance(name, candidate)
+            if dist < min_dist:
+                min_dist = dist
+                best_match = candidate
+        
+        # Threshold: allow distance up to 3 or 1/3 length
+        limit = max(3, len(name) // 3)
+        if min_dist <= limit and min_dist < len(name): 
+             return best_match
+        return None
 
     def is_copy_type(self, type_name: str) -> bool:
         """
@@ -26,23 +64,23 @@ class SemanticAnalyzer:
             return True
         return False
 
-    def move_var(self, name: str):
+    def move_var(self, name: str, node=None):
         """
         Marks a variable as moved (consumed) if it is move-only.
         Also enforces: cannot move while borrowed (readers/writer active).
         """
         var_info = self.lookup(name)
         if not var_info:
-            raise Exception(f"Semantic Error: Move of undefined variable '{name}'")
+            self.error(f"Semantic Error: Move of undefined variable '{name}'", node)
 
         if var_info.get('moved'):
-            raise Exception(f"Ownership Error: Use of moved variable '{name}'")
+            self.error(f"Ownership Error: Use of moved variable '{name}'", node)
 
         # Disallow moving while borrowed (bootstrap rule).
         if var_info.get('readers', 0) > 0:
-            raise Exception(f"Borrow Error: Cannot move '{name}' because it is borrowed")
+            self.error(f"Borrow Error: Cannot move '{name}' because it is borrowed", node)
         if var_info.get('writer'):
-            raise Exception(f"Borrow Error: Cannot move '{name}' because it is borrowed mutable")
+            self.error(f"Borrow Error: Cannot move '{name}' because it is borrowed mutable", node)
 
         var_info['moved'] = True
 
@@ -211,7 +249,11 @@ class SemanticAnalyzer:
         
         # 3. Check if member exists
         if node.member not in fields_dict:
-             raise Exception(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'")
+             hint = None
+             suggestion = self.suggest_name(node.member, fields_dict.keys())
+             if suggestion:
+                 hint = f"Did you mean '{suggestion}'?"
+             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node, hint=hint)
         
         # Annotate node for CodeGen
         node.struct_type = lookup_type
@@ -242,7 +284,17 @@ class SemanticAnalyzer:
         
         methods = self.struct_methods[lookup_type]
         if node.method_name not in methods:
-            raise Exception(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'")
+            hint = None
+            suggestion = self.suggest_name(node.method_name, methods.keys())
+            if suggestion:
+                hint = f"Did you mean '{suggestion}'?"
+            try:
+                self.error(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'", node, hint=hint)
+            except CompilerError as e:
+                raise e # Propagate CompilerError
+            except Exception as e:
+                # Fallback if self.error wasn't used or raised generic Exception
+                raise Exception(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'{(' (Hint: ' + hint + ')') if hint else ''}")
         
         method_def = methods[node.method_name]
         
@@ -610,7 +662,48 @@ class SemanticAnalyzer:
         # No debug print
 
 
-    # NOTE: `declare()` removed: use `declare_variable()` everywhere to keep borrow state consistent.
+
+    def visit_ForStmt(self, node):
+        # 1. Analyze Range
+        start_type = self.visit(node.start_expr)
+        end_type = self.visit(node.end_expr)
+        
+        if start_type != 'i32' or end_type != 'i32':
+             raise Exception(f"Type Error: For loop range must be i32, got '{start_type}..{end_type}'")
+             
+        # 2. Scope for Loop Variable
+        self.enter_scope()
+        self.loop_depth += 1
+        
+        # Declare loop variable (immutable in body? usually yes, but for now just standard var)
+        self.declare_variable(node.var_name, 'i32')
+        
+        # 3. Analyze Body
+        for stmt in node.body:
+             self.visit(stmt)
+             
+        self.loop_depth -= 1
+        self.exit_scope()
+
+    def visit_WhileStmt(self, node):
+        if self.visit(node.condition) != 'bool':
+            raise Exception("Type Error: While condition must be bool")
+            
+        self.enter_scope()
+        self.loop_depth += 1
+        for stmt in node.body:
+            self.visit(stmt)
+        self.loop_depth -= 1
+        self.exit_scope()
+
+    def visit_BreakStmt(self, node):
+        if self.loop_depth == 0:
+            raise Exception("Semantic Error: 'break' outside of loop")
+
+    def visit_ContinueStmt(self, node):
+        if self.loop_depth == 0:
+            raise Exception("Semantic Error: 'continue' outside of loop")
+
 
     def visit_FunctionDef(self, node):
         if node.generics:
@@ -785,10 +878,20 @@ class SemanticAnalyzer:
     def visit_VariableExpr(self, node):
         var_info = self.lookup(node.name)
         if not var_info:
-             raise Exception(f"Semantic Error: Undefined variable '{node.name}'")
+             # Gather candidates
+             candidates = []
+             for scope in self.scopes:
+                 candidates.extend(scope.keys())
+             
+             hint = None
+             suggestion = self.suggest_name(node.name, candidates)
+             if suggestion:
+                 hint = f"Did you mean '{suggestion}'?"
+             
+             self.error(f"Semantic Error: Undefined variable '{node.name}'", node, hint=hint)
              
         if var_info['moved']:
-            raise Exception(f"Ownership Error: Use of moved variable '{node.name}'")
+            self.error(f"Ownership Error: Use of moved variable '{node.name}'", node)
             
         ty = var_info['type']
         node.type_name = ty
@@ -993,7 +1096,7 @@ class SemanticAnalyzer:
             for arg in node.args:
                 arg_ty = self.visit(arg)
                 if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                    self.move_var(arg.name)
+                    self.move_var(arg.name, arg)
             self.exit_scope()
             return callee_name  # In an impl<T>, this refers to the current generic type
 
@@ -1012,7 +1115,7 @@ class SemanticAnalyzer:
                  for i, arg in enumerate(node.args):
                       self.visit(arg)
                       if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
-                           self.move_var(arg.name)
+                           self.move_var(arg.name, arg)
                  self.exit_scope()
                  return enum_name
 
@@ -1148,7 +1251,7 @@ class SemanticAnalyzer:
                 if i < len(fn.params):
                     _pname, ptype = fn.params[i]
                     if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
-                        self.move_var(arg.name)
+                        self.move_var(arg.name, arg)
             self.exit_scope()
             return self.function_defs[node.callee].return_type
 
@@ -1160,7 +1263,7 @@ class SemanticAnalyzer:
             for arg in node.args:
                 arg_ty = self.visit(arg)
                 if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                    self.move_var(arg.name)
+                    self.move_var(arg.name, arg)
             self.exit_scope()
             return node.callee
             
@@ -1190,7 +1293,7 @@ class SemanticAnalyzer:
 
                       # Move payload variables if the payload type is move-only
                       if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
-                          self.move_var(arg.name)
+                          self.move_var(arg.name, arg)
                  self.exit_scope()
                  return prefix
             
@@ -1209,7 +1312,7 @@ class SemanticAnalyzer:
                       arg_ty = self.visit(arg)
                       _pname, ptype = fn.params[i]
                       if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
-                           self.move_var(arg.name)
+                           self.move_var(arg.name, arg)
                  self.exit_scope()
                  return fn.return_type
             
@@ -1226,13 +1329,19 @@ class SemanticAnalyzer:
                 for arg in node.args:
                     arg_ty = self.visit(arg)
                     if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                         self.move_var(arg.name)
+                         self.move_var(arg.name, arg)
                 self.exit_scope()
                 return mangled
             
             raise Exception(f"Semantic Error: Unknown function or type '{callee_name}'")
 
-        raise Exception(f"Semantic Error: Unknown function '{node.callee}'")
+        # Gather all functions
+        candidates = list(self.functions) + list(self.function_defs.keys()) + list(self.generic_functions.keys())
+        hint = None
+        suggestion = self.suggest_name(node.callee, candidates)
+        if suggestion:
+             hint = f"Did you mean '{suggestion}'?"
+        self.error(f"Semantic Error: Unknown function '{node.callee}'", node, hint=hint)
 
     def visit_IfStmt(self, node):
         cond_type = self.visit(node.condition)
@@ -1250,56 +1359,7 @@ class SemanticAnalyzer:
                 self.visit(stmt)
             self.exit_scope()
 
-    def visit_ForStmt(self, node):
-        self.enter_scope()
-        
-        start_ty = self.visit(node.start_expr)
-        end_ty = self.visit(node.end_expr)
-        
-        if start_ty != 'i32' or end_ty != 'i32':
-             raise Exception("For loop range must be i32")
-             
-        # mangled names to avoid collision
-        iter_name = f"$iter_{node.var_name}"
-        limit_name = f"$limit_{node.var_name}"
-        
-        # 1. Declare iter and limit
-        iter_decl = VarDecl(iter_name, 'i32', node.start_expr)
-        self.visit(iter_decl)
-        
-        limit_decl = VarDecl(limit_name, 'i32', node.end_expr)
-        self.visit(limit_decl)
-        
-        # 2. While loop body construction
-        body_stmts = []
-        
-        # let user_var = iter
-        user_var = VarDecl(node.var_name, 'i32', VariableExpr(iter_name))
-        body_stmts.append(user_var)
-        
-        body_stmts.extend(node.body)
-        
-        # iter = iter + 1
-        increment = BinaryExpr(VariableExpr(iter_name), 'PLUS', IntegerLiteral(1))
-        # Note: Semantic visit_Assignment expects Assignment node
-        assign_inc = Assignment(VariableExpr(iter_name), increment)
-        body_stmts.append(assign_inc)
-        
-        # 3. While Loop Condition
-        op = 'LTE' if node.inclusive else 'LT'
-        cond = BinaryExpr(VariableExpr(iter_name), op, VariableExpr(limit_name))
-        
-        while_stmt = WhileStmt(cond, body_stmts)
-        self.visit(while_stmt)
-        
-        self.exit_scope()
 
-    def visit_WhileStmt(self, node):
-        self.visit(node.condition)
-        self.enter_scope()
-        for stmt in node.body:
-            self.visit(stmt)
-        self.exit_scope()
 
     def visit_RegionStmt(self, node):
         # No debug print
@@ -1315,7 +1375,7 @@ class SemanticAnalyzer:
         if node.value:
             ret_ty = self.visit(node.value)
             if isinstance(node.value, VariableExpr) and not self.is_copy_type(ret_ty):
-                self.move_var(node.value.name)
+                self.move_var(node.value.name, node.value)
         # Should check against function return type
 
     def substitute_generics(self, node, mapping):

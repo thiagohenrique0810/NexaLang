@@ -48,6 +48,7 @@ class CodeGen:
         self.enum_payloads = {} # name -> {variant: payload_type}
         self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
         self.scopes = []
+        self.loop_stack = [] # Stack of (continue_block, break_block, scope_depth)
 
         # For Vulkan SPIR-V kernels-only, avoid emitting host/runtime helpers
         # (Arena/malloc/printf) because they pull in pointer ops that are not shader-friendly.
@@ -792,11 +793,115 @@ class CodeGen:
         self.emit_scope_drops(self.scopes[-1])
         self.scopes.pop()
 
+    def visit_ForStmt(self, node):
+        # Range Loop: for i in start..end { body }
+        
+        # 1. Initialize Loop Variable
+        start_val = self.visit(node.start_expr)
+        end_val = self.visit(node.end_expr)
+        
+        # Create alloca for loop var
+        func = self.builder.function
+        entry_block = func.entry_basic_block
+        # Insert alloca at top of entry
+        with self.builder.goto_block(entry_block):
+             if entry_block.instructions:
+                  self.builder.position_before(entry_block.instructions[0])
+             loop_var_ptr = self.builder.alloca(ir.IntType(32), name=node.var_name)
+             
+        # Initialize
+        self.builder.store(start_val, loop_var_ptr)
+        
+        # 2. Basic Blocks
+        cond_block = self.builder.append_basic_block(f"for_cond_{node.var_name}")
+        body_block = self.builder.append_basic_block(f"for_body_{node.var_name}")
+        inc_block = self.builder.append_basic_block(f"for_inc_{node.var_name}")
+        end_block = self.builder.append_basic_block(f"for_end_{node.var_name}")
+        
+        self.builder.branch(cond_block)
+        
+        # 3. Condition Block
+        self.builder.position_at_end(cond_block)
+        curr_val = self.builder.load(loop_var_ptr, name=f"{node.var_name}_val")
+        
+        if node.inclusive:
+             cond = self.builder.icmp_signed("<=", curr_val, end_val, name="loop_cond")
+        else:
+             cond = self.builder.icmp_signed("<", curr_val, end_val, name="loop_cond")
+             
+        self.builder.cbranch(cond, body_block, end_block)
+        
+        # 4. Body Block
+        self.builder.position_at_end(body_block)
+        
+        # Enter Scope
+        self.scopes.append({})
+        self.loop_stack.append((inc_block, end_block, len(self.scopes) - 1))
+        
+        # Register loop variable
+        self.scopes[-1][node.var_name] = (loop_var_ptr, 'i32') # i32, no tag needed for primitives
+        
+        for stmt in node.body:
+             self.visit(stmt)
+             
+        # Auto-drop (if we supported break/continue, we would need to handle drops there too)
+        self.emit_scope_drops(self.scopes[-1])
+        
+        self.scopes.pop()
+        self.loop_stack.pop()
+        
+        self.builder.branch(inc_block)
+        
+        # 5. Increment Block
+        self.builder.position_at_end(inc_block)
+        curr_val_2 = self.builder.load(loop_var_ptr)
+        one = ir.Constant(ir.IntType(32), 1)
+        next_val = self.builder.add(curr_val_2, one)
+        self.builder.store(next_val, loop_var_ptr)
+        self.builder.branch(cond_block)
+        
+        # 6. End Block
+        self.builder.position_at_end(end_block)
+
+    def visit_BreakStmt(self, node):
+        if not self.loop_stack:
+            raise Exception("Break statement outside of loop")
+        _, break_block, loop_scope_depth = self.loop_stack[-1]
+        
+        # Unwind scopes until loop scope
+        # Current depth: len(self.scopes) - 1
+        # Loop scope depth: loop_scope_depth
+        # We need to drop everything from current down to loop_scope_depth (inclusive of loop scope vars if breaking out)
+        # Yes, breaking exits the loop scope too.
+        
+        current_depth = len(self.scopes) - 1
+        while current_depth >= loop_scope_depth:
+             self.emit_scope_drops(self.scopes[current_depth])
+             current_depth -= 1
+             
+        self.builder.branch(break_block)
+
+    def visit_ContinueStmt(self, node):
+        if not self.loop_stack:
+            raise Exception("Continue statement outside of loop")
+        continue_block, _, loop_scope_depth = self.loop_stack[-1]
+        
+        # Unwind scopes until loop scope
+        # Continue stays IN the loop, but exits current iteration scopes (e.g. if inside If)
+        # It jumps to continue_block (inc or cond).
+        # It exits the loop body scope? Yes, eventually re-enters or incs.
+        # So we drop everything down to loop_scope_depth.
+        
+        current_depth = len(self.scopes) - 1
+        while current_depth >= loop_scope_depth:
+             self.emit_scope_drops(self.scopes[current_depth])
+             current_depth -= 1
+             
+        self.builder.branch(continue_block)
     def visit_BlockStmt(self, node):
         self.scopes.append({})
         for stmt in node.stmts:
-            self.visit(stmt)
-
+             self.visit(stmt)
         # Auto-drop variables in this scope
         self.emit_scope_drops(self.scopes[-1])
         self.scopes.pop()
@@ -1165,12 +1270,20 @@ class CodeGen:
 
         # Loop Block
         self.builder.position_at_end(loop_bb)
+        
+        self.scopes.append({})
+        self.loop_stack.append((cond_bb, end_bb, len(self.scopes) - 1))
+        
         for stmt in node.body:
             self.visit(stmt)
+            
+        self.emit_scope_drops(self.scopes[-1])
+        self.scopes.pop()
+        self.loop_stack.pop()
+        
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_bb) # Loop back to condition
-
-        # End Block
+            
         # End Block
         self.builder.position_at_end(end_bb)
 

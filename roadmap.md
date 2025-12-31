@@ -152,15 +152,15 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [ ] Directory-based modules (`mod.nxl` or `mod/mod.nxl`)
 
 ### 6.4 Control Flow Enhancements
-- [ ] **For Loops**
-  - [ ] Range syntax: `0..10`, `0..=10` (inclusive)
+- [~] **For Loops**
+  - [x] Range syntax: `0..10`, `0..=10` (inclusive)
   - [ ] `for item in collection` syntax
   - [ ] Iterator trait (simple version)
-  - [ ] Desugar to while loops in codegen
-- [ ] **Loop Control**
-  - [ ] `break` statement
-  - [ ] `continue` statement
-  - [ ] Labeled loops: `'outer: loop { }`
+  - [x] Native Codegen implementation (direct LLVM IR)
+- [x] **Loop Control**
+  - [x] `break` statement
+  - [x] `continue` statement
+  - [ ] Labeled for circles (`'label: loop`) { }`
 
 ### 6.5 Developer Experience
 - [ ] **Better Error Messages**

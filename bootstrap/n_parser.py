@@ -1,5 +1,7 @@
 class ASTNode:
-    pass
+    def __init__(self):
+        self.line = 0
+        self.column = 0
 
 class Assignment(ASTNode):
     def __init__(self, target, value):
@@ -213,6 +215,12 @@ class RegionStmt(ASTNode):
         self.name = name
         self.body = body
 
+class BreakStmt(ASTNode):
+    pass
+
+class ContinueStmt(ASTNode):
+    pass
+
 class ModDecl(ASTNode):
     def __init__(self, name, is_pub=False):
         self.name = name
@@ -337,7 +345,11 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return StructDef(name, fields, generics, is_pub=is_pub)
+        start_token = self.tokens[self.pos-1] # AFTER consume
+        node = StructDef(name, fields, generics, is_pub=is_pub)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_enum(self, is_pub=False):
         self.consume('ENUM')
@@ -371,6 +383,7 @@ class Parser:
         return EnumDef(name, variants, generics, is_pub=is_pub)
 
     def parse_function(self, is_kernel=False, is_pub=False):
+        start_token = self.peek()
         if is_kernel:
             self.consume('KERNEL')
         self.consume('FN')
@@ -430,7 +443,10 @@ class Parser:
             if self.peek().type == 'SEMICOLON':
                 self.consume('SEMICOLON')
         self.consume('RBRACE')
-        return FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub)
+        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
 
 
@@ -448,6 +464,14 @@ class Parser:
             return self.parse_for()
         elif token.type == 'MATCH':
             return self.parse_match()
+        elif token.type == 'BREAK':
+            self.consume('BREAK')
+            if self.peek().type == 'SEMICOLON': self.consume('SEMICOLON')
+            return BreakStmt()
+        elif token.type == 'CONTINUE':
+            self.consume('CONTINUE')
+            if self.peek().type == 'SEMICOLON': self.consume('SEMICOLON')
+            return ContinueStmt()
         elif token.type == 'REGION':
             return self.parse_region()
         elif token.type == 'LBRACE':
@@ -476,7 +500,7 @@ class Parser:
             return expr
 
     def parse_var_decl(self):
-        self.consume('LET')
+        start_token = self.consume('LET')
         
         # Check for optional 'mut'
         is_mut = False
@@ -497,6 +521,8 @@ class Parser:
         # Create VarDecl with mutability flag
         var_decl = VarDecl(name, type_name, initializer)
         var_decl.is_mut = is_mut
+        var_decl.line = start_token.line
+        var_decl.column = start_token.column
         return var_decl
 
     def parse_type(self):
@@ -576,15 +602,18 @@ class Parser:
              raise Exception(f"Expected type, found {self.peek()}")
              
     def parse_return(self):
-        self.consume('RETURN')
+        start_token = self.consume('RETURN')
         value = None
         if self.peek().type != 'SEMICOLON':
             value = self.parse_expression()
-        return ReturnStmt(value)
+        node = ReturnStmt(value)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
         
     def parse_match(self):
         # match expr { Variant(var) => stmt, ... }
-        self.consume('MATCH')
+        start_token = self.consume('MATCH')
         value = self.parse_expression()
         self.consume('LBRACE')
         cases = []
@@ -613,10 +642,13 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return MatchExpr(value, cases)
+        node = MatchExpr(value, cases)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_if(self):
-        self.consume('IF')
+        start_token = self.consume('IF')
         self.consume('LPAREN')
         cond = self.parse_expression()
         self.consume('RPAREN')
@@ -640,10 +672,13 @@ class Parser:
                      self.consume('SEMICOLON')
             self.consume('RBRACE')
             
-        return IfStmt(cond, then_branch, else_branch)
+        node = IfStmt(cond, then_branch, else_branch)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_for(self):
-        self.consume('FOR')
+        start_token = self.consume('FOR')
         var_name = self.consume('IDENTIFIER').value
         self.consume('IN')
         
@@ -666,10 +701,13 @@ class Parser:
                  self.consume('SEMICOLON')
         self.consume('RBRACE')
         
-        return ForStmt(var_name, start_expr, end_expr, body, inclusive)
+        node = ForStmt(var_name, start_expr, end_expr, body, inclusive)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_while(self):
-        self.consume('WHILE')
+        start_token = self.consume('WHILE')
         self.consume('LPAREN')
         cond = self.parse_expression()
         self.consume('RPAREN')
@@ -682,10 +720,13 @@ class Parser:
                  self.consume('SEMICOLON')
         self.consume('RBRACE')
         
-        return WhileStmt(cond, body)
+        node = WhileStmt(cond, body)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_region(self):
-        self.consume('REGION')
+        start_token = self.consume('REGION')
         name = self.consume('IDENTIFIER').value
         self.consume('LBRACE')
         body = []
@@ -694,7 +735,10 @@ class Parser:
             if self.peek().type == 'SEMICOLON':
                  self.consume('SEMICOLON')
         self.consume('RBRACE')
-        return RegionStmt(name, body)
+        node = RegionStmt(name, body)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_expression_stmt(self):
         expr = self.parse_expression()
@@ -753,11 +797,12 @@ class Parser:
         return -1
 
     def parse_primary(self):
-        token = self.peek()
+        start_token = self.peek()
+        token = start_token
         # No debug print
         expr = None
         
-        if token.type == 'SELF':
+        if start_token.type == 'SELF':
             self.consume('SELF')
             expr = VariableExpr('self')
         elif token.type == 'NUMBER':
@@ -931,6 +976,10 @@ class Parser:
             else:
                 break
                 
+        if expr:
+            expr.line = start_token.line
+            expr.column = start_token.column
+            
         return expr
 
     def parse_call(self):

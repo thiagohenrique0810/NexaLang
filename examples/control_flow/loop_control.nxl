@@ -1,0 +1,33 @@
+fn main() {
+    print("Testing Break in For Loop (should print 0, 1):");
+    for i in 0..5 {
+        if (i == 2) {
+            break;
+        }
+        print(i);
+    }
+    
+    print("Testing Continue in For Loop (should skip 1):");
+    for j in 0..3 {
+        if (j == 1) {
+            continue;
+        }
+        print(j);
+    }
+
+    print("Testing Break in While Loop (should print 0):");
+    let k = 0;
+    while (k < 5) {
+        if (k == 1) {
+            break;
+        }
+        print(k);
+        k = k + 1;
+    }
+    
+    # Note: 'continue' in while loop is tricky if inc is at end of body.
+    # Logic needs to ensure increment happens or is skipped correctly if manual.
+    # In 'for' loop, continue jumps to inc_block so it's safe.
+    # In 'while', continue usually jumps to cond_block. If inc is inside body, it might be skipped -> infinite loop.
+    # User must handle increment manually before continue in while.
+}

@@ -1,0 +1,9 @@
+struct Rect {
+    width: i32,
+    height: i32
+}
+
+fn main() {
+    let r = Rect(10, 20);
+    let h = r.hight;
+}

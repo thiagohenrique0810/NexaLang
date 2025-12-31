@@ -1,144 +1,160 @@
 import re
 
 class Token:
-    def __init__(self, type, value):
+    def __init__(self, type, value, line=1, column=1):
         self.type = type
         self.value = value
+        self.line = line
+        self.column = column
 
     def __repr__(self):
-        return f"Token({self.type}, {self.value})"
+        return f"Token({self.type}, {self.value}, {self.line}:{self.column})"
 
 class Lexer:
     def __init__(self, source):
         self.source = source
         self.pos = 0
         self.length = len(source)
+        self.line = 1
+        self.column = 1
     
+    def advance(self, n=1):
+        for _ in range(n):
+            if self.pos < self.length:
+                if self.source[self.pos] == '\n':
+                    self.line += 1
+                    self.column = 1
+                else:
+                    self.column += 1
+                self.pos += 1
+
     def tokenize(self):
         tokens = []
         while self.pos < self.length:
             char = self.source[self.pos]
+            start_line = self.line
+            start_col = self.column
             
             # Skip whitespace
             if char.isspace():
-                self.pos += 1
+                self.advance()
                 continue
             # Skip comments
             elif char == '#':
                 while self.pos < self.length and self.source[self.pos] != '\n':
-                    self.pos += 1
+                    self.advance()
                 # If the comment ends with a newline, consume it too
                 if self.pos < self.length and self.source[self.pos] == '\n':
-                    self.pos += 1
+                    self.advance()
                 continue
             
             # Punctuation
             if char == ':' and self.pos + 1 < self.length and self.source[self.pos+1] == ':':
-                tokens.append(Token('DOUBLE_COLON', '::'))
-                self.pos += 2
+                tokens.append(Token('DOUBLE_COLON', '::', start_line, start_col))
+                self.advance(2)
                 continue
 
             if char == '(':
-                tokens.append(Token('LPAREN', '('))
-                self.pos += 1
+                tokens.append(Token('LPAREN', '(', start_line, start_col))
+                self.advance()
             elif char == ')':
-                tokens.append(Token('RPAREN', ')'))
-                self.pos += 1
+                tokens.append(Token('RPAREN', ')', start_line, start_col))
+                self.advance()
             elif char == '[':
-                tokens.append(Token('LBRACKET', '['))
-                self.pos += 1
+                tokens.append(Token('LBRACKET', '[', start_line, start_col))
+                self.advance()
             elif char == ']':
-                tokens.append(Token('RBRACKET', ']'))
-                self.pos += 1
+                tokens.append(Token('RBRACKET', ']', start_line, start_col))
+                self.advance()
             elif char == '{':
-                tokens.append(Token('LBRACE', '{'))
-                self.pos += 1
+                tokens.append(Token('LBRACE', '{', start_line, start_col))
+                self.advance()
             elif char == '}':
-                tokens.append(Token('RBRACE', '}'))
-                self.pos += 1
+                tokens.append(Token('RBRACE', '}', start_line, start_col))
+                self.advance()
             elif char == '.':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '.':
                     if self.pos + 2 < self.length and self.source[self.pos+2] == '=':
-                        tokens.append(Token('DOT_DOT_EQ', '..='))
-                        self.pos += 3
+                        tokens.append(Token('DOT_DOT_EQ', '..=', start_line, start_col))
+                        self.advance(3)
                     else:
-                        tokens.append(Token('DOT_DOT', '..'))
-                        self.pos += 2
+                        tokens.append(Token('DOT_DOT', '..', start_line, start_col))
+                        self.advance(2)
                 else:
-                    tokens.append(Token('DOT', '.'))
-                    self.pos += 1
+                    tokens.append(Token('DOT', '.', start_line, start_col))
+                    self.advance()
             elif char == ':':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == ':':
-                    tokens.append(Token('DOUBLE_COLON', '::'))
-                    self.pos += 2
+                    tokens.append(Token('DOUBLE_COLON', '::', start_line, start_col))
+                    self.advance(2)
                 else:
-                    tokens.append(Token('COLON', ':'))
-                    self.pos += 1
+                    tokens.append(Token('COLON', ':', start_line, start_col))
+                    self.advance()
             elif char == ',':
-                tokens.append(Token('COMMA', ','))
-                self.pos += 1
+                tokens.append(Token('COMMA', ',', start_line, start_col))
+                self.advance()
             elif char == ';':
-                tokens.append(Token('SEMICOLON', ';'))
-                self.pos += 1
+                tokens.append(Token('SEMICOLON', ';', start_line, start_col))
+                self.advance()
             
             # Operators
             elif char == '=':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
-                   tokens.append(Token('EQEQ', '=='))
-                   self.pos += 2
+                   tokens.append(Token('EQEQ', '==', start_line, start_col))
+                   self.advance(2)
                 elif self.pos + 1 < self.length and self.source[self.pos+1] == '>':
-                   tokens.append(Token('FAT_ARROW', '=>'))
-                   self.pos += 2
+                   tokens.append(Token('FAT_ARROW', '=>', start_line, start_col))
+                   self.advance(2)
                 else:
-                   tokens.append(Token('EQ', '='))
-                   self.pos += 1
+                   tokens.append(Token('EQ', '=', start_line, start_col))
+                   self.advance()
             elif char == '<':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
-                   tokens.append(Token('LTE', '<='))
-                   self.pos += 2
+                   tokens.append(Token('LTE', '<=', start_line, start_col))
+                   self.advance(2)
                 else:
-                   tokens.append(Token('LT', '<'))
-                   self.pos += 1
+                   tokens.append(Token('LT', '<', start_line, start_col))
+                   self.advance()
             elif char == '>':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
-                   tokens.append(Token('GTE', '>='))
-                   self.pos += 2
+                   tokens.append(Token('GTE', '>=', start_line, start_col))
+                   self.advance(2)
                 else:
-                   tokens.append(Token('GT', '>'))
-                   self.pos += 1
+                   tokens.append(Token('GT', '>', start_line, start_col))
+                   self.advance()
             elif char == '+':
-                tokens.append(Token('PLUS', '+'))
-                self.pos += 1
+                tokens.append(Token('PLUS', '+', start_line, start_col))
+                self.advance()
             elif char == '-':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '>':
-                    tokens.append(Token('THIN_ARROW', '->'))
-                    self.pos += 2
+                    tokens.append(Token('THIN_ARROW', '->', start_line, start_col))
+                    self.advance(2)
                 else:
-                    tokens.append(Token('MINUS', '-'))
-                    self.pos += 1
+                    tokens.append(Token('MINUS', '-', start_line, start_col))
+                    self.advance()
             elif char == '*':
-                tokens.append(Token('STAR', '*'))
-                self.pos += 1
+                tokens.append(Token('STAR', '*', start_line, start_col))
+                self.advance()
             elif char == '/':
-                tokens.append(Token('SLASH', '/'))
-                self.pos += 1
+                tokens.append(Token('SLASH', '/', start_line, start_col))
+                self.advance()
             elif char == '%':
-                tokens.append(Token('PERCENT', '%'))
-                self.pos += 1
+                tokens.append(Token('PERCENT', '%', start_line, start_col))
+                self.advance()
             elif char == '&':
-                tokens.append(Token('AMPERSAND', '&'))
-                self.pos += 1
+                tokens.append(Token('AMPERSAND', '&', start_line, start_col))
+                self.advance()
             elif char == '!':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
-                   tokens.append(Token('NEQ', '!='))
-                   self.pos += 2
+                   tokens.append(Token('NEQ', '!=', start_line, start_col))
+                   self.advance(2)
                 else:
-                   tokens.append(Token('BANG', '!'))
-                   self.pos += 1
+                   tokens.append(Token('BANG', '!', start_line, start_col))
+                   self.advance()
 
             # String Literals
             elif char == '"':
-                self.pos += 1
+                self.advance()
                 value = ""
                 while self.pos < self.length:
                     if self.source[self.pos] == '"':
@@ -155,26 +171,26 @@ class Lexer:
                             value += '"'
                         else:
                             value += '\\' + esc
-                        self.pos += 2
+                        self.advance(2)
                     else:
                         value += self.source[self.pos]
-                        self.pos += 1
-                tokens.append(Token('STRING', value))
-                self.pos += 1
+                        self.advance()
+                tokens.append(Token('STRING', value, start_line, start_col))
+                self.advance()
 
             # Char Literals: 'a', '\n', '\'', '\\', '\x41'
             elif char == "'":
-                self.pos += 1  # consume opening '
+                self.advance()  # consume opening '
                 if self.pos >= self.length:
-                    raise Exception("Unterminated char literal")
+                    raise Exception(f"Unterminated char literal at {start_line}:{start_col}")
 
                 c = self.source[self.pos]
                 if c == '\\':
-                    self.pos += 1
+                    self.advance()
                     if self.pos >= self.length:
-                        raise Exception("Unterminated char escape")
+                        raise Exception(f"Unterminated char escape at {start_line}:{start_col}")
                     esc = self.source[self.pos]
-                    self.pos += 1
+                    self.advance()
                     if esc == 'n':
                         codepoint = ord('\n')
                     elif esc == 't':
@@ -192,29 +208,29 @@ class Lexer:
                     elif esc == 'x':
                         # \xNN
                         if self.pos + 1 >= self.length:
-                            raise Exception("Invalid \\x escape in char literal")
+                            raise Exception(f"Invalid \\x escape in char literal at {start_line}:{start_col}")
                         h1 = self.source[self.pos]
                         h2 = self.source[self.pos + 1]
                         if not re.match(r"[0-9a-fA-F]", h1) or not re.match(r"[0-9a-fA-F]", h2):
-                            raise Exception("Invalid \\x escape in char literal")
+                            raise Exception(f"Invalid \\x escape in char literal at {start_line}:{start_col}")
                         codepoint = int(h1 + h2, 16)
-                        self.pos += 2
+                        self.advance(2)
                     else:
-                        raise Exception(f"Unknown char escape: \\{esc}")
+                        raise Exception(f"Unknown char escape: \\{esc} at {start_line}:{start_col}")
                 else:
                     codepoint = ord(c)
-                    self.pos += 1
+                    self.advance()
 
                 if self.pos >= self.length or self.source[self.pos] != "'":
-                    raise Exception("Unterminated char literal (missing closing ')")
-                self.pos += 1  # consume closing '
-                tokens.append(Token('CHAR', str(codepoint)))
+                    raise Exception(f"Unterminated char literal (missing closing ') at {start_line}:{start_col}")
+                self.advance()  # consume closing '
+                tokens.append(Token('CHAR', str(codepoint), start_line, start_col))
             
             # Numbers: integer or float (e.g. 123, 3.14)
             elif char.isdigit():
                 start = self.pos
                 while self.pos < self.length and self.source[self.pos].isdigit():
-                    self.pos += 1
+                    self.advance()
 
                 is_float = False
                 # Float: digits '.' digits
@@ -224,66 +240,34 @@ class Lexer:
                     and self.source[self.pos + 1].isdigit()
                 ):
                     is_float = True
-                    self.pos += 1  # consume '.'
+                    self.advance()  # consume '.'
                     while self.pos < self.length and self.source[self.pos].isdigit():
-                        self.pos += 1
+                        self.advance()
 
                 value = self.source[start:self.pos]
-                tokens.append(Token('FLOAT' if is_float else 'NUMBER', value))
+                tokens.append(Token('FLOAT' if is_float else 'NUMBER', value, start_line, start_col))
 
             # Identifiers and Keywords
             elif char.isalpha() or char == '_':
                 start = self.pos
                 while self.pos < self.length and (self.source[self.pos].isalnum() or self.source[self.pos] == '_'):
-                    self.pos += 1
+                    self.advance()
                 value = self.source[start:self.pos]
-                if value == 'fn':
-                    tokens.append(Token('FN', value))
-                elif value == 'kernel':
-                     tokens.append(Token('KERNEL', value))
-                elif value == 'struct':
-                     tokens.append(Token('STRUCT', value))
-                elif value == 'enum':
-                     tokens.append(Token('ENUM', value))
-                elif value == 'region':
-                     tokens.append(Token('REGION', value))
-                elif value == 'let':
-                    tokens.append(Token('LET', value))
-                elif value == 'return':
-                    tokens.append(Token('RETURN', value))
-                elif value == 'if':
-                    tokens.append(Token('IF', value))
-                elif value == 'else':
-                    tokens.append(Token('ELSE', value))
-                elif value == 'while':
-                    tokens.append(Token('WHILE', value))
-                elif value == 'match':
-                    tokens.append(Token('MATCH', value))
-                elif value == 'true':
-                    tokens.append(Token('TRUE', value))
-                elif value == 'false':
-                    tokens.append(Token('FALSE', value))
-                elif value == 'mut':
-                    tokens.append(Token('MUT', value))
-                elif value == 'impl':
-                    tokens.append(Token('IMPL', value))
-                elif value == 'self':
-                    tokens.append(Token('SELF', value))
-                elif value == 'or':
-                    tokens.append(Token('OR', value))
-                elif value == 'and':
-                    tokens.append(Token('AND', value))
-                elif value == 'mod':
-                    tokens.append(Token('MOD', value))
-                elif value == 'pub':
-                    tokens.append(Token('PUB', value))
-                elif value == 'for':
-                    tokens.append(Token('FOR', value))
-                elif value == 'in':
-                    tokens.append(Token('IN', value))
-                else:
-                    tokens.append(Token('IDENTIFIER', value))
+                
+                # Keywords map
+                keywords = {
+                    'fn': 'FN', 'kernel': 'KERNEL', 'struct': 'STRUCT', 'enum': 'ENUM',
+                    'region': 'REGION', 'let': 'LET', 'return': 'RETURN', 'if': 'IF',
+                    'else': 'ELSE', 'while': 'WHILE', 'match': 'MATCH', 'true': 'TRUE',
+                    'false': 'FALSE', 'mut': 'MUT', 'impl': 'IMPL', 'self': 'SELF',
+                    'or': 'OR', 'and': 'AND', 'mod': 'MOD', 'pub': 'PUB', 'for': 'FOR',
+                    'in': 'IN', 'break': 'BREAK', 'continue': 'CONTINUE'
+                }
+                
+                type_name = keywords.get(value, 'IDENTIFIER')
+                tokens.append(Token(type_name, value, start_line, start_col))
+
             else:
-                raise Exception(f"Unexpected character: {char} at pos {self.pos}")
+                raise Exception(f"Unexpected character: {char} at {start_line}:{start_col}")
                 
         return tokens

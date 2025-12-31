@@ -1,0 +1,7 @@
+struct Box { val: i32 }
+
+fn main() {
+    let b = Box { val: 10 };
+    let b2 = b;
+    let b3 = b;
+}
