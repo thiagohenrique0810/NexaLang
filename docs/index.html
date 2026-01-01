@@ -28,6 +28,7 @@
                     <li><a href="#ponteiros">Ponteiros</a></li>
                     <li><a href="#stdlib">Standard Library</a></li>
                     <li><a href="#ferramentas">Ferramentas</a></li>
+                    <li><a href="#metaprogramacao">Metaprogramação & Testes</a></li>
                     <li><a href="#exemplos">Exemplos</a></li>
                 </ul>
             </nav>
@@ -35,7 +36,7 @@
 
         <main class="main-content">
             <div class="header">
-                <h1>NexaLang <span class="badge badge-version">v0.1</span> <span class="badge badge-status">Em Desenvolvimento</span></h1>
+                <h1>NexaLang <span class="badge badge-version">v0.5</span> <span class="badge badge-status">Auto-Hospedada</span></h1>
                 <p>A Linguagem Universal de Sistemas - Combinando segurança moderna com poder de baixo nível</p>
             </div>
 
@@ -77,25 +78,36 @@
             </section>
 
             <section id="instalacao">
-                <h2>🛠️ Instalação</h2>
-                <p>Atualmente, NexaLang está em fase de desenvolvimento. O compilador bootstrap está disponível em Python.</p>
+                <h2>🛠️ Instalação Global</h2>
+                <p>NexaLang agora conta com um comando CLI unificado para facilitar o desenvolvimento.</p>
 
                 <h3>Requisitos</h3>
                 <ul>
-                    <li>Python 3.8+</li>
-                    <li>LLVM (para geração de código)</li>
-                    <li>SPIRV-Tools (opcional, para suporte SPIR-V)</li>
+                    <li><strong>LLVM / Clang</strong> (v15+ recomendado)</li>
+                    <li><strong>Python 3.8+</strong> (para o gerenciador de build)</li>
                 </ul>
 
-                <h3>Uso Básico</h3>
+                <h3>Configuração no Windows</h3>
+                <ol>
+                    <li>Abra as <strong>Variáveis de Ambiente</strong> do sistema.</li>
+                    <li>Adicione o caminho da pasta raiz do NexaLang ao seu <code>Path</code> de usuário.</li>
+                    <li>Reinicie o terminal.</li>
+                </ol>
+
+                <h3>Configuração no Linux / macOS</h3>
+                <pre><code># Na pasta do projeto
+chmod +x nxc
+sudo ln -s $(pwd)/nxc /usr/local/bin/nxc</code></pre>
+
+                <h3>Uso da CLI</h3>
                 <pre><code># Compilar e executar um arquivo
-python nx.py run examples/hello.nxl
+nxc run examples/hello.nxl
 
-# Compilar para LLVM IR
-python bootstrap/main.py examples/hello.nxl --emit ll --out output.ll
+# Compilar para binário nativo otimizado
+nxc build main.nxl --opt O3 --out meu_programa.exe
 
-# Compilar para SPIR-V (GPU)
-python bootstrap/main.py examples/gpu_kernel.nxl --target spirv --emit spv --out kernel.spv</code></pre>
+# Rodar todos os testes unitários
+nxc test meu_codigo.nxl</code></pre>
             </section>
 
             <section id="sintaxe">
@@ -120,9 +132,10 @@ counter = counter + 1</code></pre>
                 <h3>Comentários</h3>
                 <pre><code># Comentário de linha única
 
-# Comentários multi-linha
-# são feitos com múltiplas linhas
-# começando com #</code></pre>
+/* 
+   Comentário de múltiplas linhas
+   (Estilo C)
+*/</code></pre>
             </section>
 
             <section id="tipos">
@@ -557,6 +570,30 @@ python nx.py val spirv kernel.spv</code></pre>
                     <li><strong>Targets:</strong> Native, SPIR-V (OpenCL/Vulkan)</li>
                     <li><strong>Output:</strong> LLVM IR (.ll), SPIR-V (.spv), Binário nativo</li>
                 </ul>
+            </section>
+
+            <section id="metaprogramacao">
+                <h2>🧪 Metaprogramação & Testes</h2>
+                
+                <h3>Atributos</h3>
+                <p>NexaLang utiliza atributos <code>@[nome]</code> para anexar metadados e comportamentos especiais a funções e estruturas.</p>
+
+                <h3>Testes Unitários</h3>
+                <p>Marque funções com <code>@[test]</code> para incluí-las no runner de testes integrado.</p>
+                <pre><code>@[test]
+fn test_soma() {
+    assert(1 + 1 == 2, "Erro na soma")
+}</code></pre>
+
+                <h3>Derivação Automática</h3>
+                <p>Use <code>@[derive(Debug)]</code> para gerar automaticamente métodos úteis, como o <code>debug_print()</code>.</p>
+                <pre><code>@[derive(Debug)]
+struct Point { x: i32, y: i32 }
+
+fn main() {
+    let p = Point(10, 20)
+    p.debug_print() # Saída: Point { x: 10, y: 20 }
+}</code></pre>
             </section>
 
             <section id="exemplos">

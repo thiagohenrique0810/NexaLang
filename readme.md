@@ -2,171 +2,79 @@
 
 **The Universal Systems Language**
 
-![NexaLang Badge](https://img.shields.io/badge/NexaLang-v0.1-blueviolet?style=for-the-badge) ![Status](https://img.shields.io/badge/Status-In_Development-orange?style=for-the-badge)
+![NexaLang Badge](https://img.shields.io/badge/NexaLang-v0.5-blueviolet?style=for-the-badge) ![Status](https://img.shields.io/badge/Status-Self--Hosted-green?style=for-the-badge)
 
-NexaLang is a modern, high-performance systems programming language designed to unify CPU and GPU computing. It combines the safety of modern languages with the raw power of low-level control, all without a garbage collector.
+NexaLang is a modern, high-performance systems programming language designed to unify CPU and GPU computing. It combines the safety of modern languages with the raw power of low-level control, featuring a **self-hosted compiler** and native binary generation.
 
 ---
 
 ## 🚀 Key Features
 
 ### 🧠 Hybrid Memory Management
-Safe by default, manual when you need it. NexaLang uses **Affine Ownership** to prevent leaks and data races at compile time, but allows explicit **Region-based** management and `unsafe` blocks for hardware drivers.
+Safe by default, manual when you need it. NexaLang uses **Affine Ownership** and **RAII (Automatic Drop)** to prevent leaks at compile time, while offering **Region-based Arenas** for high-performance allocations.
 
 ### ⚡ Native GPU Kernels
-Stop writing CUDA C++ strings in your code. NexaLang treats the GPU as a first-class citizen. Write kernels directly in standard NexaLang syntax and dispatch them seamlessly.
+Write kernels directly in NexaLang. Treat the GPU as a first-class citizen with seamless dispatch and SPIR-V/Vulkan support.
 
 ```nexalang
 kernel fn compute_physics(particles: Buffer<Particle>) {
-    let i = gpu::global_id().x
-    // ... logic runs on GPU ...
+    let i = gpu::global_id()
+    # ... logic runs on GPU ...
 }
 ```
 
-### 🔌 Zero-Cost Interop
-Link directly with C and C++ libraries with no overhead. Generate Python and JavaScript bindings automatically with the `nx` toolchain.
+### 🔌 C Interop & FFI
+Zero-overhead linking with C libraries. Call `malloc`, `printf`, or any system API directly with the `extern "C"` block.
 
----
-
-## 📄 Technical Specification
-
-For a deep dive into the architecture, memory model, and syntax, please read the **[Official Whitepaper](whitepaper.md)**.
+### 🛠️ Professional Tooling
+- **Integrated Test Framework**: Mark functions with `@[test]` and run them with `nxc test`.
+- **Automatic Derivation**: Generate boilerplate like `debug_print()` automatically with `@[derive(Debug)]`.
+- **Function Overloading**: Multiple functions with the same name, resolved by parameter types.
 
 ---
 
 ## 🛠️ Getting Started
 
-*Current Status: **Design & Prototyping Phase***
+### Requirements
+- **LLVM / Clang**: Essential for compilation and linking. (Recommended: version 15+).
+- **Python 3.8+**: Required for the bootstrap CLI and build tools.
 
-We are currently implementing the `nxc` bootstrap compiler. Stay tuned for version 0.1!
+### Global Installation
 
+#### Windows
+1. Add the NexaLang root directory (`Y:\WWW\NexaLang`) to your **User PATH** environment variable.
+2. You can now use the `nxc` command from any CMD or PowerShell window.
+
+#### Linux / macOS
+1. Create a symbolic link to the `nxc` wrapper:
+   ```bash
+   chmod +x nxc
+   sudo ln -s $(pwd)/nxc /usr/local/bin/nxc
+   ```
+
+### Basic Commands
 ```bash
-# Future usage
-nx new my-project
-nx run
+# Compile and run a file immediately
+nxc run examples/hello.nxl
+
+# Build a standalone executable with O3 optimization
+nxc build main.nxl --opt O3 --out my_app.exe
+
+# Run integrated unit tests
+nxc test examples/test_example.nxl
 ```
 
 ---
 
-## 🧩 SPIR-V Backend (Bootstrap)
-
-The bootstrap compiler can **emit LLVM IR prepared for SPIR-V** and can optionally **emit `.spv`** if you have external tools installed.
-
-### Generate SPIR-V-flavored LLVM IR
-
-```bash
-python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit ll --out output.spirv.ll
-```
-
-### Emit `.spv` (requires external tools)
-
-Preferred: `llc` with SPIR-V targets enabled (LLVM 20+).
-
-Fallback: `llvm-as` + `llvm-spirv` (SPIRV-LLVM-Translator).
-
-```bash
-python bootstrap/main.py examples/gpu_dispatch.nxl --target spirv --emit spv --out output.spv
-```
-
-### Check toolchain
-
-```bash
-python tools/check_spirv_toolchain.py
-```
-
-### Activate toolchain (this repo)
-
-If you created the environment under `Y:\tools\nexalang-spirv`, you can activate it for the current PowerShell session:
-
-```powershell
-.\tools\activate_spirv_env.ps1
-```
-
-### Vulkan environment (experimental)
-
-You can switch the SPIR-V environment to Vulkan compute:
-
-```powershell
-python bootstrap\main.py examples\gpu_kernel_vulkan_spirv.nxl --target spirv --spirv-env vulkan --spirv-local-size 8,1,1 --emit spv --out fill_vulkan.spv
-spirv-dis fill_vulkan.spv | Select-String -Pattern "OpCapability|OpMemoryModel|OpEntryPoint|OpExecutionMode"
-spirv-val fill_vulkan.spv
-```
-
-Notes:
-- The LLVM SPIR-V backend may emit `OpPtrAccessChain` for buffer indexing. The bootstrap emitter will patch this to `OpAccessChain` for `__nexa_*_data` StorageBuffer variables when `spirv-as` is available (required for Vulkan validation).
-- When `--spirv-vulkan-var-pointers on` (default) and `spirv-as` is available, the bootstrap emitter may also inject `SPV_KHR_variable_pointers` + `VariablePointers*` capabilities if any remaining `OpPtrAccessChain` exists.
-- If you don't have `spirv-as`, install SPIRV-Tools and ensure it is in PATH.
-- Vulkan bindings are assigned deterministically by name: `*_len` first, then `*_data`, then others (per kernel/arg).
+## 🎨 VSCode Integration
+The official extension provides syntax highlighting, snippets, and integrated error reporting.
+- Install from `vscode-nexalang/` folder.
+- Supports `fn`, `struct`, `test`, and `main` snippets.
 
 ---
 
-## 🛠️ `nx` CLI (Bootstrap)
-
-A small helper CLI to run common tasks:
-
-```bash
-python nx.py examples
-python nx.py run examples/hello.nxl
-python nx.py build examples/gpu_kernel_vulkan_spirv.nxl --target spirv --spirv-env vulkan --emit spv --spv-out fill.spv
-python nx.py val spirv fill.spv
-```
-
-By default, `nx` writes build outputs to `dev/artifacts/` to keep the repo root clean.
-
----
-
-## 🎨 VSCode Syntax Highlighting
-
-This repo includes a local VSCode extension under `vscode-nexalang/` for `.nxl` files.
-
-- Open VSCode
-- `Ctrl+Shift+P` → **Developer: Install Extension from Location...**
-- Select the folder `vscode-nexalang`
-
----
-
-## 🧬 Self-hosting (Stage 1)
-
-The first self-hosting milestone is making it possible to write compiler tooling in NexaLang that can **read real source files**.
-
-Bootstrap now provides:
-- `fs::read_file(path: string) -> Buffer<u8>`
-
-Try:
-
-```bash
-python nx.py run selfhost/stage1_read_file.nxl
-```
-
----
-
-## 🧬 Self-hosting (Stage 2)
-
-A minimal lexer written in NexaLang (currently just counts token categories):
-
-```bash
-python nx.py run selfhost/stage2_lexer.nxl
-```
-
----
-
-## 🧬 Self-hosting (Stage 3)
-
-Token stream milestone: a lexer written in NexaLang that produces `Token { kind, start, len }` records.
-
-```bash
-python nx.py run selfhost/stage3_tokens.nxl
-```
-
----
-
-## 🧬 Self-hosting (Stage 4)
-
-Parser milestone (subset): parse `fn` blocks and count statements (`let` / `return` / basic `if`/`while` blocks).
-
-```bash
-python nx.py run selfhost/stage4_parser.nxl
-```
+## 🧬 Self-Hosting Milestone
+NexaLang has successfully achieved **self-hosting**. The compiler source code in `selfhost/stage5_full.nxl` is capable of compiling itself into the native `bin/nxc.exe` binary.
 
 ---
 

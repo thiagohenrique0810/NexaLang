@@ -53,7 +53,7 @@ class SemanticAnalyzer:
         base_name = name.split('<')[0] if '<' in name else name
         if base_name in self.struct_used: self.struct_used[base_name] = True
         if base_name in self.enum_used: self.enum_used[base_name] = True
-
+        
         # 1. Alias Check (Direct or Recursive)
         if name in self.aliases:
             return self.resolve_type_name(self.aliases[name])
@@ -273,7 +273,7 @@ class SemanticAnalyzer:
                             if generated:
                                 new_nodes.extend(generated)
         ast.extend(new_nodes)
-
+        
         # Pass 1: Collect Types (Structs, Enums, Traits)
         for node in ast:
             name = type(node).__name__
@@ -353,13 +353,13 @@ class SemanticAnalyzer:
                  funcs = [funcs]
                  
              for func in funcs:
-                  if not func.used and not func.is_pub and not name.startswith('std_'):
-                       # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
-                       if '::' in name: continue # Skip methods for now to avoid noise
-                       if self.current_module == 'std': continue # Skip std lib internal
-                       
-                       # Find original line/col? FuncDef has it.
-                       self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
+             if not func.used and not func.is_pub and not name.startswith('std_'):
+                  # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
+                  if '::' in name: continue # Skip methods for now to avoid noise
+                  if self.current_module == 'std': continue # Skip std lib internal
+                  
+                  # Find original line/col? FuncDef has it.
+                  self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
 
         for name, used in self.struct_used.items():
              if not used and not name.startswith('std_'):
@@ -445,7 +445,7 @@ class SemanticAnalyzer:
         struct_name = node.struct_name
         if struct_name == 'std_hash_i32': struct_name = 'i32'
         if struct_name == 'std_hash_string': struct_name = 'string'
-
+             
         # Resolve associated types and Self inside this impl
         mapping = {"Self": struct_name}
         if hasattr(node, 'associated_types'):
@@ -469,7 +469,7 @@ class SemanticAnalyzer:
                   if i == 0 and pn == 'self':
                        new_params.append((pn, pt))
                   else:
-                       new_params.append((pn, self.apply_submap(pt, mapping)))
+                  new_params.append((pn, self.apply_submap(pt, mapping)))
              method.params = new_params
              
              # Update body
@@ -580,10 +580,10 @@ class SemanticAnalyzer:
              fields_dict = self.structs[base_type]
              lookup_type = base_type
         else:
-             lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
-             if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
-             elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
-             else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
+        if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
+        elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
+        else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         if node.member not in fields_dict:
              suggestion = self.get_suggestion(node.member, list(fields_dict.keys()))
