@@ -120,6 +120,16 @@ def main():
         print(f"[SEMANTIC ERROR] {e}")
         import traceback; traceback.print_exc()
         return
+    # 3.5 Print Warnings
+    if analyzer.warnings:
+         lines = source.splitlines()
+         for (msg, line, col) in analyzer.warnings:
+              print(f"\033[33m[WARNING] {msg}\033[0m")
+              if line and 0 <= line - 1 < len(lines):
+                   print(f"  --> {filepath}:{line}:{col}")
+                   print(f"   |")
+                   print(f"{line:3} | {lines[line-1]}")
+                   print(f"   | {' ' * (col-1)}^")
 
     # 4. Code Generation
     spirv_env = args.spirv_env if args.target == "spirv" else "opencl"

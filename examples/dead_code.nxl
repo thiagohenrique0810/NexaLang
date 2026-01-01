@@ -1,0 +1,12 @@
+fn unused_fn() -> void {
+    print("This is never called");
+}
+
+fn used_fn() -> void {
+    print("This is called");
+}
+
+fn main() -> i32 {
+    used_fn();
+    return 0;
+}

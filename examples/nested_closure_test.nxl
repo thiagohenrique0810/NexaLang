@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let a = 10;
+    let b = 20;
+    let outer = |x: i32| {
+        let inner = |y: i32| x + y + a + b;
+        return inner(5);
+    };
+    print(outer(100)); # Should be 100 + 5 + 10 + 20 = 135
+    return 0;
+}

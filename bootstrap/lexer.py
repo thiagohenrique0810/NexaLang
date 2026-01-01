@@ -149,8 +149,11 @@ class Lexer:
                    tokens.append(Token('NEQ', '!=', start_line, start_col))
                    self.advance(2)
                 else:
-                   tokens.append(Token('BANG', '!', start_line, start_col))
+                   tokens.append(Token('NOT', '!', start_line, start_col))
                    self.advance()
+            elif char == '|':
+                tokens.append(Token('PIPE', '|', start_line, start_col))
+                self.advance()
 
             # String Literals
             elif char == '"':

@@ -1,0 +1,20 @@
+trait Iterator {
+    type Item;
+    fn next(&mut self) -> Self::Item; 
+}
+
+struct Counter { count: i32 }
+
+impl Iterator for Counter {
+    type Item = i32;
+    fn next(&mut self) -> Self::Item {
+        return self.count;
+    }
+}
+
+fn main() -> i32 {
+    let c = Counter { count: 10 };
+    c.next();
+    print("Associated Types Parsed & Validated");
+    return 0;
+}

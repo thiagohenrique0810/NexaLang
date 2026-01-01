@@ -1,0 +1,11 @@
+fn apply(f: fn(i32)->i32, v: i32) -> i32 {
+    return f(v);
+}
+
+fn main() -> i32 {
+    let factor = 10;
+    let mult = |x: i32| x * factor;
+    let res = apply(mult, 5);
+    print(res); # Should be 50
+    return 0;
+}

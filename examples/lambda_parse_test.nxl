@@ -1,0 +1,18 @@
+fn main() -> i32 {
+    let add = |x: i32, y: i32| x + y;
+    let res = add(10, 20);
+    print(res); # Should be 30
+
+    let block = |x: i32| {
+        let y = x * 2;
+        return y;
+    };
+    let res2 = block(5);
+    print(res2); # Should be 10
+
+    let no_params = || 42;
+    print(no_params()); # Should be 42
+
+    print("Lambda execution successful");
+    return 0;
+}

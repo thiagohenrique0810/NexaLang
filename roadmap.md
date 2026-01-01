@@ -137,10 +137,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Module resolution fixes for local/nested modules
 - [ ] **Hash Maps (HashMap<K, V>)**
   - [ ] `Hash` trait
-  - [ ] `HashMap` implementation (chaining or open addressing)
-- [ ] **Result Type**
-  - [ ] `Result<T, E>` enum
-  - [ ] Helper methods (`unwrap`, `is_ok`, etc.)
+  - [/] `HashMap` implementation (chaining or open addressing)
+- [x] **Result Type**
+  - [x] `Result<T, E>` enum
+  - [x] Helper methods (`unwrap`, `is_ok`, etc.)
 
 ### 6.3 Module System & Code Organization
 - [x] **Basic Modules**
@@ -155,7 +155,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `use module::item;` syntax
   - [x] `use module::*;` glob imports
   - [x] Path resolution across modules
-- [ ] **Module Hierarchy**
+- [x] **Module Hierarchy**
   - [x] Nested modules (`mod parent { mod child { } }`)
   - [x] Directory-based modules (`mod.nxl` or `mod/mod.nxl`)
 
@@ -177,26 +177,34 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Suggestion system ("did you mean X?")
   - [ ] Error codes and documentation links
 - [ ] **Warnings System**
-  - [ ] Unused variable warnings
-  - [ ] Dead code detection
+  - [x] Unused variable warnings
+  - [x] Dead code detection
   - [ ] Type coercion warnings
 
 ## Phase 7: Advanced Type System 🔧
-- [~] **Traits (Interfaces)**
+- [x] **Traits (Interfaces)**
   - [x] `trait Name { }` syntax
   - [x] Trait methods (required)
-  - [ ] Trait methods (provided/default)
+  - [x] Trait methods (provided/default)
   - [x] `impl Trait for Type` syntax
   - [x] Trait bounds in generics: `fn foo<T: Display>(x: T)`
-- [ ] **Advanced Generics**
-  - [ ] Multiple type parameters
-  - [ ] Const generics: `Array<T, const N: usize>`
-  - [ ] Associated types in traits
+- [x] **Advanced Generics**
+  - [x] Multiple type parameters
+  - [x] Const generics: `Array<T, const N: usize>`
+  - [x] Associated types in traits
 - [x] **Type Aliases**
   - [x] `type Name = ExistingType;`
 
-## Phase 8: Future Directions 🚀
-- [ ] Closures and lambdas
+## Phase 8: Functional Programming 🧩
+- [x] **Closures and Lambdas**
+  - [x] `|x, y| x + y` syntax
+  - [x] Capturing variables from scope (environment)
+  - [/] `Fn`, `FnMut`, `FnOnce` traits (represented via fat pointers)
+- [x] **High-Order Functions**
+  - [ ] `map`, `filter`, `fold` in standard library
+  - [x] Function pointers as arguments
+
+## Phase 9: Future Directions 🚀
 - [ ] Async/await (future consideration)
 - [ ] Procedural macros
 - [ ] Foreign Function Interface (FFI) for C interop

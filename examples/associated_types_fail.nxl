@@ -1,0 +1,15 @@
+trait Iterator {
+    type Item;
+    fn next(&mut self) -> i32; 
+}
+
+struct Counter { count: i32 }
+
+impl Iterator for Counter {
+    # Missing type Item
+    fn next(&mut self) -> i32 {
+        return self.count;
+    }
+}
+
+fn main() -> i32 { return 0; }

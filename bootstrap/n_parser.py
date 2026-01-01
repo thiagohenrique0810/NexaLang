@@ -30,6 +30,7 @@ class FunctionDef(ASTNode):
         self.generics = generics or []
         self.is_pub = is_pub
         self.module = ""
+        self.used = False
 
 class StructDef(ASTNode):
     def __init__(self, name, fields, generics=None, is_pub=False):
@@ -48,19 +49,21 @@ class EnumDef(ASTNode):
         self.module = ""
 
 class TraitDef(ASTNode):
-    def __init__(self, name, methods, generics=None, is_pub=False):
+    def __init__(self, name, methods, generics=None, is_pub=False, associated_types=None):
         self.name = name
         self.methods = methods # list of FunctionDef (likely without body)
         self.generics = generics or []
         self.is_pub = is_pub
+        self.associated_types = associated_types or [] # list of names
         self.module = ""
 
 class ImplDef(ASTNode):
-    def __init__(self, struct_name, methods, generics=None, trait_name=None):
+    def __init__(self, struct_name, methods, generics=None, trait_name=None, associated_types=None):
         self.struct_name = struct_name
         self.methods = methods
         self.generics = generics or []
         self.trait_name = trait_name
+        self.associated_types = associated_types or {} # dict: name -> type
 
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
@@ -95,6 +98,13 @@ class CallExpr(ASTNode):
     def __init__(self, callee, args):
         self.callee = callee
         self.args = args
+
+class LambdaExpr(ASTNode):
+    def __init__(self, params, return_type, body):
+        self.params = params # [(name, type), ...]
+        self.return_type = return_type
+        self.body = body # list of statements
+        self.captures = {} # {name: type} - filled during semantic analysis
 
 class StringLiteral(ASTNode):
     def __init__(self, value):
@@ -419,14 +429,25 @@ class Parser:
 
         self.consume('LBRACE')
         methods = []
+        associated_types = {}
         while self.peek().type != 'RBRACE':
             is_pub = False
+            token = self.peek()
+            if token.type == 'TYPE': # type Item = i32;
+                 self.consume('TYPE')
+                 assoc_name = self.consume('IDENTIFIER').value
+                 self.consume('EQ')
+                 target_type = self.parse_type()
+                 self.consume('SEMICOLON')
+                 associated_types[assoc_name] = target_type
+                 continue
+            
             if self.peek().type == 'PUB':
                  self.consume('PUB')
                  is_pub = True
             methods.append(self.parse_function(is_kernel=False, is_pub=is_pub))
         self.consume('RBRACE')
-        node = ImplDef(struct_name, methods, generics, trait_name=trait_name)
+        node = ImplDef(struct_name, methods, generics, trait_name=trait_name, associated_types=associated_types)
         node.line = token.line
         node.column = token.column
         return node
@@ -450,13 +471,21 @@ class Parser:
             
         self.consume('LBRACE')
         methods = []
+        associated_types = []
         while self.peek().type != 'RBRACE':
+             if self.peek().type == 'TYPE': # type Item;
+                 self.consume('TYPE')
+                 assoc_name = self.consume('IDENTIFIER').value
+                 self.consume('SEMICOLON')
+                 associated_types.append(assoc_name)
+                 continue
+                 
              # Trait methods might not have bodies.
              # Call parse_function with allow_empty_body=True
              # But parse_function signature update needed.
              methods.append(self.parse_function(allow_empty_body=True))
         self.consume('RBRACE')
-        return TraitDef(name, methods, generics, is_pub=is_pub)
+        return TraitDef(name, methods, generics, is_pub=is_pub, associated_types=associated_types)
 
     def parse_struct(self, is_pub=False):
         self.consume('STRUCT')
@@ -466,12 +495,17 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
+                is_const = False
+                if self.peek().type == 'CONST':
+                     self.consume('CONST')
+                     is_const = True
+                
                 g_name = self.consume('IDENTIFIER').value
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
                      bound = self.consume('IDENTIFIER').value
-                generics.append((g_name, bound))
+                generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
             self.consume('GT')
@@ -502,12 +536,17 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
+                is_const = False
+                if self.peek().type == 'CONST':
+                     self.consume('CONST')
+                     is_const = True
+
                 g_name = self.consume('IDENTIFIER').value
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
                      bound = self.consume('IDENTIFIER').value
-                generics.append((g_name, bound))
+                generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
             self.consume('GT')
@@ -541,12 +580,17 @@ class Parser:
         if self.peek().type == 'LT':
             self.consume('LT')
             while self.peek().type != 'GT':
+                is_const = False
+                if self.peek().type == 'CONST':
+                     self.consume('CONST')
+                     is_const = True
+                
                 g_name = self.consume('IDENTIFIER').value
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
                      bound = self.consume('IDENTIFIER').value
-                generics.append((g_name, bound))
+                generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                    self.consume('COMMA')
             self.consume('GT')
@@ -701,7 +745,10 @@ class Parser:
                 self.consume('LT')
                 args = []
                 while self.peek().type != 'GT':
-                    args.append(self.parse_type())
+                    if self.peek().type == 'NUMBER':
+                         args.append(str(self.consume('NUMBER').value))
+                    else:
+                         args.append(self.parse_type())
                     if self.peek().type == 'COMMA':
                         self.consume('COMMA')
                 self.consume('GT')
@@ -721,6 +768,22 @@ class Parser:
                 is_mut = "mut "
             inner = self.parse_type()
             return f"&{is_mut}{inner}"
+        elif self.peek().type == 'FN':
+            self.consume('FN')
+            self.consume('LPAREN')
+            params = []
+            while self.peek().type != 'RPAREN':
+                params.append(self.parse_type())
+                if self.peek().type == 'COMMA':
+                    self.consume('COMMA')
+            self.consume('RPAREN')
+            
+            ret_type = 'void'
+            if self.peek().type == 'THIN_ARROW':
+                self.consume('THIN_ARROW')
+                ret_type = self.parse_type()
+            
+            return f"fn({','.join(params)})->{ret_type}"
         elif self.peek().type == 'STAR':
             self.consume('STAR')
             inner = self.parse_type()
@@ -1004,17 +1067,33 @@ class Parser:
                 self.consume('RBRACE')
                 expr = CallExpr(name, args)
             
-            # 2. Templated Intrinsics: cast<T>(x), sizeof<T>()
-            elif token.value in ('cast', 'sizeof') and peek1 == 'LT':
+            # 2. Generic Instantiation or Templated Variable (cast<T>)
+            elif peek1 == 'LT' and token.value in ('cast', 'sizeof', 'ptr_offset', 'slice_from_array', 'ptr_to_int', 'int_to_ptr'):
                 name = self.consume('IDENTIFIER').value
                 self.consume('LT')
                 types = []
                 while self.peek().type != 'GT':
-                    types.append(self.parse_type())
+                    if self.peek().type == 'NUMBER':
+                         types.append(str(self.consume('NUMBER').value))
+                    else:
+                         types.append(self.parse_type())
                     if self.peek().type == 'COMMA': self.consume('COMMA')
                 self.consume('GT')
                 full_name = f"{name}<{','.join(types)}>"
-                expr = VariableExpr(full_name) # Let postfix handler handle '('
+                
+                if self.peek().type == 'LBRACE':
+                    # Struct Instantiation: Name<T> { ... }
+                    self.consume('LBRACE')
+                    args = []
+                    while self.peek().type != 'RBRACE':
+                        self.consume('IDENTIFIER')
+                        self.consume('COLON')
+                        args.append(self.parse_expression())
+                        if self.peek().type == 'COMMA': self.consume('COMMA')
+                    self.consume('RBRACE')
+                    expr = CallExpr(full_name, args)
+                else:
+                    expr = VariableExpr(full_name)
             
             # 3. Namespaces or TurboFish: ID :: ...
             elif peek1 == 'DOUBLE_COLON':
@@ -1105,6 +1184,8 @@ class Parser:
             expr = ArrayLiteral(elements)
         elif token.type == 'STAR':
             return self.parse_unary()
+        elif token.type == 'PIPE':
+            expr = self.parse_lambda()
         else:
             # Print context
             start = max(0, self.pos - 10)
@@ -1139,6 +1220,46 @@ class Parser:
             expr.column = start_token.column
             
         return expr
+
+    def parse_lambda(self):
+        start_token = self.peek()
+        self.consume('PIPE')
+        params = []
+        if self.peek().type != 'PIPE':
+            while True:
+                pname = self.consume('IDENTIFIER').value
+                ptype = None
+                if self.peek().type == 'COLON':
+                    self.consume('COLON')
+                    ptype = self.parse_type()
+                params.append((pname, ptype))
+                if self.peek().type == 'COMMA':
+                    self.consume('COMMA')
+                    if self.peek().type == 'PIPE': break
+                else:
+                    break
+        self.consume('PIPE')
+        
+        ret_type = None
+        if self.peek().type == 'THIN_ARROW':
+            self.consume('THIN_ARROW')
+            ret_type = self.parse_type()
+            
+        if self.peek().type == 'LBRACE':
+            self.consume('LBRACE')
+            body = []
+            while self.peek().type != 'RBRACE':
+                body.append(self.parse_statement())
+                if self.peek().type == 'SEMICOLON': self.consume('SEMICOLON')
+            self.consume('RBRACE')
+        else:
+            # Single expression body: |x| x + 1
+            body = [ReturnStmt(self.parse_expression())]
+            
+        node = LambdaExpr(params, ret_type, body)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_call(self):
         name = self.consume('IDENTIFIER').value

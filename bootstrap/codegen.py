@@ -319,6 +319,8 @@ class CodeGen:
         self.exit_func = ir.Function(self.module, exit_ty, name="exit")
 
     def get_llvm_type(self, type_name):
+        # Debug trace
+        # print(f"DEBUG GET_LLVM_TYPE: {type_name} generics={self._current_generics}", flush=True)
         if type_name == 'i32':
             return ir.IntType(32)
         elif type_name == 'bool':
@@ -359,7 +361,6 @@ class CodeGen:
         if type_name in self._current_generics:
              return ir.IntType(8) # Placeholder
 
-        # Handle generic types via erasure
         if "<" in type_name:
             base = type_name.split("<")[0]
             if base in self.struct_types:
@@ -367,13 +368,40 @@ class CodeGen:
             if base in self.enum_definitions:
                 enum_ty, _ = self.enum_definitions[base]
                 return enum_ty
+            print(f"DEBUG ERASURE: {type_name} -> i8")
+                
+        if type_name.startswith('fn('):
+            # Parse fn(i32, bool)->void
+            # Use rpartition for robust splitting of return type
+            main_part, arrow, ret_str = type_name.rpartition(')->')
+            if not arrow: raise Exception(f"Invalid function type: {type_name}")
+            params_str = main_part[3:] # Strip 'fn('
+            
+            param_types = []
+            if params_str:
+                depth = 0
+                current = ""
+                for c in params_str:
+                    if c == '<' or c == '(': depth += 1
+                    elif c == '>' or c == ')': depth -= 1
+                    if c == ',' and depth == 0:
+                        param_types.append(self.get_llvm_type(current.strip()))
+                        current = ""
+                    else:
+                        current += c
+                if current:
+                    param_types.append(self.get_llvm_type(current.strip()))
+            
+            ret_type = self.get_llvm_type(ret_str.strip())
+            # Use Fat Pointer representation: { function_ptr, environment_ptr }
+            return ir.LiteralStructType([ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer()])
 
         # Fallback
         raise Exception(f"CodeGen: Unknown type '{type_name}'")
 
     def visit_StructDef(self, node):
-        if '<' in node.name:
-            return # Skip monomorphized version in bootstrap; use erased base type instead
+        if getattr(node, 'generics', None): return
+        #     return # Skip monomorphized version in bootstrap; use erased base type instead
             
         # We don't skip generic definitions anymore; we register them as base types
         # so that monomorphized instances (type erasure in bootstrap) can find them.
@@ -413,8 +441,8 @@ class CodeGen:
         self._current_generics = []
 
     def visit_EnumDef(self, node):
-        if '<' in node.name:
-            return # Skip monomorphized version in bootstrap
+        if getattr(node, 'generics', None): return
+        #     return # Skip monomorphized version in bootstrap
             
         # if node.generics: return # ALLOW GENERICS (Type Erasure)
         
@@ -480,6 +508,7 @@ class CodeGen:
         pass # Traits are compile-time only for now (static dispatch)
 
     def visit_ImplDef(self, node):
+        if getattr(node, 'generics', None): return
         self._current_generics = [g[0] for g in node.generics]
         for method in node.methods:
             self.visit(method)
@@ -601,13 +630,30 @@ class CodeGen:
             # GEP + Load
             param_ptr = struct_val
 
+            # Ensure param_ptr points to the actual struct type (handles type erasure fallback to i8*)
+            actual_struct_ty = self.get_llvm_type(struct_name)
+            if param_ptr.type.pointee != actual_struct_ty:
+                param_ptr = self.builder.bitcast(param_ptr, actual_struct_ty.as_pointer())
+
             # Need to find field index
             field_idx = self.struct_fields[struct_name][node.member]
 
             ptr = self.builder.gep(param_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
             return self.builder.load(ptr)
         else:
-            # Extract Value
+            # Extract Value case
+            # Ensure it's not type-erased i8 (LLVM IntType doesn't have fields)
+            if isinstance(struct_val.type, ir.IntType):
+                 # Typeless load or erasure: Spill to stack to bitcast and access fields
+                 actual_struct_ty = self.get_llvm_type(struct_name)
+                 temp_mem = self.builder.alloca(struct_val.type)
+                 self.builder.store(struct_val, temp_mem)
+                 # Bitcast to actual struct pointer
+                 casted_ptr = self.builder.bitcast(temp_mem, actual_struct_ty.as_pointer())
+                 field_idx = self.struct_fields[struct_name][node.member]
+                 field_ptr = self.builder.gep(casted_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
+                 return self.builder.load(field_ptr)
+            
             field_index = self.struct_fields[struct_name][node.member]
             return self.builder.extract_value(struct_val, field_index)
 
@@ -743,9 +789,7 @@ class CodeGen:
 
         # Fallback: Evaluate object to value (loads it)
         obj_val = self.visit(node.object)
-        if not isinstance(obj_val.type, ir.PointerType) and not str(obj_val.type).endswith('*'):
-             raise Exception(f"Fatal Codegen Error: Indexing non-pointer type {obj_val.type} for object {node.object}")
-
+        
         # Pointer indexing: gep(ptr, idx) then load
         if isinstance(obj_val.type, ir.PointerType) or str(obj_val.type).endswith('*'):
             if isinstance(obj_val.type, ir.PointerType) and isinstance(obj_val.type.pointee, ir.ArrayType):
@@ -765,7 +809,14 @@ class CodeGen:
         temp_ptr = self.builder.alloca(obj_val.type)
         self.builder.store(obj_val, temp_ptr)
         zero = ir.Constant(ir.IntType(32), 0)
-        ptr = self.builder.gep(temp_ptr, [zero, index_val])
+        try:
+            if isinstance(obj_val.type, (ir.ArrayType, ir.LiteralStructType, ir.StructureType)):
+                ptr = self.builder.gep(temp_ptr, [zero, index_val])
+            else:
+                ptr = self.builder.gep(temp_ptr, [index_val])
+        except Exception as e:
+            print(f"DEBUG GEP FAILED: type={obj_val.type} agg={isinstance(obj_val.type, (ir.ArrayType, ir.LiteralStructType, ir.StructureType))}")
+            raise e
         return self.builder.load(ptr)
 
         func = ir.Function(self.module, func_ty, name=node.name)
@@ -787,7 +838,10 @@ class CodeGen:
     def emit_scope_drops(self, scope):
         # Iterate in reverse order of declaration (LIFO)
         # Scope is dict, assuming insertion order preserved (Python 3.7+)
-        for var_name, (ptr, type_name) in reversed(list(scope.items())):
+        for var_name, entry in reversed(list(scope.items())):
+            if var_name.startswith('$') or not isinstance(entry, tuple) or len(entry) < 2:
+                continue
+            ptr, type_name = entry[0], entry[1]
             # Look for destructor: {TypeName}_drop(T) or {TypeName}_drop(&T)
             # Current convention: {TypeName}_drop(T) (Pass by value, consumes)
             drop_func_name = f"{type_name}_drop"
@@ -860,6 +914,13 @@ class CodeGen:
             self.builder.store(option_ret, opt_mem)
             
             # Extract Tag (field 0)
+            # Ensure opt_mem points to a struct even if type was erased to i8
+            if not isinstance(opt_mem.type.pointee, (ir.ArrayType, ir.LiteralStructType, ir.StructureType)):
+                 # Deduce return type name (e.g. Option<T>)
+                 opt_type_name = getattr(node, 'option_type', f"Option<{node.item_type}>")
+                 actual_ty = self.get_llvm_type(opt_type_name)
+                 opt_mem = self.builder.bitcast(opt_mem, actual_ty.as_pointer())
+
             tag_ptr = self.builder.gep(opt_mem, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
             tag = self.builder.load(tag_ptr)
             
@@ -1260,6 +1321,11 @@ class CodeGen:
             struct_name = node.target.struct_type
             field_index = self.struct_fields[struct_name][node.target.member]
 
+            # Ensure struct_ptr points to the actual struct type (handles type erasure fallback to i8*)
+            actual_struct_ty = self.get_llvm_type(struct_name)
+            if struct_ptr.type.pointee != actual_struct_ty:
+                struct_ptr = self.builder.bitcast(struct_ptr, actual_struct_ty.as_pointer())
+
             # GEP to field
             zero = ir.Constant(ir.IntType(32), 0)
             idx = ir.Constant(ir.IntType(32), field_index)
@@ -1436,22 +1502,52 @@ class CodeGen:
         val = 1 if node.value else 0
         return ir.Constant(ir.IntType(1), val)
 
+    def get_env_struct(self, lambda_node):
+        struct_name = f"{lambda_node.lambda_name}_env"
+        if struct_name in self.struct_types:
+            return self.struct_types[struct_name]
+        
+        field_types = []
+        field_names = []
+        if not hasattr(lambda_node, 'captures'): return None
+
+        for name in sorted(lambda_node.captures.keys()):
+            type_name = lambda_node.captures[name]
+            field_types.append(self.get_llvm_type(type_name))
+            field_names.append(name)
+            
+        struct_ty = ir.LiteralStructType(field_types)
+        self.struct_types[struct_name] = struct_ty
+        self.struct_fields[struct_name] = {name: i for i, name in enumerate(field_names)}
+        return struct_ty
+
     def visit_VariableExpr(self, node):
-        # Lookup in scopes (LIFO)
+        # 1. Primary Lookup (Local Scopes)
         for scope in reversed(self.scopes):
             if node.name in scope:
                 entry = scope[node.name]
-                # Vulkan special entries:
-                # - (ptr, type_name, "value"): SSA value stored directly in scope (no load)
-                # - (ptr, type_name, "vulkan_buffer"): Buffer<T> handled via MemberAccess
                 if isinstance(entry, tuple) and len(entry) == 3:
                     val_or_ptr, _, tag = entry
                     if tag == "value":
                         return val_or_ptr
-                    if tag == "vulkan_buffer":
-                        return val_or_ptr
                 ptr, _ = entry
                 return self.builder.load(ptr, name=node.name)
+
+        # 2. Secondary Lookup (Closure Environment)
+        # Search for the closest $env in scopes
+        for scope in reversed(self.scopes):
+            if '$env' in scope:
+                env_ptr_raw, _ = scope['$env']
+                lambda_node = scope.get('$env_lambda')
+                if lambda_node and node.name in getattr(lambda_node, 'captures', {}):
+                    struct_name = f"{lambda_node.lambda_name}_env"
+                    struct_ty = self.struct_types[struct_name]
+                    env_ptr = self.builder.bitcast(env_ptr_raw, struct_ty.as_pointer())
+                    field_idx = self.struct_fields[struct_name][node.name]
+                    ptr = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
+                    return self.builder.load(ptr, name=node.name)
+
+        # 3. Check for Enum Variant (Unit Variant)
         
         # Check for Enum Variant (Unit Variant)
         if '::' in node.name:
@@ -1471,8 +1567,82 @@ class CodeGen:
 
         raise Exception(f"Ref to undefined variable: {node.name}")
 
+    def visit_LambdaExpr(self, node):
+        func = self.module.get_global(node.lambda_name)
+        if not func:
+             raise Exception(f"Lambda function '{node.lambda_name}' not found in LLVM module")
+        
+        # 1. Environment Packing
+        if hasattr(node, 'captures') and node.captures:
+             struct_ty = self.get_env_struct(node)
+             # For simplicity in bootstrap, we use stack-based environment (alloca)
+             # In a real compiler, escaped closures would need heap allocation (Arena)
+             env_ptr = self.builder.alloca(struct_ty, name="closure_env")
+             struct_name = f"{node.lambda_name}_env"
+             for name in sorted(node.captures.keys()):
+                 # Visit a temporary VariableExpr to get current value of the capture
+                 val = self.visit(VariableExpr(name))
+                 idx = self.struct_fields[struct_name][name]
+                 field_ptr = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), idx)])
+                 self.builder.store(val, field_ptr)
+             env_ptr_raw = self.builder.bitcast(env_ptr, ir.IntType(8).as_pointer())
+        else:
+             env_ptr_raw = ir.Constant(ir.IntType(8).as_pointer(), None)
+             
+        # 2. Pack Fat Pointer: { func_ptr, env_ptr }
+        func_ptr_raw = self.builder.bitcast(func, ir.IntType(8).as_pointer())
+        
+        fat_ty = ir.LiteralStructType([ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer()])
+        fat_ptr = ir.Constant(fat_ty, ir.Undefined)
+        fat_ptr = self.builder.insert_value(fat_ptr, func_ptr_raw, 0)
+        fat_ptr = self.builder.insert_value(fat_ptr, env_ptr_raw, 1)
+        return fat_ptr
+
+    def _emit_closure_call(self, fat_ptr, callee_type_name, args):
+        func_ptr_raw = self.builder.extract_value(fat_ptr, 0)
+        env_ptr_raw = self.builder.extract_value(fat_ptr, 1)
+        
+        main_part, _, ret_str = callee_type_name.rpartition(')->')
+        ret_type = self.get_llvm_type(ret_str.strip())
+        params_str = main_part[3:]
+        arg_types = [ir.IntType(8).as_pointer()]
+        if params_str:
+             # Very basic comma split; won't work for nested fn types in params but good for bootstrap
+             for pt in params_str.split(','):
+                  if pt.strip(): arg_types.append(self.get_llvm_type(pt.strip()))
+        
+        func_ty = ir.FunctionType(ret_type, arg_types)
+        func_ptr = self.builder.bitcast(func_ptr_raw, func_ty.as_pointer())
+        
+        processed_args = [env_ptr_raw] + [self.visit(arg) for arg in args]
+        return self.builder.call(func_ptr, processed_args)
+
     def visit_CallExpr(self, node):
-        if node.callee == "print":
+        callee_name = node.callee
+        if not isinstance(callee_name, str):
+            if isinstance(callee_name, VariableExpr):
+                callee_name = callee_name.name
+            else:
+                # Dynamic call (e.g. result of expression)
+                # Dynamic call (e.g. result of expression)
+                fat_ptr = self.visit(callee_name)
+                callee_type_name = getattr(callee_name, 'type_name', None)
+                if not callee_type_name or not callee_type_name.startswith('fn('):
+                     raise Exception("Dynamic call requires callee to have 'fn' type")
+                return self._emit_closure_call(fat_ptr, callee_type_name, node.args)
+        
+        # Now callee_name is a string. Check if it's a local variable (function pointer)
+        for scope in reversed(self.scopes):
+            if callee_name in scope:
+                entry = scope[callee_name]
+                if isinstance(entry, tuple) and len(entry) >= 2:
+                    ptr, ptype_name = entry
+                    # If it's a fat pointer (fn type), load and call
+                    if isinstance(ptype_name, str) and ptype_name.startswith('fn('):
+                        fat_ptr = self.builder.load(ptr)
+                        return self._emit_closure_call(fat_ptr, ptype_name, node.args)
+
+        if callee_name == "print":
             # Generate printf
             # Check arg type
             val = self.visit(node.args[0])
@@ -1726,10 +1896,13 @@ class CodeGen:
         # Note: only treat `::` calls as enum constructors if the LHS is a known enum.
         elif isinstance(node.callee, str) and '::' in node.callee:
             lhs, rhs = node.callee.split('::', 1)
-            base_lhs = lhs.split('<')[0]
-            if base_lhs in self.enum_definitions:
-                enum_ty, max_size = self.enum_definitions[base_lhs]
-                tag = self.enum_types[base_lhs][rhs]
+            enum_key = lhs
+            if enum_key not in self.enum_definitions and '<' in enum_key:
+                 enum_key = enum_key.split('<')[0]
+            
+            if enum_key in self.enum_definitions:
+                enum_ty, max_size = self.enum_definitions[enum_key]
+                tag = self.enum_types[enum_key][rhs]
 
             # Create struct { tag, padding }
             enum_val = ir.Constant(enum_ty, ir.Undefined)
@@ -1760,9 +1933,12 @@ class CodeGen:
             else:
                 return enum_val
 
-        elif node.callee in self.struct_types:
+        elif isinstance(node.callee, str) and (node.callee in self.struct_types or ('<' in node.callee and node.callee.split('<')[0] in self.struct_types)):
             # Struct Instantiation
-            struct_ty = self.struct_types[node.callee]
+            struct_key = node.callee
+            if '<' in struct_key and struct_key not in self.struct_types:
+                 struct_key = struct_key.split('<')[0]
+            struct_ty = self.struct_types[struct_key]
             struct_val = ir.Constant(struct_ty, ir.Undefined)
 
             for i, arg in enumerate(node.args):
@@ -1771,7 +1947,7 @@ class CodeGen:
             return struct_val
 
 
-        elif node.callee.startswith('cast<'):
+        elif isinstance(node.callee, str) and node.callee.startswith('cast<'):
             val = self.visit(node.args[0])
             target_type_name = node.callee[5:].rstrip('>')
 
@@ -1815,17 +1991,15 @@ class CodeGen:
             # Fallback
             return self.builder.bitcast(val, target_ty)
 
-        elif node.callee.startswith('sizeof<'):
+        elif isinstance(node.callee, str) and node.callee.startswith('sizeof<'):
             type_name = node.callee[7:].rstrip('>')
-            llvm_ty = ir.IntType(32) # Default
-            if type_name == 'i32': llvm_ty = ir.IntType(32)
-            elif type_name == 'u8': llvm_ty = ir.IntType(8)
+            llvm_ty = self.get_llvm_type(type_name)
 
             null_ptr = ir.Constant(llvm_ty.as_pointer(), None)
             gep = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)])
             return self.builder.ptrtoint(gep, ir.IntType(32))
 
-        elif node.callee.startswith('ptr_offset<'):
+        elif isinstance(node.callee, str) and node.callee.startswith('ptr_offset<'):
             ptr_val = self.visit(node.args[0])
             idx_val = self.visit(node.args[1])
             return self.builder.gep(ptr_val, [idx_val])
@@ -1902,7 +2076,7 @@ class CodeGen:
         else:
             # Resolve static method calls: Struct::Method -> Struct_Method
             callee_name = node.callee
-            if '::' in callee_name:
+            if isinstance(callee_name, str) and '::' in callee_name:
                 parts = callee_name.split('::')
                 struct_name = parts[0]
                 method_name = parts[1]
@@ -1911,7 +2085,7 @@ class CodeGen:
                 callee_name = f"{struct_name}_{method_name}"
 
             # Try to find function in module
-            if callee_name in self.module.globals:
+            if isinstance(callee_name, str) and callee_name in self.module.globals:
                 callee_func = self.module.globals[callee_name]
                 processed_args = [self.visit(arg) for arg in node.args]
                 
@@ -1941,7 +2115,13 @@ class CodeGen:
                 
                 return self.builder.call(callee_func, processed_args)
             else:
-                raise Exception(f"Unknown function call: {node.callee} (resolved as {callee_name})")
+                # Try dynamic call (e.g. function pointer or closure)
+                callee_val = self.visit(node.callee)
+                if isinstance(callee_val.type, ir.PointerType) and isinstance(callee_val.type.pointee, ir.FunctionType):
+                    processed_args = [self.visit(arg) for arg in node.args]
+                    return self.builder.call(callee_val, processed_args)
+                
+                raise Exception(f"Unknown function call: {node.callee} (resolved as {callee_name}) type={callee_val.type if 'callee_val' in locals() else 'N/A'}")
 
     def visit_StringLiteral(self, node, name="str", value_override=None):
         # Create a global constant string
@@ -1994,10 +2174,14 @@ class CodeGen:
         switch = self.builder.switch(tag_val, merge_bb)
 
         enum_name = node.enum_name
-
+        # Prioritize full monomorphized name if it exists in enum_definitions
+        enum_lookup_key = enum_name
+        if enum_lookup_key not in self.enum_types and '<' in enum_lookup_key:
+             enum_lookup_key = enum_lookup_key.split('<')[0]
+        
         # Cases
         for case in node.cases:
-            tag_id = self.enum_types[enum_name][case.variant_name]
+            tag_id = self.enum_types[enum_lookup_key][case.variant_name]
             case_bb = self.builder.append_basic_block(f"case_{case.variant_name}")
             switch.add_case(ir.Constant(ir.IntType(32), tag_id), case_bb)
 
@@ -2009,12 +2193,18 @@ class CodeGen:
             # Bound Variables
             if case.var_names:
                 # Get Payload Address
+                # Ensure val_ptr points to the correct enum struct (handles type erasure fallback)
+                actual_enum_ty = self.get_llvm_type(node.enum_name)
+                current_val_ptr = val_ptr
+                if current_val_ptr.type.pointee != actual_enum_ty:
+                     current_val_ptr = self.builder.bitcast(current_val_ptr, actual_enum_ty.as_pointer())
+
                 zero = ir.Constant(ir.IntType(32), 0)
                 one = ir.Constant(ir.IntType(32), 1)
-                data_ptr = self.builder.gep(val_ptr, [zero, one])
+                data_ptr = self.builder.gep(current_val_ptr, [zero, one])
 
                 # Bitcast to payload type
-                payload_ty = self.enum_payloads[enum_name][case.variant_name]
+                payload_ty = self.enum_payloads[enum_lookup_key][case.variant_name]
                 if payload_ty:
                     cast_ptr = self.builder.bitcast(data_ptr, payload_ty.as_pointer())
 
@@ -2099,6 +2289,11 @@ class CodeGen:
         if node.return_type != 'void':
             ret_type = self.get_llvm_type(node.return_type)
 
+        # Add env pointer to lambda signatures
+        if getattr(node, 'is_lambda', False):
+            # Lambda functions always take environment as first argument (fat pointer convention)
+            arg_types.insert(0, ir.IntType(8).as_pointer())
+
         func_ty = ir.FunctionType(ret_type, arg_types)
 
         # Check if exists
@@ -2113,7 +2308,7 @@ class CodeGen:
         return func
 
     def visit_FunctionDef(self, node):
-        if node.generics: return
+        if getattr(node, 'generics', None): return
 
         # Function already declared in Pass 2
         func = self.module.get_global(node.name)
@@ -2122,6 +2317,9 @@ class CodeGen:
 
         self._current_function_name = node.name
         self._current_function_is_kernel = bool(node.is_kernel)
+        self.current_lambda_node = getattr(node, 'lambda_node', None)
+        if self.current_lambda_node:
+             self.get_env_struct(self.current_lambda_node)
 
         entry_block = func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry_block)
@@ -2142,8 +2340,16 @@ class CodeGen:
                     # Treat global like a pointer slot for VariableExpr loads.
                     self.scopes[-1][pname] = (gv, ptype)
         else:
+            offset = 1 if getattr(node, 'is_lambda', False) else 0
+            if offset == 1:
+                 env_ptr = func.args[0]
+                 env_ptr.name = "env"
+                 # Store env ptr and the lambda node in scope so closures can find it
+                 self.scopes[-1]['$env'] = (env_ptr, 'i8*')
+                 self.scopes[-1]['$env_lambda'] = getattr(node, 'lambda_node', None)
+
             for i, (pname, ptype) in enumerate(node.params):
-                arg_val = func.args[i]
+                arg_val = func.args[i + offset]
                 arg_val.name = pname
                 alloca = self.builder.alloca(self.get_llvm_type(ptype), name=pname)
                 self.builder.store(arg_val, alloca)

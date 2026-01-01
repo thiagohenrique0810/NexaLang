@@ -1,0 +1,23 @@
+trait Greeter {
+    fn greet(&self) -> void {
+        print("Hello (default)");
+    }
+}
+
+struct Person {}
+impl Greeter for Person {} 
+
+struct Robot {}
+impl Greeter for Robot {
+    fn greet(&self) -> void {
+        print("Beep Boop");
+    }
+}
+
+fn main() -> i32 {
+    let p = Person {};
+    p.greet();
+    let r = Robot {};
+    r.greet();
+    return 0;
+}

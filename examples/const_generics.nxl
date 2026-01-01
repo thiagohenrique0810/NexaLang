@@ -1,0 +1,10 @@
+struct Buffer<T, const N: i32> {
+    item: T
+}
+
+fn main() -> i32 {
+    let b1 = Buffer<i32, 10> { item: 1 };
+    let b2 = Buffer<i32, 20> { item: 2 };
+    print("Buffer<i32, 10> created");
+    return 0;
+}

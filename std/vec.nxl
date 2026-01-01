@@ -46,6 +46,7 @@ impl<T> Vec<T> {
         self.len = self.len + 1;
     }
     
+    
     fn iter(&self) -> VecIterator<T> {
         return VecIterator(self.ptr, self.len, 0);
     }

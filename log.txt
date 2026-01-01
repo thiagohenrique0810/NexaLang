@@ -1,0 +1,98 @@
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG IS_CONCRETE: T
+DEBUG TRY MONO STRUCT: std_vec_Vec<std_map_Entry<K,V>>
+DEBUG TRY MONO STRUCT: std_map_Entry<K,V>
+DEBUG IS_CONCRETE: K
+DEBUG IS_CONCRETE: std_map_Entry<K,V>
+DEBUG IS_CONCRETE: std_map_Entry
+DEBUG IS_CONCRETE: K
+DEBUG TRY MONO STRUCT: std_map_Entry<K,V>
+DEBUG IS_CONCRETE: K
+DEBUG TRY MONO STRUCT: std_map_Entry<K,V>
+DEBUG IS_CONCRETE: K
+DEBUG IS_CONCRETE: V
+DEBUG IS_CONCRETE: V
+DEBUG TRY MONO STRUCT: std_map_HashMap<i32,i32>
+DEBUG TRY MONO STRUCT: std_vec_Vec<std_map_Entry<i32,i32>>
+DEBUG TRY MONO STRUCT: std_map_Entry<i32,i32>
+DEBUG IS_CONCRETE: i32
+DEBUG IS_CONCRETE: i32
+DEBUG MONO STRUCT: std_map_Entry<i32,i32> fields=[('key', 'i32'), ('value', 'i32')]
+DEBUG IS_CONCRETE: std_map_Entry<i32,i32>
+DEBUG IS_CONCRETE: std_map_Entry
+DEBUG IS_CONCRETE: i32
+DEBUG IS_CONCRETE: i32
+DEBUG MONO STRUCT: std_vec_Vec<std_map_Entry<i32,i32>> fields=[('ptr', 'std_map_Entry<i32,i32>*'), ('len', 'i32'), ('cap', 'i32')]
+DEBUG IS_CONCRETE: i32
+DEBUG IS_CONCRETE: i32
+DEBUG MONO STRUCT: std_map_HashMap<i32,i32> fields=[('entries', 'std_vec_Vec<std_map_Entry<i32,i32>>')]
+DEBUG TRY MONO STRUCT: std_map_HashMap<i32,i32>
+[33m[WARNING] Unused variable 'i'[0m
+  --> examples/hashmap_test.nxl:19:9
+   |
+ 19 |     return 0;
+   |         ^
+[33m[WARNING] Unused variable 'value'[0m
+  --> examples/hashmap_test.nxl:18:5
+   |
+ 18 | 
+   |     ^
+[33m[WARNING] Unused variable 'i'[0m
+[33m[WARNING] Dead code: Function 'i32_hash' is never used[0m
+  --> examples/hashmap_test.nxl:6:5
+   |
+  6 |     map.insert(10, 100);
+   |     ^
+[33m[WARNING] Dead code: Function 'string_hash' is never used[0m
+  --> examples/hashmap_test.nxl:12:5
+   |
+ 12 |     print(v1); # 100
+   |     ^
+Traceback (most recent call last):
+  File "Y:\WWW\NexaLang\bootstrap\main.py", line 183, in <module>
+    main()
+    ~~~~^^
+  File "Y:\WWW\NexaLang\bootstrap\main.py", line 143, in main
+    llvm_ir = codegen.generate(ast)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 554, in generate
+    self.visit(node)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 513, in visit_ImplDef
+    self.visit(method)
+    ~~~~~~~~~~^^^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 2363, in visit_FunctionDef
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 1014, in visit_ForStmt
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 1415, in visit_IfStmt
+    self.visit(stmt)
+    ~~~~~~~~~~^^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 692, in visit_MethodCall
+    args = [receiver_arg] + [self.visit(arg) for arg in node.args]
+                             ~~~~~~~~~~^^^^^
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 2118, in visit_CallExpr
+    callee_val = self.visit(node.callee)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 564, in visit
+    return visitor(node)
+  File "Y:\WWW\NexaLang\bootstrap\codegen.py", line 1567, in visit_VariableExpr
+    raise Exception(f"Ref to undefined variable: {node.name}")
+Exception: Ref to undefined variable: Entry<K,V>

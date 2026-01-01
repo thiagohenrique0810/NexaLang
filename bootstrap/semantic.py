@@ -8,6 +8,7 @@ class SemanticAnalyzer:
     def __init__(self):
         # Symbol table entries: {name: {'type': type, 'moved': bool, 'readers': int, 'writer': bool, 'is_ref': bool}}
         self.scopes = [{}] 
+        self.warnings = [] # list of (msg, line, col)
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
@@ -26,6 +27,10 @@ class SemanticAnalyzer:
         self.traits = {} # name -> {method_name: method_signature_node}
         self.trait_defs = {} # name -> TraitDef
         self.current_module = ""
+        self.lambda_count = 0
+        self.lambda_base_scopes = [] # Stack of len(self.scopes) when lambda started
+        self.lambda_capture_stack = [] # Stack of dicts: {name: type}
+        self.lambda_count = 0
 
 
     def error(self, message, node=None, hint=None):
@@ -177,7 +182,7 @@ class SemanticAnalyzer:
             elif name == 'TraitDef':
                  self.trait_defs[node.name] = node
                  methods = {m.name: m for m in node.methods}
-                 self.traits[node.name] = methods
+                 self.traits[node.name] = {'methods': methods, 'types': node.associated_types}
             elif name == 'TypeAlias':
                  self.aliases[node.alias] = node.original_type
 
@@ -212,7 +217,19 @@ class SemanticAnalyzer:
         # 2. Analyze bodies
         for node in ast:
             if type(node).__name__ == "UseStmt": continue
+            if isinstance(node, FunctionDef) and getattr(node, 'is_lambda', False): continue
             self.visit(node)
+        
+        # 3. Dead Code Analysis
+        for name, func in self.function_defs.items():
+             if name == 'main' or name.endswith('::main'): continue
+             if not func.used and not func.is_pub and not name.startswith('std_'):
+                  # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
+                  if '::' in name: continue # Skip methods for now to avoid noise
+                  if self.current_module == 'std': continue # Skip std lib internal
+                  
+                  # Find original line/col? FuncDef has it.
+                  self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
 
     def canonicalize_type_refs(self, node):
         prefix = getattr(node, 'module', '')
@@ -254,6 +271,18 @@ class SemanticAnalyzer:
              return mangled
         return type_name
 
+    def is_deeply_concrete(self, t):
+        if not t: return True
+        print(f"DEBUG IS_CONCRETE: {t}")
+        if '<' in t:
+             base = t.split('<')[0]
+             inside = t[t.find('<')+1:-1]
+             args = self.split_generic_args(inside)
+             return self.is_deeply_concrete(base) and all(self.is_deeply_concrete(a) for a in args)
+        if len(t) == 1 and t.isupper(): return False
+        if t in ('T', 'U', 'V', 'E', 'K', 'Self'): return False
+        return True
+
     def visit(self, node):
         method_name = f'visit_{type(node).__name__}'
         visitor = getattr(self, method_name, self.generic_visit)
@@ -267,7 +296,23 @@ class SemanticAnalyzer:
         if getattr(node, 'module', None):
              self.current_module = node.module
              
+        # Resolve associated types and Self inside this impl
+        mapping = {"Self": node.struct_name}
+        if hasattr(node, 'associated_types'):
+            for assoc_name, assoc_type in node.associated_types.items():
+                 mapping[f"Self_{assoc_name}"] = assoc_type
+             
         for method in node.methods:
+             # Update signature
+             method.return_type = self.apply_submap(method.return_type, mapping)
+             new_params = []
+             for pn, pt in method.params:
+                  new_params.append((pn, self.apply_submap(pt, mapping)))
+             method.params = new_params
+             
+             # Update body
+             self.substitute_generics(method.body, mapping)
+             
              self.visit(method)
         
         self.current_module = prev_mod
@@ -301,14 +346,44 @@ class SemanticAnalyzer:
         if node.trait_name:
              if node.trait_name not in self.traits:
                   self.error(f"Semantic Error: Unknown trait '{node.trait_name}'", node)
-             trait_methods = self.traits[node.trait_name]
+             trait_info = self.traits[node.trait_name]
+             trait_methods = trait_info['methods']
+             expected_types = trait_info['types']
+             
              impl_method_names = set(m.name for m in node.methods)
-             missing = [m for m in trait_methods if m not in impl_method_names]
+             
+             missing = []
+             for m_name, m_node in trait_methods.items():
+                  if m_name not in impl_method_names:
+                       if m_node.body is not None:
+                            new_method = copy.deepcopy(m_node)
+                            node.methods.append(new_method)
+                       else:
+                            missing.append(m_name)
+
              if missing:
                   self.error(f"Semantic Error: Implementation of trait '{node.trait_name}' for '{struct_name}' is missing methods: {', '.join(missing)}", node)
+                  
+             # Check associated types
+             for assoc_type in expected_types:
+                  if assoc_type not in node.associated_types:
+                       self.error(f"Semantic Error: Implementation of trait '{node.trait_name}' for '{struct_name}' is missing associated type '{assoc_type}'", node)
              self.impls.add((struct_name, node.trait_name))
+             
+        # Resolve associated types and Self in signatures
+        mapping = {"Self": struct_name}
+        if hasattr(node, 'associated_types'):
+            for assoc_name, assoc_type in node.associated_types.items():
+                 mapping[f"Self_{assoc_name}"] = assoc_type
 
         for method in node.methods:
+             # Update signature
+             method.return_type = self.apply_submap(method.return_type, mapping)
+             new_params = []
+             for pn, pt in method.params:
+                  new_params.append((pn, self.apply_submap(pt, mapping)))
+             method.params = new_params
+             
              if method.params:
                   pname, ptype = method.params[0]
                   if pname == 'self':
@@ -406,9 +481,17 @@ class SemanticAnalyzer:
     def visit_UnaryExpr(self, node):
         t = self.visit(node.operand)
         if node.op == '*':
-            if not t.endswith('*'): raise Exception("Type Error: Cannot dereference non-pointer")
-            node.type_name = t[:-1]
-            return node.type_name
+            if t.endswith('*'):
+                node.type_name = t[:-1]
+                return node.type_name
+            elif t.startswith('&'):
+                if t.startswith('&mut '):
+                    node.type_name = t[len('&mut '):]
+                else:
+                    node.type_name = t[1:]
+                return node.type_name
+            else:
+                raise Exception(f"Type Error: Cannot dereference non-pointer. Type: {t}")
         elif node.op in ('&', '&mut'):
             if isinstance(node.operand, VariableExpr):
                 var = self.lookup(node.operand.name)
@@ -467,43 +550,89 @@ class SemanticAnalyzer:
         elif base in self.generic_enums: self.instantiate_generic_enum(name)
 
     def instantiate_generic_struct(self, name):
+        print(f"DEBUG TRY MONO STRUCT: {name}")
         if name in self.structs: return
         base_name, rest = name.split('<', 1)
-        args = [a.strip() for a in rest[:-1].split(',')]
+        args = [a.strip() for a in self.split_generic_args(rest[:-1])]
         def_node = self.generic_structs[base_name]
-        for (gn, gb), at in zip(def_node.generics, args):
-             if gb and not self.check_trait_impl(at, gb): raise Exception(f"Bounds check failed for {at}")
+        for (gn, gb, is_const), at in zip(def_node.generics, args):
+             if is_const:
+                  if not at.isdigit(): raise Exception(f"Const generic argument '{at}' must be integer literal")
+             elif gb and not self.check_trait_impl(at, gb): raise Exception(f"Bounds check failed for {at}")
         mapping = dict(zip([g[0] for g in def_node.generics], args))
-        new_fields = [(n, self.apply_submap(t, mapping)) for n, t in def_node.fields]
-        self.structs[name] = dict(new_fields)
-        self.ast_root.append(StructDef(name, new_fields))
+        
+        prev_mod = self.current_module
+        if getattr(def_node, 'module', None): self.current_module = def_node.module
+        new_fields = [(n, self.resolve_type_name(self.apply_submap(t, mapping))) for n, t in def_node.fields]
+        for _, fty in new_fields: self.instantiate_generic_type(fty)
+        self.current_module = prev_mod
+
+        # Only append to AST if args are concrete
+        is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
+        if is_concrete:
+             self.structs[name] = dict(new_fields)
+             print(f"DEBUG MONO STRUCT: {name} fields={new_fields}")
+             self.ast_root.append(StructDef(name, new_fields))
 
     def instantiate_generic_enum(self, name):
         if name in self.enums: return
         base_name, rest = name.split('<', 1)
-        args = [a.strip() for a in rest[:-1].split(',')]
+        args = [a.strip() for a in self.split_generic_args(rest[:-1])]
         def_node = self.generic_enums[base_name]
+        for (gn, gb, is_const), at in zip(def_node.generics, args):
+             if is_const:
+                  if not at.isdigit(): raise Exception(f"Const generic argument '{at}' must be integer literal")
+             elif gb and not self.check_trait_impl(at, gb): raise Exception(f"Bounds check failed for {at}")
         mapping = dict(zip([g[0] for g in def_node.generics], args))
-        new_variants = [(vn, [self.apply_submap(p, mapping) for p in ps]) for vn, ps in def_node.variants]
-        self.enums[name] = {v: ps for v, ps in new_variants}
-        self.ast_root.append(EnumDef(name, new_variants))
+        
+        prev_mod = self.current_module
+        if getattr(def_node, 'module', None): self.current_module = def_node.module
+        new_variants = [(vn, [self.resolve_type_name(self.apply_submap(p, mapping)) for p in ps]) for vn, ps in def_node.variants]
+        for _, ps in new_variants:
+             for p in ps: self.instantiate_generic_type(p)
+        self.current_module = prev_mod
+
+        # Only append to AST if args are concrete
+        is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
+        if is_concrete:
+             self.enums[name] = {v: ps for v, ps in new_variants}
+             self.ast_root.append(EnumDef(name, new_variants))
 
     def instantiate_generic_function(self, name):
         if name in self.functions: return
         base_name, rest = name.split('<', 1)
-        args = [a.strip() for a in rest[:-1].split(',')]
+        args = [a.strip() for a in self.split_generic_args(rest[:-1])]
         if base_name not in self.generic_functions: return self.instantiate_generic_type(name)
         def_node = self.generic_functions[base_name]
+        for (gn, gb, is_const), at in zip(def_node.generics, args):
+             if is_const:
+                  if not at.isdigit(): raise Exception(f"Const generic argument '{at}' must be integer literal")
+             elif gb and not self.check_trait_impl(at, gb): raise Exception(f"Bounds check failed for {at}")
         mapping = dict(zip([g[0] for g in def_node.generics], args))
-        new_params = [(pn, self.apply_submap(pt, mapping)) for pn, pt in def_node.params]
-        new_ret = self.apply_submap(def_node.return_type, mapping)
+        
+        prev_mod = self.current_module
+        if getattr(def_node, 'module', None): self.current_module = def_node.module
+        
+        new_params = [(pn, self.resolve_type_name(self.apply_submap(pt, mapping))) for pn, pt in def_node.params]
+        new_ret = self.resolve_type_name(self.apply_submap(def_node.return_type, mapping))
+        
+        for _, pty in new_params: self.instantiate_generic_type(pty)
+        self.instantiate_generic_type(new_ret)
+        
         import copy
         new_body = copy.deepcopy(def_node.body)
         self.substitute_generics(new_body, mapping)
-        new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
-        self.ast_root.append(new_func)
-        self.functions.add(name)
-        self.function_defs[name] = new_func
+        
+        self.current_module = prev_mod
+        
+        # Only append to AST if args are concrete
+        is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
+        if is_concrete:
+             new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
+             print(f"DEBUG MONO FUNC: {name} params={[p[1] for p in new_params]} ret={new_ret}")
+             self.ast_root.append(new_func)
+             self.functions.add(name)
+             self.function_defs[name] = new_func
 
     def visit_IfStmt(self, node):
         if self.visit(node.condition) != 'bool': raise Exception("If condition must be bool")
@@ -544,8 +673,8 @@ class SemanticAnalyzer:
                 struct_def = self.generic_structs.get(base)
                 if struct_def:
                      mapping = {}
-                     for (gname, bound), gval in zip(struct_def.generics, args):
-                          mapping[gname] = gval
+                     for (gname, bound, is_const), gval in zip(struct_def.generics, args):
+                           mapping[gname] = gval
                      real_ret = self.apply_submap(ret_type, mapping)
             
             item_type = None
@@ -559,12 +688,12 @@ class SemanticAnalyzer:
             
             node.item_type = item_type # Store for codegen
             
-            self.declare_variable(node.var_name, item_type)
+            self.declare_variable(node.var_name, item_type, node=node)
             for s in node.body: self.visit(s)
         else:
             if self.visit(node.start_expr) != 'i32' or self.visit(node.end_expr) != 'i32': 
                 raise Exception("For loop range must be i32")
-            self.declare_variable(node.var_name, 'i32')
+            self.declare_variable(node.var_name, 'i32', node=node)
             for s in node.body: self.visit(s)
             
         self.loop_depth -= 1
@@ -596,7 +725,7 @@ class SemanticAnalyzer:
             pt = self.resolve_type_name(pt)
             node.params[i] = (pn, pt)
             if '<' in pt: self.instantiate_generic_type(pt)
-            self.declare_variable(pn, pt)
+            self.declare_variable(pn, pt, node=node)
         for s in node.body: self.visit(s)
         self.exit_scope()
         self.current_function = None
@@ -610,7 +739,7 @@ class SemanticAnalyzer:
         if init_t != node.type_name and not (('<' in init_t and '<' in node.type_name) and (init_t.split('<')[0] == node.type_name.split('<')[0])):
              raise Exception(f"Type Error: {init_t} != {node.type_name}")
         if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_t): self.move_var(node.initializer.name)
-        self.declare_variable(node.name, node.type_name)
+        self.declare_variable(node.name, node.type_name, node=node)
 
     def visit_Assignment(self, node):
         val_t = self.visit(node.value)
@@ -641,6 +770,46 @@ class SemanticAnalyzer:
     def visit_BooleanLiteral(self, node): return 'bool'
     def visit_StringLiteral(self, node): return 'string'
     def visit_CharLiteral(self, node): return 'char'
+    
+    def visit_LambdaExpr(self, node):
+        lambda_name = f"__lambda_{self.lambda_count}"
+        self.lambda_count += 1
+        node.lambda_name = lambda_name
+        
+        resolved_params = []
+        for pname, ptype in node.params:
+            rt = self.resolve_type_name(ptype) if ptype else 'i32'
+            resolved_params.append((pname, rt))
+            
+        ret_type = self.resolve_type_name(node.return_type) if node.return_type else 'i32'
+        
+        # Create FunctionDef
+        func_node = FunctionDef(lambda_name, resolved_params, ret_type, node.body, is_pub=True)
+        func_node.lambda_node = node
+        func_node.is_lambda = True
+        func_node.line = node.line
+        func_node.column = node.column
+        
+        # Register
+        self.function_defs[lambda_name] = func_node
+        self.functions.add(lambda_name)
+        
+        if isinstance(self.ast_root, list):
+            self.ast_root.append(func_node)
+            
+        # Capture Management
+        self.lambda_base_scopes.append(len(self.scopes))
+        self.lambda_capture_stack.append({})
+        
+        self.visit_FunctionDef(func_node)
+        
+        node.captures = self.lambda_capture_stack.pop()
+        self.lambda_base_scopes.pop()
+        
+        param_types = [p[1] for p in resolved_params]
+        # Type of a lambda (pointer to it)
+        return f"fn({','.join(param_types)})->{ret_type}"
+
     def visit_VariableExpr(self, node):
         if '::' in node.name:
             parts = node.name.rsplit('::', 1)
@@ -659,16 +828,44 @@ class SemanticAnalyzer:
             if '<' in prefix and prefix.split('<')[0] in self.generic_enums:
                  return prefix
 
-        v = self.lookup(node.name)
+        v, v_depth = self.lookup_with_depth(node.name)
         if not v: self.error(f"UNDEFINED_VAR_LOOKUP: '{node.name}'", node)
+        
+        if self.lambda_base_scopes:
+             captured = False
+             # If variable is in a scope prior to the current lambda's base scope, it's a capture.
+             # We must mark it as captured for ALL lambdas between the variable's scope and use.
+             for i in range(len(self.lambda_base_scopes) - 1, -1, -1):
+                  if v_depth < self.lambda_base_scopes[i]:
+                        self.lambda_capture_stack[i][node.name] = v['type']
+                        captured = True
+             if captured:
+                  node.is_capture = True
+
         if v['moved']: self.error(f"Use of moved variable '{node.name}'", node)
+        v['used'] = True
         return v['type']
 
+    def process_fn_call(self, node, callee_type):
+        if not callee_type.startswith('fn('):
+             raise Exception(f"Type Error: Cannot call non-function type '{callee_type}'")
+        main_part, _, ret_type = callee_type.rpartition(')->')
+        for arg in node.args: self.visit(arg)
+        return ret_type
+
     def visit_CallExpr(self, node):
+        if not isinstance(node.callee, (str, VariableExpr)):
+             callee_type = self.visit(node.callee)
+             return self.process_fn_call(node, callee_type)
+
         if isinstance(node.callee, VariableExpr):
-             node.callee = node.callee.name
-        callee = node.callee
+             name = node.callee.name
+             v = self.lookup(name)
+             if v:
+                  return self.process_fn_call(node, v['type'])
+             node.callee = name
         
+        callee = node.callee
         if callee in self.aliases:
             callee = self.aliases[callee]
             node.callee = callee
@@ -688,7 +885,7 @@ class SemanticAnalyzer:
                       struct_def = self.generic_structs[base]
                       args_str = prefix[prefix.find('<')+1:-1]
                       args = self.split_generic_args(args_str)
-                      for (gname, bound), gval in zip(struct_def.generics, args):
+                      for (gname, bound, is_const), gval in zip(struct_def.generics, args):
                            generics_mapping[gname] = gval
 
             if prefix in self.enums:
@@ -702,10 +899,29 @@ class SemanticAnalyzer:
                     if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]): self.move_var(arg.name)
                 self.exit_scope(); return prefix
             
+            # Support variants of non-concrete generic enums
+            base_prefix = prefix.split('<')[0]
+            if base_prefix in self.generic_enums:
+                 # We can't type-check the payload thoroughly without instantiation,
+                 # but for now we accept it and return the prefix.
+                 for arg in node.args: self.visit(arg)
+                 return prefix
+            
             # Check for mangled function or struct
-            mangled = f"{prefix.split('<')[0]}_{suffix}"
+            mangled = f"{prefix}_{suffix}"
+            if mangled not in self.function_defs and '<' in prefix:
+                 # Check if this is a generic method we haven't monomorphized yet
+                 base_prefix = prefix.split('<')[0]
+                 if base_prefix in self.generic_structs or base_prefix in self.generic_enums:
+                      self.instantiate_generic_function(mangled)
+            
+            if mangled not in self.function_defs and '<' in prefix:
+                 # Fallback to base name mangling if monomorphized function doesn't exist
+                 mangled = f"{prefix.split('<')[0]}_{suffix}"
+            
             if mangled in self.function_defs: 
-                 callee = mangled; node.callee = mangled
+                 node.callee = mangled
+                 return self.visit_CallExpr(node)
             elif mangled in self.structs or mangled in self.generic_structs:
                  callee = mangled; node.callee = mangled
 
@@ -735,6 +951,12 @@ class SemanticAnalyzer:
                        callee = local
                        node.callee = local
 
+        # Generic Struct Instantiation (e.g. Wrapper<T>)
+        if '<' in callee:
+             base = callee.split('<')[0]
+             if base in self.generic_structs:
+                  self.instantiate_generic_struct(callee)
+
         if callee in self.structs or (callee in self.generic_structs):
             # Constructor call
             struct_name = callee
@@ -746,14 +968,6 @@ class SemanticAnalyzer:
             for i, (fname, ftype) in enumerate(fields.items()):
                 arg_t = self.visit(node.args[i])
                 if arg_t != ftype: 
-                    print(f"DEBUG: arg len={len(arg_t)} exp len={len(ftype)}")
-                    if arg_t != ftype:
-                        for idx in range(min(len(arg_t), len(ftype))):
-                             if arg_t[idx] != ftype[idx]:
-                                  print(f"DIFF at {idx}: '{arg_t[idx]}' vs '{ftype[idx]}'")
-                                  break
-                        if len(arg_t) != len(ftype):
-                             print(f"DIFF len mismatch")
                     raise Exception(f"Type mismatch field '{fname}': expected {ftype}, got {arg_t}")
             self.exit_scope()
             return struct_name
@@ -765,6 +979,7 @@ class SemanticAnalyzer:
 
         if callee in self.functions:
             func_def = self.function_defs[callee]
+            func_def.used = True
             if len(node.args) != len(func_def.params): raise Exception(f"Arg count mismatch for '{callee}'")
             self.enter_scope()
             for i, arg in enumerate(node.args):
@@ -792,17 +1007,32 @@ class SemanticAnalyzer:
                 if var_info:
                     if role == 'reader': var_info['readers'] -= 1
                     elif role == 'writer': var_info['writer'] = False
+        
+        # Check for unused variables
+        for name, info in current_scope.items():
+             if name == 'active_borrows': continue
+             if not info['used'] and not name.startswith('_'):
+                  self.warnings.append((f"Unused variable '{name}'", info['line'], info['col']))
+
         self.scopes.pop()
 
-    def declare_variable(self, name, type_name):
+    def declare_variable(self, name, type_name, node=None):
         if name in self.scopes[-1]:
              raise Exception(f"Semantic Error: Variable '{name}' already declared in this scope")
-        self.scopes[-1][name] = {'type': type_name, 'moved': False, 'readers': 0, 'writer': False}
+        line = node.line if node else 0
+        col = node.column if node else 0
+        self.scopes[-1][name] = {'type': type_name, 'moved': False, 'readers': 0, 'writer': False, 'used': False, 'line': line, 'col': col}
 
     def lookup(self, name):
         for scope in reversed(self.scopes):
             if name in scope: return scope[name]
         return None
+
+    def lookup_with_depth(self, name):
+        for i, scope in enumerate(reversed(self.scopes)):
+            if name in scope:
+                return scope[name], (len(self.scopes) - 1 - i)
+        return None, None
 
     def visit_BlockStmt(self, node):
         self.enter_scope()
@@ -810,7 +1040,7 @@ class SemanticAnalyzer:
         self.exit_scope()
 
     def visit_RegionStmt(self, node):
-        self.enter_scope(); self.declare_variable(node.name, 'Arena')
+        self.enter_scope(); self.declare_variable(node.name, 'Arena', node=node)
         for s in node.body: self.visit(s)
         self.exit_scope()
 
@@ -825,19 +1055,30 @@ class SemanticAnalyzer:
         if isinstance(node, list):
             for x in node: self.substitute_generics(x, mapping)
             return
-        if isinstance(node, VarDecl):
-            if node.type_name: node.type_name = self.apply_submap(node.type_name, mapping)
-            self.substitute_generics(node.initializer, mapping)
-        elif isinstance(node, CallExpr):
-            if isinstance(node.callee, str) and '<' in node.callee: node.callee = self.apply_submap(node.callee, mapping)
-            for a in node.args: self.substitute_generics(a, mapping)
-        elif hasattr(node, '__dict__'):
-            for k, v in node.__dict__.items():
-                if k in ('body', 'then_branch', 'else_branch', 'condition', 'value', 'left', 'right', 'operand', 'target'):
-                    self.substitute_generics(v, mapping)
+        if not hasattr(node, '__dict__'): return
+
+        # 1. Update Type Annotations recursively
+        # We handle all attributes that might carry a type name string
+        for attr in ('type_name', 'struct_type', 'item_type', 'option_type', 'iterator_type', 'enum_name'):
+            if hasattr(node, attr):
+                val = getattr(node, attr)
+                if isinstance(val, str):
+                    setattr(node, attr, self.apply_submap(val, mapping))
+
+        if isinstance(node, CallExpr):
+            if isinstance(node.callee, str) and '<' in node.callee:
+                 node.callee = self.apply_submap(node.callee, mapping)
+
+        # 2. Recurse on Children
+        for k, v in node.__dict__.items():
+            if k in ('type_name', 'struct_type', 'item_type', 'option_type', 'iterator_type', 'enum_name', 'callee', 'name', 'module'): continue 
+            if isinstance(v, (list, object)) and not isinstance(v, (str, int, bool, float)) and v is not None:
+                self.substitute_generics(v, mapping)
 
     def apply_submap(self, t, mapping):
         if not t: return t
+        if t.startswith('&mut '): return '&mut ' + self.apply_submap(t[5:], mapping)
+        if t.startswith('&'): return '&' + self.apply_submap(t[1:], mapping)
         if t.endswith('*'): return self.apply_submap(t[:-1], mapping) + '*'
         if '<' in t and t.endswith('>'):
             b = t[:t.find('<')]; i = t[t.find('<')+1:-1]

@@ -1,0 +1,20 @@
+mod std;
+use std::map::HashMap;
+
+fn main() -> i32 {
+    let mut map = HashMap::<i32, i32>::new();
+    map.insert(10, 100);
+    map.insert(20, 200);
+    
+    let v1 = map.get(10).unwrap();
+    let v2 = map.get(20).unwrap();
+    
+    print(v1); # 100
+    print(v2); # 200
+    
+    map.insert(10, 101);
+    let v3 = map.get(10).unwrap();
+    print(v3); # 101
+
+    return 0;
+}

@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let factor = 10;
+    let mult = |x: i32| x * factor;
+    print(mult(5)); 
+    return 0;
+}
