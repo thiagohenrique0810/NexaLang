@@ -1175,14 +1175,18 @@ extern "C" {
 
 # --- Main ---
 
-fn main() -> i32 {
+fn main(argc: i32, argv: u8**) -> i32 {
+    if (argc < 2) {
+        print("Usage: nxc <input_file>");
+        return 1;
+    }
+    
+    # Get filename from argv[1]
+    let input_file_ptr: *u8 = argv[1];
+    let input_file: string = cast::<string>(input_file_ptr);
+    
     print("NexaLang Native Compiler (nxc) v0.5.0");
-    
-    # Por enquanto, como o suporte a argc/argv via FFI está sendo finalizado,
-    # vamos manter a leitura do arquivo de teste, mas preparar a estrutura.
-    
-    let input_file = "examples/ultra_simple.nxl";
-    print("Compiling...");
+    print("Compiling: ");
     print(input_file);
     
     # 1. Read File

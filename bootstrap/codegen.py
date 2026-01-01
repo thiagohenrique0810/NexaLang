@@ -2458,14 +2458,24 @@ class CodeGen:
                  self.scopes[-1]['$env'] = (env_ptr, 'i8*')
                  self.scopes[-1]['$env_lambda'] = getattr(node, 'lambda_node', None)
 
+            # Special case for main(argc, argv)
+            is_main = node.name == "main" and not getattr(node, 'is_lambda', False)
+            
             for i, (pname, ptype) in enumerate(node.params):
                 arg_val = func.args[i + offset]
                 arg_val.name = pname
-                alloca = self.builder.alloca(self.get_llvm_type(ptype), name=pname)
+                
+                # Use recorded type if it's main args
+                actual_ptype = ptype
+                if is_main:
+                    if i == 0: actual_ptype = "i32"
+                    if i == 1: actual_ptype = "u8**"
+                
+                alloca = self.builder.alloca(self.get_llvm_type(actual_ptype), name=pname)
                 self.builder.store(arg_val, alloca)
 
                 # Store in scope: (Pointer, TypeName)
-                self.scopes[-1][pname] = (alloca, ptype)
+                self.scopes[-1][pname] = (alloca, actual_ptype)
 
         # Process body
         for stmt in node.body:
