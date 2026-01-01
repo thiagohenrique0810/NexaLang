@@ -66,7 +66,7 @@ NexaLang comes with a growing modular standard library:
 ### Basic Commands
 ```bash
 # Initialize a new project
-python nxpkg.py init my_project
+nxpkg init my_project
 
 # Compile and run a file immediately
 nxc run main.nxl
