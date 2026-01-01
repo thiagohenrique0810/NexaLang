@@ -15,8 +15,8 @@ class SemanticAnalyzer:
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_stack = [] # list of labels (None if no label)
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
-        self.function_defs = {} # name -> FunctionDef
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert'])
+        self.function_defs = {} # name -> list of FunctionDef
         self.structs = {} # name -> {field: type}
         self.struct_defs = {} # name -> StructDef (for privacy check)
         self.struct_used = {} # name -> bool
@@ -48,6 +48,8 @@ class SemanticAnalyzer:
 
     def resolve_type_name(self, name):
         if not name: return name
+        # Normalize: remove spaces
+        name = name.replace(' ', '')
         
         # Mark as used if it's a known struct/enum
         base_name = name.split('<')[0] if '<' in name else name
@@ -285,15 +287,21 @@ class SemanticAnalyzer:
         
         inner_t = self.visit(node.value)
         # In a real implementation, Await expects a Future<T> and returns T.
-        # For this bootstrap, we simplify: if it's not 'void', return the type.
+        # For this bootstrap, if it's Task<T>, return T.
+        if inner_t.startswith('Task<') and inner_t.endswith('>'):
+            res_t = inner_t[5:-1]
+            node.type_name = res_t
+            return res_t
+            
         node.type_name = inner_t
         return inner_t
 
     def visit_MacroCallExpr(self, node):
         import os
+        from n_parser import StringLiteral, IntegerLiteral
+        
         if node.name == 'include_str':
             if len(node.args) != 1: self.error("include_str! expects 1 argument", node)
-            from n_parser import StringLiteral
             path_node = node.args[0]
             if not isinstance(path_node, StringLiteral): self.error("include_str! expects string literal", node)
             
@@ -310,13 +318,45 @@ class SemanticAnalyzer:
                 
         elif node.name == 'env':
             if len(node.args) != 1: self.error("env! expects 1 argument", node)
-            from n_parser import StringLiteral
             var_node = node.args[0]
             if not isinstance(var_node, StringLiteral): self.error("env! expects string literal", node)
             
             val = os.environ.get(var_node.value, "")
             node.expanded = StringLiteral(val)
             return 'string'
+
+        elif node.name == 'file':
+            node.expanded = StringLiteral(getattr(self, 'current_file_path', 'unknown'))
+            return 'string'
+
+        elif node.name == 'line':
+            node.expanded = IntegerLiteral(node.line or 0)
+            return 'i32'
+
+        elif node.name == 'column':
+            node.expanded = IntegerLiteral(node.column or 0)
+            return 'i32'
+
+        elif node.name == 'panic':
+            if len(node.args) != 1: self.error("panic! expects 1 argument", node)
+            from n_parser import CallExpr, StringLiteral, IntegerLiteral, BlockStmt
+            msg = node.args[0]
+            
+            # Expand to: __nexa_panic(msg, file, line)
+            expansion = CallExpr("__nexa_panic", [msg, StringLiteral(getattr(self, 'current_file_path', 'unknown')), IntegerLiteral(node.line or 0)])
+            node.expanded = expansion
+            return self.visit(expansion)
+
+        elif node.name == 'assert':
+            if len(node.args) != 2: self.error("assert! expects 2 arguments: condition, message", node)
+            from n_parser import IfStmt, CallExpr, StringLiteral, IntegerLiteral, BlockStmt
+            cond = node.args[0]
+            msg = node.args[1]
+            
+            # Expand to: __nexa_assert(cond, msg, file, line)
+            expansion = CallExpr("__nexa_assert", [cond, msg, StringLiteral(getattr(self, 'current_file_path', 'unknown')), IntegerLiteral(node.line or 0)])
+            node.expanded = expansion
+            return self.visit(expansion)
             
         else:
             self.error(f"Unknown macro: {node.name}!", node)
@@ -324,6 +364,12 @@ class SemanticAnalyzer:
     def analyze(self, ast):
         self.ast_root = ast
         
+        # Register built-ins in function_defs for overload resolution
+        for bf in self.functions:
+            if bf not in self.function_defs:
+                # Create a dummy FunctionDef for built-ins
+                self.function_defs[bf] = [FunctionDef(bf, [], 'void', None)]
+
         # 0. Process Derives
         new_nodes = []
         for node in ast:
@@ -385,10 +431,12 @@ class SemanticAnalyzer:
                  self.register_impl_methods(node)
         
         # Inject Built-ins
-        if 'Buffer' not in self.generic_structs and 'Buffer' not in self.structs:
-            self.generic_structs['Buffer'] = StructDef('Buffer', [('ptr', 'T*'), ('len', 'i32')], generics=['T'])
         if 'Slice' not in self.generic_structs and 'Slice' not in self.structs:
-            self.generic_structs['Slice'] = StructDef('Slice', [('ptr', 'T*'), ('len', 'i32')], generics=['T'])
+            self.generic_structs['Slice'] = StructDef('Slice', [('ptr', 'T*'), ('len', 'i32')], generics=[('T', None, False)])
+        if 'Task' not in self.generic_structs and 'Task' not in self.structs:
+            self.generic_structs['Task'] = StructDef('Task', [('coro_handle', 'u8*'), ('done', 'bool')], generics=[('T', None, False)])
+        if 'Buffer' not in self.generic_structs and 'Buffer' not in self.structs:
+            self.generic_structs['Buffer'] = StructDef('Buffer', [('ptr', 'T*'), ('len', 'i32')], generics=[('T', None, False)])
         self.structs['Arena'] = {'chunk': 'u8*', 'offset': 'i32', 'capacity': 'i32'}
 
         # 1.5 Process Imports (Use Statements)
@@ -635,17 +683,19 @@ class SemanticAnalyzer:
 
     def visit_MemberAccess(self, node):
         obj_type = self.visit(node.object)
-        base_type = obj_type.lstrip('&').replace('mut ', '').rstrip('*')
+        base_type = obj_type.lstrip('&').replace('mut', '').rstrip('*')
         
         # Try full type first (monomorphized)
         if base_type in self.structs:
              fields_dict = self.structs[base_type]
              lookup_type = base_type
         else:
-             lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
+             base = base_type.split('<')[0] if '<' in base_type else base_type
+             lookup_type = self.resolve_type_name(base)
+             
              if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
              elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
-             else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+             else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}' (lookup={lookup_type})")
         
         if node.member not in fields_dict:
              suggestion = self.get_suggestion(node.member, list(fields_dict.keys()))
@@ -1031,6 +1081,13 @@ class SemanticAnalyzer:
             node.name = self.get_mangled_name(node.name, node.params)
             self.functions.add(node.name) # Add mangled name to known functions
             
+        # For async functions, the effective return type from the outside is a Future/Task
+        # but internally we check against the declared return type.
+        if node.is_async:
+            # Inject Task<T> or similar if we want strict typing for caller
+            # For now, let's just make sure it's valid.
+            pass
+
         for s in node.body: self.visit(s)
         self.exit_scope()
         self.current_function = None
@@ -1220,6 +1277,16 @@ class SemanticAnalyzer:
             callee = self.aliases[callee]
             node.callee = callee
         
+        # Handle built-in intrinsics and special internal functions
+        if callee in ('print', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'memcpy', '__nexa_panic', '__nexa_assert'):
+            for a in node.args: self.visit(a)
+            if callee == 'fs::read_file': 
+                self.instantiate_generic_type('Buffer<u8>')
+                node.type_name = 'Buffer<u8>'
+                return 'Buffer<u8>'
+            if callee in ('malloc', 'realloc'): return 'u8*'
+            return 'void'
+
         # Double Colon Logic (also handles resolved aliases from glob imports)
         generics_mapping = {}
         # Double Colon Logic (also handles resolved aliases from glob imports)
@@ -1258,22 +1325,29 @@ class SemanticAnalyzer:
                  return prefix
             
             # Check for mangled function or struct
-            mangled = f"{prefix}_{suffix}"
-            if mangled not in self.function_defs and '<' in prefix:
+            mangled_base = f"{prefix}_{suffix}"
+            if mangled_base not in self.function_defs and '<' in prefix:
                  # Check if this is a generic method we haven't monomorphized yet
                  base_prefix = prefix.split('<')[0]
                  if base_prefix in self.generic_structs or base_prefix in self.generic_enums:
-                      self.instantiate_generic_function(mangled)
+                      self.instantiate_generic_function(mangled_base)
             
-            if mangled not in self.function_defs and '<' in prefix:
+            if mangled_base not in self.function_defs and '<' in prefix:
                  # Fallback to base name mangling if monomorphized function doesn't exist
-                 mangled = f"{prefix.split('<')[0]}_{suffix}"
+                 mangled_base = f"{prefix.split('<')[0]}_{suffix}"
             
-            if mangled in self.function_defs: 
-                 node.callee = mangled
-                 return self.visit_CallExpr(node)
-            elif mangled in self.structs or mangled in self.generic_structs:
-                 callee = mangled; node.callee = mangled
+            if mangled_base in self.function_defs:
+                 arg_types = [self.visit(arg) for arg in node.args]
+                 func_def, mangled_full = self.resolve_overload(mangled_base, arg_types, node)
+                 node.callee = mangled_full
+                 func_def.used = True
+                 
+                 ret = func_def.return_type
+                 if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
+                 return ret
+            
+            if mangled_base in self.structs or mangled_base in self.generic_structs:
+                 callee = mangled_base; node.callee = mangled_base
 
         if callee == 'print':
             for a in node.args: self.visit(a)
@@ -1316,14 +1390,30 @@ class SemanticAnalyzer:
         # Generic Struct Instantiation (e.g. Wrapper<T>)
         if '<' in callee:
              base = callee.split('<')[0]
-             if base in self.generic_structs:
+             resolved_base = self.resolve_type_name(base)
+             if resolved_base in self.generic_structs:
+                  callee = f"{resolved_base}<{callee[callee.find('<')+1:]}"
+                  node.callee = callee
                   self.instantiate_generic_struct(callee)
 
-        if callee in self.structs or (callee in self.generic_structs):
+        if callee in self.structs or (callee in self.generic_structs) or ('<' in callee and callee.split('<')[0] in self.generic_structs):
             # Constructor call
             struct_name = callee
-            if '<' in struct_name: self.instantiate_generic_struct(struct_name)
+            if '<' in struct_name:
+                 base = struct_name.split('<')[0]
+                 if base in self.generic_structs:
+                      self.instantiate_generic_struct(struct_name)
             
+            if struct_name not in self.structs:
+                 # Check if base exists but not instantiated
+                 base = struct_name.split('<')[0] if '<' in struct_name else struct_name
+                 if base in self.generic_structs:
+                      # Still not instantiated? maybe args are not concrete
+                      # We return the generic type name
+                      for a in node.args: self.visit(a)
+                      return struct_name
+                 raise Exception(f"Semantic Error: Unknown struct '{struct_name}'")
+
             # Mark struct as used
             base_struct = struct_name.split('<')[0]
             if base_struct in self.struct_used: self.struct_used[base_struct] = True
@@ -1359,6 +1449,13 @@ class SemanticAnalyzer:
 
             ret = func_def.return_type
             if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
+            
+            if func_def.is_async:
+                # Wrap in Task<T>
+                task_type = f"Task<{ret}>"
+                self.instantiate_generic_type(task_type)
+                return task_type
+                
             return ret
 
         raise Exception(f"Semantic Error: Unknown function or struct definition '{callee}'")
@@ -1457,7 +1554,9 @@ class SemanticAnalyzer:
 
     def apply_submap(self, t, mapping):
         if not t: return t
-        if t.startswith('&mut '): return '&mut ' + self.apply_submap(t[5:], mapping)
+        # Normalize: remove spaces
+        t = t.replace(' ', '')
+        if t.startswith('&mut'): return '&mut' + self.apply_submap(t[4:], mapping)
         if t.startswith('&'): return '&' + self.apply_submap(t[1:], mapping)
         if t.endswith('*'): return self.apply_submap(t[:-1], mapping) + '*'
         if '<' in t and t.endswith('>'):

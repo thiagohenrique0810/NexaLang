@@ -104,6 +104,7 @@ def main():
     from semantic import SemanticAnalyzer
     analyzer = SemanticAnalyzer()
     analyzer.current_dir = os.path.dirname(os.path.abspath(filepath))
+    analyzer.current_file_path = os.path.basename(filepath)
     
     # Pre-analyze to find tests if --run-tests is on
     if args.run_tests:

@@ -9,3 +9,4 @@ pub mod io;
 pub mod json;
 pub mod net;
 pub mod db;
+pub mod task;

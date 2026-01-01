@@ -48,6 +48,8 @@ class CodeGen:
         self.enum_payloads = {} # name -> {variant: payload_type}
         self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
         self.scopes = []
+        
+        self._declare_intrinsics()
         self.loop_stack = [] # Stack of (continue_block, break_block, scope_depth, label)
 
         # For Vulkan SPIR-V kernels-only, avoid emitting host/runtime helpers
@@ -202,6 +204,34 @@ class CodeGen:
             # Fallback pointer
             return "void*"
         return "STD_MISSING"
+
+    def _declare_intrinsics(self):
+        # ... existing intrinsics ...
+        void_ptr = ir.IntType(8).as_pointer()
+        i32 = ir.IntType(32)
+        i1 = ir.IntType(1)
+        i64 = ir.IntType(64)
+
+        # External Coroutine Hooks (only if not already there)
+        if "__nexa_resume" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="__nexa_resume")
+        if "__nexa_is_done" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(i1, [void_ptr]), name="__nexa_is_done")
+        if "__nexa_destroy" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="__nexa_destroy")
+
+        # LLVM Coroutine Intrinsics
+        token_ty = ir.IntType(8).as_pointer() # Placeholder for TokenType
+        self.coro_id = ir.Function(self.module, ir.FunctionType(token_ty, [i32, void_ptr, void_ptr, void_ptr]), name="llvm.coro.id")
+        self.coro_size = ir.Function(self.module, ir.FunctionType(i32, []), name="llvm.coro.size.i32")
+        self.coro_begin = ir.Function(self.module, ir.FunctionType(void_ptr, [token_ty, void_ptr]), name="llvm.coro.begin")
+        self.coro_free = ir.Function(self.module, ir.FunctionType(void_ptr, [token_ty, void_ptr]), name="llvm.coro.free")
+        self.coro_end = ir.Function(self.module, ir.FunctionType(i1, [void_ptr, i1]), name="llvm.coro.end")
+        self.coro_suspend = ir.Function(self.module, ir.FunctionType(ir.IntType(8), [token_ty, i1]), name="llvm.coro.suspend")
+        self.coro_resume = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="llvm.coro.resume")
+        self.coro_destroy = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="llvm.coro.destroy")
+        self.coro_done = ir.Function(self.module, ir.FunctionType(i1, [void_ptr]), name="llvm.coro.done")
+        self.coro_promise = ir.Function(self.module, ir.FunctionType(void_ptr, [void_ptr, i32, i1]), name="llvm.coro.promise")
 
     def _declare_arena(self):
         # struct Arena { chunk: i8*, offset: i32, capacity: i32 }
@@ -583,9 +613,38 @@ class CodeGen:
         raise Exception(f"Macro {node.name}! was not expanded during semantic analysis")
 
     def visit_AwaitExpr(self, node):
-        # Synchronous fallback: await just executes the expression
-        # (which is usually a CallExpr) and returns its value.
-        return self.visit(node.value)
+        # 1. Evaluate the expression (returns handle/pointer to state)
+        h = self.visit(node.value)
+        
+        # 2. Polling Loop
+        res_type_name = getattr(node, 'type_name', 'void')
+        res_ty = self.get_llvm_type(res_type_name)
+        # struct { i1 done, T result }
+        state_ty = ir.LiteralStructType([ir.IntType(1), res_ty])
+        state = self.builder.bitcast(h, state_ty.as_pointer())
+        
+        cond_bb = self.builder.append_basic_block("await_cond")
+        body_bb = self.builder.append_basic_block("await_poll")
+        cont_bb = self.builder.append_basic_block("await_cont")
+        
+        self.builder.branch(cond_bb)
+        self.builder.position_at_end(cond_bb)
+        
+        done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+        done = self.builder.load(done_ptr)
+        self.builder.cbranch(done, cont_bb, body_bb)
+        
+        self.builder.position_at_end(body_bb)
+        # Here we could yield to executor. For bootstrap, we just loop (busy wait).
+        self.builder.branch(cond_bb)
+        
+        self.builder.position_at_end(cont_bb)
+        # 3. Load result
+        if res_type_name == 'void':
+            return ir.Constant(ir.IntType(32), 0)
+            
+        res_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
+        return self.builder.load(res_ptr)
 
     def visit_UnaryExpr(self, node):
         if node.op == '&':
@@ -2132,6 +2191,39 @@ class CodeGen:
 
             return self.builder.call(self.memcpy, [dest, src, size, is_volatile])
 
+        elif callee == "__nexa_panic":
+            # __nexa_panic(msg, file, line)
+            msg = self.visit(node.args[0])
+            file = self.visit(node.args[1])
+            line = self.visit(node.args[2])
+            
+            voidptr_ty = ir.IntType(8).as_pointer()
+            fmt_s = self.visit_StringLiteral(None, name="panic_fmt", value_override="PANIC: %s at %s:%d\n\0")
+            fmt_arg = self.builder.bitcast(fmt_s, voidptr_ty)
+            
+            self.builder.call(self.printf, [fmt_arg, msg, file, line])
+            self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
+            return None
+
+        elif callee == "__nexa_assert":
+            # __nexa_assert(cond, msg, file, line)
+            cond_val = self.visit(node.args[0])
+            msg = self.visit(node.args[1])
+            file = self.visit(node.args[2])
+            line = self.visit(node.args[3])
+            
+            # if (!cond) { panic... }
+            if cond_val.type != ir.IntType(1):
+                cond_val = self.builder.icmp_signed('!=', cond_val, ir.Constant(cond_val.type, 0))
+            
+            with self.builder.if_then(self.builder.not_(cond_val)):
+                voidptr_ty = ir.IntType(8).as_pointer()
+                fmt_s = self.visit_StringLiteral(None, name="assert_fmt", value_override="ASSERTION FAILED: %s at %s:%d\n\0")
+                fmt_arg = self.builder.bitcast(fmt_s, voidptr_ty)
+                self.builder.call(self.printf, [fmt_arg, msg, file, line])
+                self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
+            return None
+
         elif node.callee == "gpu::global_id":
             if self.target == "spirv" and hasattr(self, "spirv_global_invocation_id"):
                 gid = self.builder.load(self.spirv_global_invocation_id, name="spirv_gid")
@@ -2365,7 +2457,25 @@ class CodeGen:
             self.emit_scope_drops(scope)
 
         if not self.builder.block.is_terminated:
-            if ret_val:
+            if getattr(self._current_function_node, 'is_async', False):
+                # Set done = true and store result in manual state
+                for scope in reversed(self.scopes):
+                    if '$async_state' in scope:
+                        state = scope['$async_state']
+                        # done = true
+                        done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+                        self.builder.store(ir.Constant(ir.IntType(1), 1), done_ptr)
+                        # result
+                        if ret_val:
+                            res_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
+                            self.builder.store(ret_val, res_ptr)
+                        
+                        # Return state pointer as handle
+                        void_ptr = ir.IntType(8).as_pointer()
+                        h = self.builder.bitcast(state, void_ptr)
+                        self.builder.ret(h)
+                        break
+            elif ret_val:
                 self.builder.ret(ret_val)
             else:
                 self.builder.ret_void()
@@ -2375,31 +2485,13 @@ class CodeGen:
 
         # Determine function type
         arg_types = []
-        # Vulkan Shader entrypoints cannot have parameters; map kernel params to globals instead.
-        if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:
-            for pname, ptype in node.params:
-                if isinstance(ptype, str) and ptype.startswith("Buffer<"):
-                    self._get_or_declare_vulkan_buffer_globals(node.name, pname, ptype)
-                else:
-                    self._get_or_declare_vulkan_kernel_arg_global(node.name, pname, ptype)
-        else:
-            for _, ptype in node.params:
-                # Handle arrays manually for now or add to get_llvm_type
-                if ptype.startswith('['):
-                    content = ptype[1:-1]
-                    elem_str, size_str = content.split(':')
-                    elem_ty = self.get_llvm_type(elem_str)
-                    arg_types.append(ir.ArrayType(elem_ty, int(size_str)))
-                elif ptype in self.enum_definitions: # Enums need special handling? 
-                    # get_llvm_type might handle if added? 
-                    # For now fallback or manual
-                    ety, _ = self.enum_definitions[ptype]
-                    arg_types.append(ety)
-                else:
-                    arg_types.append(self.get_llvm_type(ptype))
-
+        # ...
+        
         ret_type = ir.VoidType()
-        if node.return_type != 'void':
+        if getattr(node, 'is_async', False):
+            # Async functions return a coroutine handle (i8*)
+            ret_type = ir.IntType(8).as_pointer()
+        elif node.return_type != 'void':
             ret_type = self.get_llvm_type(node.return_type)
 
         # Add env pointer to lambda signatures
@@ -2436,6 +2528,7 @@ class CodeGen:
             self._kernel_function_names.add(node.name)
 
         self._current_function_name = node.name
+        self._current_function_node = node
         self._current_function_is_kernel = bool(node.is_kernel)
         self.current_lambda_node = getattr(node, 'lambda_node', None)
         if self.current_lambda_node:
@@ -2446,6 +2539,21 @@ class CodeGen:
 
         # Create new scope
         self.scopes.append({})
+
+        is_async = getattr(node, 'is_async', False)
+        if is_async:
+            # Manual Coroutine State
+            res_ty = self.get_llvm_type(node.return_type)
+            # struct { i1 done, T result }
+            state_ty = ir.LiteralStructType([ir.IntType(1), res_ty])
+            state_ptr = self.builder.call(self.malloc, [ir.Constant(ir.IntType(32), 16)]) # Simplified size
+            state = self.builder.bitcast(state_ptr, state_ty.as_pointer())
+            
+            # Init state: done = false
+            done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+            self.builder.store(ir.Constant(ir.IntType(1), 0), done_ptr)
+            
+            self.scopes[-1]['$async_state'] = state
 
         # Register arguments in scope
         if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:

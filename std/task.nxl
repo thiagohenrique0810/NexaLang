@@ -1,0 +1,36 @@
+use std::vec::Vec;
+use std::option::Option;
+
+pub struct Task<T> {
+    coro_handle: *u8,
+    done: bool
+}
+
+pub struct Executor {
+    tasks: Vec<*u8> # Simplified: storing raw handles for now
+}
+
+impl Executor {
+    fn new() -> Executor {
+        return Executor(Vec::<*u8>::new());
+    }
+
+    fn spawn(&mut self, coro: *u8) {
+        self.tasks.push(coro);
+    }
+
+    fn run(&mut self) {
+        while (self.tasks.len() > 0) {
+            # In a real implementation, we would iterate and resume.
+            # For bootstrap, we'll keep it simple.
+            break;
+        }
+    }
+}
+
+# Built-in compiler hooks for async/await
+extern "C" {
+    fn __nexa_resume(h: *u8);
+    fn __nexa_is_done(h: *u8) -> bool;
+    fn __nexa_destroy(h: *u8);
+}

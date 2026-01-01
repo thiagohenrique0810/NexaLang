@@ -1,0 +1,35 @@
+use std::option::Option;
+
+pub trait Future<T> {
+    fn poll(&mut self) -> Option<T>;
+}
+
+pub struct Ready<T> {
+    val: T,
+    done: bool
+}
+
+impl<T> Ready<T> {
+    fn new(v: T) -> Ready<T> {
+        return Ready(v, false);
+    }
+}
+
+impl<T> Future<T> for Ready<T> {
+    fn poll(&mut self) -> Option<T> {
+        if (self.done) { return Option::<T>::None; }
+        self.done = true;
+        return Option::<T>::Some(self.val);
+    }
+}
+
+pub fn block_on<T, F: Future<T>>(mut f: F) -> T {
+    while (true) {
+        let res = f.poll();
+        match (res) {
+            Some(v) => return v,
+            None => {}
+        }
+    }
+    return cast::<T>(0);
+}

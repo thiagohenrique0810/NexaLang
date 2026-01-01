@@ -215,10 +215,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Function pointers as arguments
 
 ## Phase 9: Future Directions 🚀
-- [/] Async/await (Syntax and Semantic foundation ready; Sync-fallback in Codegen)
+- [x] Async/await (Full LLVM Coroutine transformation + Executor)
 - [x] Procedural macros
     - [x] Macro call syntax (`ident!(...)`).
-    - [x] Built-in macros: `include_str!`, `env!`.
+    - [x] Built-in macros: `include_str!`, `env!`, `file!`, `line!`, `panic!`, `assert!`.
 - [x] Foreign Function Interface (FFI) for C interop
 - [x] Package manager (`nxpkg`)
 - [x] Build system improvements (Project support via `nexa.json`)

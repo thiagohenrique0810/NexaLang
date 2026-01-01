@@ -1,0 +1,20 @@
+async fn fetch_val() -> i32 {
+    print("Inside async fn...");
+    return 42;
+}
+
+async fn main() -> i32 {
+    print("Main starting...");
+    
+    # Call async fn -> returns Task<i32>
+    let t = fetch_val();
+    
+    # Await it -> returns i32
+    let val = await t;
+    
+    print("Awaited value:");
+    print(val);
+    
+    assert!(val == 42, "Async failed");
+    return 0;
+}
