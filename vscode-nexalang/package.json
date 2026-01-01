@@ -1,9 +1,10 @@
 {
   "name": "nexalang",
   "displayName": "NexaLang",
-  "description": "Syntax highlighting for NexaLang (.nxl)",
-  "version": "0.0.1",
-  "publisher": "thiago-henrique",
+  "description": "Syntax highlighting and official tooling for NexaLang (.nxl)",
+  "version": "0.1.0",
+  "publisher": "nexalang",
+  "icon": "nexalang-icon.svg",
   "engines": {
     "vscode": "^1.80.0"
   },
