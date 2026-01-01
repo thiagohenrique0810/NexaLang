@@ -96,6 +96,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
     - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`, `struct`, `call`, `member`).
     - [x] Verify `nxc` can compile `nxc`.
+    - [x] Native binary `nxc.exe` generated.
 - [ ] **Tooling**
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
     - [x] Syntax highlighter extension (VSCode) (TextMate grammar under `vscode-nexalang/`).

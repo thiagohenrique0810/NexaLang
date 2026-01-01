@@ -274,13 +274,15 @@ class SemanticAnalyzer:
                     self.functions.add(node.name)
                     if node.name not in self.function_defs:
                         self.function_defs[node.name] = []
-                    
-                    if not isinstance(self.function_defs[node.name], list):
-                        # Handle case where it was a single item from a previous turn? 
-                        # Unlikely but safer.
-                        self.function_defs[node.name] = [self.function_defs[node.name]]
-                        
                     self.function_defs[node.name].append(node)
+            elif name == 'ExternBlock':
+                 for func in node.functions:
+                      func.module = getattr(node, 'module', '')
+                      self.canonicalize_type_refs(func)
+                      if func.name not in self.function_defs:
+                          self.function_defs[func.name] = []
+                      self.function_defs[func.name].append(func)
+                      self.functions.add(func.name)
             elif name == 'ImplDef':
                  self.register_impl_methods(node)
         
@@ -309,6 +311,11 @@ class SemanticAnalyzer:
         # 3. Dead Code Analysis
         for name, funcs in self.function_defs.items():
              if name == 'main' or name.endswith('::main'): continue
+             
+             # Safety: ensure funcs is a list
+             if not isinstance(funcs, list):
+                 funcs = [funcs]
+                 
              for func in funcs:
                   if not func.used and not func.is_pub and not name.startswith('std_'):
                        # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
@@ -810,7 +817,9 @@ class SemanticAnalyzer:
              new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
              self.ast_root.append(new_func)
              self.functions.add(name)
-             self.function_defs[name] = new_func
+             if name not in self.function_defs:
+                 self.function_defs[name] = []
+             self.function_defs[name].append(new_func)
 
     def visit_IfStmt(self, node):
         if self.visit(node.condition) != 'bool': raise Exception("If condition must be bool")

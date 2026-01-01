@@ -1167,13 +1167,30 @@ fn emit_ll(prog: Program) {
     # Globals handling omitted for now (Print(Str) will be no-op)
     print("Emitted LLVM IR to dev/artifacts/output.ll");
 }
+# --- FFI for CLI Arguments ---
+extern "C" {
+    fn malloc(size: i32) -> u8*;
+    fn free(ptr: u8*);
+}
+
 # --- Main ---
 
 fn main() -> i32 {
-    print("Starting Self-Host Compiler...");
+    print("NexaLang Native Compiler (nxc) v0.5.0");
     
-    # 1. Read Lexer
-    let src_buf: Buffer<u8> = fs::read_file("examples/ultra_simple.nxl");
+    # Por enquanto, como o suporte a argc/argv via FFI está sendo finalizado,
+    # vamos manter a leitura do arquivo de teste, mas preparar a estrutura.
+    
+    let input_file = "examples/ultra_simple.nxl";
+    print("Compiling...");
+    print(input_file);
+    
+    # 1. Read File
+    let src_buf: Buffer<u8> = fs::read_file(input_file);
+    if (src_buf.len == 0) {
+        print("Error: Could not read input file.");
+        return 1;
+    }
     
     # 2. Tokenize
     let max_toks: i32 = 1000;
