@@ -73,7 +73,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             return rc
         # Link
         if not args.no_link:
-            return _run([_clang(), ll_out, "-o", out])
+            return _run([_clang(), ll_out, f"-{args.opt}", "-o", out])
         return 0
 
     # SPIR-V
@@ -150,7 +150,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     rc = _run(cmd)
     if rc != 0:
         return rc
-    rc = _run([_clang(), ll_out, "-o", exe])
+    rc = _run([_clang(), ll_out, f"-{getattr(args, 'opt', 'O0')}", "-o", exe])
     if rc != 0:
         return rc
     return _run([exe])
@@ -182,7 +182,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     if rc != 0: return rc
     
     # Link
-    rc = _run([_clang(), ll_out, "-o", exe_out])
+    rc = _run([_clang(), ll_out, f"-{getattr(args, 'opt', 'O0')}", "-o", exe_out])
     if rc != 0: return rc
     
     # Run
@@ -210,6 +210,7 @@ def main() -> int:
     p_build.add_argument("--out", default=None, help="(native) output exe path")
     p_build.add_argument("--ll-out", default=None, help="output .ll path")
     p_build.add_argument("--spv-out", default=None, help="output .spv path")
+    p_build.add_argument("--opt", choices=["O0", "O1", "O2", "O3"], default="O0", help="Optimization level")
 
     # SPIR-V flags
     p_build.add_argument("--spirv-env", choices=["opencl", "vulkan"], default="opencl")
@@ -225,10 +226,12 @@ def main() -> int:
     p_run.add_argument("--exe", default=None, help="Output exe path")
     p_run.add_argument("--ll-out", default=None, help="Output .ll path")
     p_run.add_argument("--jit", action="store_true", help="Run using JIT (no clang required)")
+    p_run.add_argument("--opt", choices=["O0", "O1", "O2", "O3"], default="O0", help="Optimization level")
     p_run.set_defaults(func=cmd_run)
 
     p_test = sub.add_parser("test", help="Run tests (functions marked with @[test])")
     p_test.add_argument("file", nargs="?", help="Input .nxl")
+    p_test.add_argument("--opt", choices=["O0", "O1", "O2", "O3"], default="O0", help="Optimization level")
     p_test.set_defaults(func=cmd_test)
 
     p_val = sub.add_parser("val", help="Validate artifacts (SPIR-V)")

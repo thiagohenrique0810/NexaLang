@@ -18,6 +18,11 @@
         {
           "name": "comment.line.number-sign.nexalang",
           "match": "#.*$"
+        },
+        {
+          "name": "comment.block.nexalang",
+          "begin": "/\\*",
+          "end": "\\*/"
         }
       ]
     },
@@ -57,7 +62,7 @@
       "patterns": [
         {
           "name": "keyword.control.nexalang",
-          "match": "\\b(fn|kernel|struct|enum|match|region|let|return|if|else|while|mut)\\b"
+          "match": "\\b(fn|kernel|struct|enum|match|region|let|return|if|else|while|mut|pub|mod|use|type|extern|async|await|break|continue|for|in|trait|impl)\\b"
         },
         {
           "name": "constant.language.boolean.nexalang",

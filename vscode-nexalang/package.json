@@ -25,6 +25,12 @@
         "scopeName": "source.nexalang",
         "path": "./syntaxes/nexalang.tmLanguage.json"
       }
+    ],
+    "snippets": [
+      {
+        "language": "nexalang",
+        "path": "./snippets/nexalang.json"
+      }
     ]
   }
 }

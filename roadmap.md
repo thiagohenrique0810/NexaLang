@@ -97,9 +97,9 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`, `struct`, `call`, `member`).
     - [x] Verify `nxc` can compile `nxc`.
     - [x] Native binary `nxc.exe` generated.
-- [ ] **Tooling**
-    - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
-    - [x] Syntax highlighter extension (VSCode) (TextMate grammar under `vscode-nexalang/`).
+- [x] Tooling
+    - [x] `nx` CLI build tool (bootstrap: `python nx.py ...` with optimization support).
+    - [x] Syntax highlighter extension (VSCode) (complete with keywords, snippets and multi-line comments).
 
 ## Phase 6: Advanced Language Features 🎯
 

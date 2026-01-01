@@ -1,0 +1,65 @@
+{
+    "Function": {
+        "prefix": "fn",
+        "body": [
+            "fn ${1:name}(${2:params}) -> ${3:i32} {",
+            "    ${0:# code}",
+            "    return 0;",
+            "}"
+        ],
+        "description": "Define a function"
+    },
+    "Main Function": {
+        "prefix": "main",
+        "body": [
+            "fn main() -> i32 {",
+            "    ${0:print(\"Hello, Nexa!\");}",
+            "    return 0;",
+            "}"
+        ],
+        "description": "Main entry point"
+    },
+    "Struct": {
+        "prefix": "struct",
+        "body": [
+            "struct ${1:Name} {",
+            "    ${2:field}: ${3:i32},",
+            "}"
+        ],
+        "description": "Define a struct"
+    },
+    "Test Function": {
+        "prefix": "test",
+        "body": [
+            "@[test]",
+            "fn test_${1:name}() {",
+            "    assert(${2:condition}, \"${3:error message}\");",
+            "}"
+        ],
+        "description": "Define a test case"
+    },
+    "If Statement": {
+        "prefix": "if",
+        "body": [
+            "if (${1:condition}) {",
+            "    ${0}",
+            "}"
+        ]
+    },
+    "While Loop": {
+        "prefix": "while",
+        "body": [
+            "while (${1:condition}) {",
+            "    ${0}",
+            "}"
+        ]
+    },
+    "For Loop": {
+        "prefix": "for",
+        "body": [
+            "for ${1:i} in ${2:0..10} {",
+            "    ${0}",
+            "}"
+        ]
+    }
+}
