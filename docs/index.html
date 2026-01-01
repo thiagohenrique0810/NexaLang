@@ -100,7 +100,10 @@ chmod +x nxc
 sudo ln -s $(pwd)/nxc /usr/local/bin/nxc</code></pre>
 
                 <h3>Uso da CLI</h3>
-                <pre><code># Compilar e executar um arquivo
+                <pre><code># Inicializar um novo projeto
+nxpkg init meu_projeto
+
+# Compilar e executar um arquivo
 nxc run examples/hello.nxl
 
 # Compilar para binário nativo otimizado

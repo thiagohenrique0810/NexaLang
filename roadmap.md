@@ -221,4 +221,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] Package manager (`nxpkg`)
 - [x] Build system improvements (Project support via `nexa.json`)
 - [x] Standard library expansion (HashMap, File I/O, etc.)
+- [/] Networking Stack (FFI foundation for libcurl)
+- [/] Data Serialization (Basic JSON parser implemented)
+- [/] Database Drivers (FFI foundation for SQLite)
 

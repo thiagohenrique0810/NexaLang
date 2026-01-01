@@ -1,0 +1,88 @@
+use std::vec::Vec;
+use std::map::HashMap;
+use std::string::String;
+
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(i32),
+    Str(String),
+    Array(Vec<JsonValue>),
+    Object(HashMap<String, JsonValue>)
+}
+
+impl JsonValue {
+    fn parse(s: string) -> JsonValue {
+        let ptr = cast::<*u8>(s);
+        let i = 0;
+        return JsonValue::parse_internal(ptr, &i);
+    }
+
+    fn parse_internal(ptr: *u8, i: *i32) -> JsonValue {
+        # Skip whitespace
+        while (cast::<i32>(ptr[*i]) == 32 or cast::<i32>(ptr[*i]) == 10) {
+            *i = *i + 1;
+        }
+
+        let c = cast::<i32>(ptr[*i]);
+        
+        # String
+        if (c == 34) { # "
+            *i = *i + 1;
+            let start = *i;
+            while (cast::<i32>(ptr[*i]) != 34) {
+                *i = *i + 1;
+            }
+            let len = *i - start;
+            *i = *i + 1;
+            
+            # Simple substring
+            let buf = malloc(len + 1);
+            memcpy(buf, ptr_offset::<u8>(ptr, start), len);
+            buf[len] = cast::<u8>(0);
+            return JsonValue::Str(String::from(cast::<string>(buf)));
+        }
+
+        # Number (simplified)
+        if (c >= 48 and c <= 57) {
+            let res = 0;
+            while (cast::<i32>(ptr[*i]) >= 48 and cast::<i32>(ptr[*i]) <= 57) {
+                res = res * 10 + (cast::<i32>(ptr[*i]) - 48);
+                *i = *i + 1;
+            }
+            return JsonValue::Number(res);
+        }
+
+        # Null fallback
+        *i = *i + 1;
+        return JsonValue::Null;
+    }
+
+    fn stringify(&self) -> String {
+        let s = self;
+        match (s) {
+            Null => return String::from("null"),
+            Bool(b) => {
+                if (b) { return String::from("true"); }
+                return String::from("false");
+            }
+            Number(n) => return String::from_i32(n),
+            Str(v) => {
+                let res = String::from("\"");
+                let content = res.concat(v.as_ptr()); # Simplificação para o bootstrap
+                return content.concat("\"");
+            }
+            Array(arr) => {
+                let res = String::from("[");
+                for i in 0..arr.len() {
+                    let val = arr.get(i).unwrap();
+                    # ... recursão e concatenação ...
+                }
+                return res.concat("]");
+            }
+            Object(obj) => {
+                return String::from("{...}"); # Implementação completa exigiria mais helpers
+            }
+        }
+    }
+}

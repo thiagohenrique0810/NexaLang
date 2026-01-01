@@ -1,0 +1,20 @@
+extern "C" {
+    fn sqlite3_open(filename: *u8, ppDb: **u8) -> i32;
+    fn sqlite3_exec(db: *u8, sql: *u8, callback: *u8, arg: *u8, errmsg: **u8) -> i32;
+    fn sqlite3_close(db: *u8) -> i32;
+}
+
+fn main() -> i32 {
+    let mut db: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_open(cast::<*u8>("test.db"), &db);
+    
+    if (rc == 0) {
+        print("Database opened successfully");
+        sqlite3_exec(db, cast::<*u8>("CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT);"), cast::<*u8>(0), cast::<*u8>(0), cast::<**u8>(0));
+        sqlite3_close(db);
+    } else {
+        print("Failed to open database");
+    }
+    
+    return 0;
+}

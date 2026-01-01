@@ -1,0 +1,29 @@
+extern "C" {
+    fn curl_easy_init() -> *u8;
+    fn curl_easy_setopt(handle: *u8, option: i32, param: *u8) -> i32;
+    fn curl_easy_perform(handle: *u8) -> i32;
+    fn curl_easy_cleanup(handle: *u8);
+}
+
+pub struct HttpClient {
+    handle: *u8
+}
+
+impl HttpClient {
+    fn new() -> HttpClient {
+        let h = curl_easy_init();
+        return HttpClient(h);
+    }
+
+    fn get(&self, url: string) -> i32 {
+        # CURLOPT_URL = 10002
+        curl_easy_setopt(self.handle, 10002, cast::<*u8>(url));
+        return curl_easy_perform(self.handle);
+    }
+
+    fn drop(self) {
+        if (cast::<i64>(self.handle) != 0) {
+            curl_easy_cleanup(self.handle);
+        }
+    }
+}
