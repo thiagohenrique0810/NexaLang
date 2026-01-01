@@ -5,3 +5,4 @@ pub mod hash;
 pub mod map;
 pub mod fs;
 pub mod string;
+pub mod io;

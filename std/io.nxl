@@ -1,0 +1,46 @@
+extern "C" {
+    fn getchar() -> i32;
+    fn putchar(c: i32) -> i32;
+}
+
+use std::string::String;
+
+pub fn read_line() -> String {
+    let cap = 64;
+    let ptr = malloc(cap);
+    let len = 0;
+    
+    while (true) {
+        let c = getchar();
+        if (c == 10 or c == -1) { # \n or EOF
+            break;
+        }
+        
+        if (len + 1 >= cap) {
+            let new_cap = cap * 2;
+            let new_ptr = malloc(new_cap);
+            memcpy(new_ptr, ptr, len);
+            free(ptr);
+            ptr = new_ptr;
+            cap = new_cap;
+        }
+        
+        *ptr_offset::<u8>(ptr, len) = cast::<u8>(c);
+        len = len + 1;
+    }
+    
+    *ptr_offset::<u8>(ptr, len) = cast::<u8>(0);
+    return String(ptr, len, cap);
+}
+
+pub fn print_str(s: string) {
+    let ptr = cast::<*u8>(s);
+    let i = 0;
+    while (true) {
+        let c = *ptr_offset::<u8>(ptr, i);
+        if (cast::<i32>(c) == 0) { break; }
+        putchar(cast::<i32>(c));
+        i = i + 1;
+    }
+    putchar(10); # \n
+}

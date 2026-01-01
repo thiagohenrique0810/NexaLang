@@ -452,69 +452,68 @@ fn parse_primary(p: *Parser) -> Expr {
 }
 
 fn parse_expr(p: *Parser) -> Expr {
-    # Simple binary parsing (left-associative, only one level for now or specific ops)
-    # LHS
     let lhs_val: Expr = parse_primary(p);
-    let lhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
-    *lhs_ptr = lhs_val;
     
-    # Check for Op
-    let tok_ptr: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
-    if ((*tok_ptr).kind == 5) { # Op
-        # Check specific ops: +, -, *, / ( ==, >, < later)
-        # We need to peek content.
-        let s: i32 = (*tok_ptr).start;
-        let c: u8 = ptr_offset::<u8>((*p).src, s)[0];
-        let op_code: i32 = cast::<i32>(c);
-        
-        # +, -, *, /, %, >, <, = (wait, = is assign, == is eq)
-        if (op_code == 43) { # +
-            consume(p, 5); 
-            let rhs_val: Expr = parse_primary(p); 
-            let rhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
-            *rhs_ptr = rhs_val;
-            return Expr::Binary(43, lhs_ptr, rhs_ptr);
-        }
-        if (op_code == 45) { # -
-            consume(p, 5); 
-            let rhs_val: Expr = parse_primary(p); 
-            let rhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
-            *rhs_ptr = rhs_val;
-            return Expr::Binary(45, lhs_ptr, rhs_ptr);
-        }
-        if (op_code == 62) { # >
-            consume(p, 5); 
-            let rhs_val: Expr = parse_primary(p); 
-            let rhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
-            *rhs_ptr = rhs_val;
-            return Expr::Binary(62, lhs_ptr, rhs_ptr);
+    # Check for Member access '.' or Binary Ops
+    let running = true;
+    while (running) {
+        let tok_ptr: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        if ((*tok_ptr).kind == 5) { # Op or .
+            let s: i32 = (*tok_ptr).start;
+            let c: u8 = ptr_offset::<u8>((*p).src, s)[0];
+            
+            # '.' for Member Access
+            if (cast::<i32>(c) == 46) {
+                consume(p, 5);
+                let member_tok: Token = consume(p, 1);
+                let member_name: string = token_to_string(p, member_tok);
+                
+                # Check for Method Call 'member_name('
+                let nt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                let nt_c: u8 = ptr_offset::<u8>((*p).src, (*nt).start)[0];
+                if (cast::<i32>(nt_c) == 40) {
+                    # Actually, for now, let's treat it as a generic Call or Member
+                    # NexaLang handles methods specially, but Stage 5 can simplify
+                    # Or just return Member for now and handle calls later if needed
+                    # Let's simplify and just use Member for 'obj.field' and 'obj.method'
+                    # Call handling inside parse_primary only works for 'func()'
+                }
+                
+                # Update lhs_val to Member
+                # We need to store lhs_val name? This only works if lhs_val is Var
+                # Simplify: assume lhs_val is Var for member access in Stage 5
+                match (lhs_val) {
+                    Var(name) => {
+                        lhs_val = Expr::Member(name, member_name);
+                    }
+                    Int(v) => { running = false; }
+                    Str(s) => { running = false; }
+                    Binary(o, l, r) => { running = false; }
+                    Cast(t, v) => { running = false; }
+                    Sizeof(t) => { running = false; }
+                    Member(o, m) => { running = false; }
+                    Call(n, a) => { running = false; }
+                }
+            } else {
+                # Binary Ops: +, -, *, /
+                if (cast::<i32>(c) == 43 or cast::<i32>(c) == 45 or cast::<i32>(c) == 42 or cast::<i32>(c) == 47) {
+                    consume(p, 5);
+                    let rhs_val: Expr = parse_primary(p);
+                    let lhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
+                    *lhs_ptr = lhs_val;
+                    let rhs_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
+                    *rhs_ptr = rhs_val;
+                    lhs_val = Expr::Binary(cast::<i32>(c), lhs_ptr, rhs_ptr);
+                } else {
+                    running = false;
+                }
+            }
+        } else {
+            running = false;
         }
     }
     
-    # Return value from pointer (copy/move out?)
-    # We moved lhs_val to *lhs_ptr.
-    # We need to return an Expr.
-    # Dereferencing *lhs_ptr copies if Copy, or Moves if not.
-    # Can we move out of pointer? Semantic Analyzer says no.
-    # BUT, we are in non-branching case here.
-    # Actually, we can just return lhs_val?
-    # But lhs_val was moved to *lhs_ptr.
-    # So lhs_val is moved.
-    # We need to extract it back?
-    # Or just NOT allocate if not needed?
-    # But we don't know if we need it until we check op.
-    
-    # Workaround:
-    # 1. Parse lhs. Don't move yet.
-    # 2. Check op.
-    # 3. If op, THEN alloc lhs_ptr, move lhs, parse rhs...
-    # 4. If no op, return lhs.
-    
-    # This avoids moving lhs if we return it directly.
-    return *lhs_ptr; 
-    # Semantic Analyzer might complain about moving from pointer *lhs_ptr.
-    # We need "unsafe" or similar? Or `ptr::read` intrinsic?
-    # For now, let's use the branching alloc strategy.
+    return lhs_val;
 }
 
 
@@ -941,6 +940,10 @@ fn emit_expr(e: Expr, ctx: *Context) -> string {
              fs::append_file(ctx.out, "\n", 1);
              return out_reg;
         }
+        Cast(t, v) => { return "0"; }
+        Sizeof(t) => { return "0"; }
+        Member(o, m) => { return "0"; }
+        Call(n, a) => { return "0"; }
     }
     return "0";
 }
@@ -980,6 +983,10 @@ fn emit_stmt(s: Stmt, ctx: *Context) {
                      fs::append_file(ctx.out, val, strlen(val));
                      fs::append_file(ctx.out, ")\n", 2);
                  }
+                 Cast(t, v) => {}
+                 Sizeof(t) => {}
+                 Member(o, m) => {}
+                 Call(n, a) => {}
              }
         }
         Return(e) => {
@@ -1101,6 +1108,8 @@ fn emit_stmt(s: Stmt, ctx: *Context) {
              fs::append_file(ctx.out, l_end_id, strlen(l_end_id));
              fs::append_file(ctx.out, ":\n", 2);
         }
+        Match(v, a) => {}
+        For(v, s, e, b) => {}
     }
 }
 
@@ -1111,6 +1120,24 @@ fn emit_ll(prog: Program) {
     fs::append_file(out, "@fmt_int = private constant [4 x i8] c\"%d\\0A\\00\"\n", 47);
     fs::append_file(out, "@fmt_str = private constant [4 x i8] c\"%s\\0A\\00\"\n", 47);
     
+    # Emit Structs
+    let k: i32 = 0;
+    while (k < prog.structs.len) {
+        let s = prog.structs.ptr[k];
+        fs::append_file(out, "%", 1);
+        fs::append_file(out, s.name, strlen(cast::<*u8>(s.name)));
+        fs::append_file(out, " = type { ", 10);
+        # Simplified types for fields
+        let j: i32 = 0;
+        while (j < s.fields.len) {
+            fs::append_file(out, "i32", 3);
+            if (j < s.fields.len - 1) { fs::append_file(out, ", ", 2); }
+            j = j + 1;
+        }
+        fs::append_file(out, " }\n", 3);
+        k = k + 1;
+    }
+
     # Init CodeGen Arena
     let cg_mem: Arena = arena_init(1024 * 1024);
     

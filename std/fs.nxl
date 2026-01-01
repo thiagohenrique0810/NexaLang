@@ -8,21 +8,56 @@ extern "C" {
     fn malloc(size: i32) -> *u8;
 }
 
+pub struct File {
+    handle: *u8
+}
+
+impl File {
+    fn open(path: string, mode: string) -> Result<File, i32> {
+        let h = fopen(cast::<*u8>(path), cast::<*u8>(mode));
+        if (cast::<i64>(h) == 0) {
+            return Result::<File, i32>::Err(1);
+        }
+        return Result::<File, i32>::Ok(File(h));
+    }
+
+    fn read(&self, buf: *u8, size: i64) -> i64 {
+        return fread(buf, 1, size, self.handle);
+    }
+
+    fn write(&self, buf: *u8, size: i64) -> i64 {
+        return fwrite(buf, 1, size, self.handle);
+    }
+
+    fn seek(&self, offset: i64, whence: i32) -> i32 {
+        return fseek(self.handle, offset, whence);
+    }
+
+    fn tell(&self) -> i64 {
+        return ftell(self.handle);
+    }
+
+    fn close(self) -> i32 {
+        return fclose(self.handle);
+    }
+}
+
 pub fn read_file_as_string(path: string) -> string {
     let mode = "rb";
-    let f = fopen(cast::<*u8>(path), cast::<*u8>(mode));
-    if (cast::<i64>(f) == 0) {
+    let f_res = File::open(path, mode);
+    if (f_res.is_err()) {
         return "";
     }
     
-    fseek(f, 0, 2); # SEEK_END
-    let size = ftell(f);
-    fseek(f, 0, 0); # SEEK_SET
+    let f = f_res.unwrap();
+    f.seek(0, 2); # SEEK_END
+    let size = f.tell();
+    f.seek(0, 0); # SEEK_SET
     
     let buf = malloc(cast::<i32>(size) + 1);
-    fread(buf, 1, size, f);
+    f.read(buf, size);
     buf[cast::<i32>(size)] = cast::<u8>(0);
     
-    fclose(f);
+    f.close();
     return cast::<string>(buf);
 }

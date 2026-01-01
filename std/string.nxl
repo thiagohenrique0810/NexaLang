@@ -144,4 +144,69 @@ impl String {
             free(self.ptr);
         }
     }
+
+    fn to_i32(&self) -> i32 {
+        let res = 0;
+        let i = 0;
+        let sign = 1;
+        
+        if (self.len > 0) {
+            let first = *ptr_offset::<u8>(self.ptr, 0);
+            if (cast::<i32>(first) == 45) { # '-'
+                sign = -1;
+                i = 1;
+            }
+        }
+        
+        while (i < self.len) {
+            let c = *ptr_offset::<u8>(self.ptr, i);
+            let digit = cast::<i32>(c) - 48;
+            if (digit >= 0 and digit <= 9) {
+                res = res * 10 + digit;
+            }
+            i = i + 1;
+        }
+        
+        return res * sign;
+    }
+
+    fn from_i32(val: i32) -> String {
+        if (val == 0) { return String::from("0"); }
+        
+        let is_neg = false;
+        let v = val;
+        if (val < 0) {
+            is_neg = true;
+            v = -v;
+        }
+        
+        let temp = v;
+        let len = 0;
+        while (temp > 0) {
+            temp = temp / 10;
+            len = len + 1;
+        }
+        
+        if (is_neg) { len = len + 1; }
+        
+        let cap = len + 1;
+        let ptr = malloc(cap);
+        let i = len - 1;
+        
+        temp = v;
+        while (temp > 0) {
+            let digit = temp % 10;
+            *ptr_offset::<u8>(ptr, i) = cast::<u8>(digit + 48);
+            temp = temp / 10;
+            i = i - 1;
+        }
+        
+        if (is_neg) {
+            *ptr_offset::<u8>(ptr, 0) = cast::<u8>(45); # '-'
+        }
+        
+        *ptr_offset::<u8>(ptr, len) = cast::<u8>(0);
+        
+        return String(ptr, len, cap);
+    }
 }

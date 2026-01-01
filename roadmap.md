@@ -28,6 +28,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 
 - [x] **Data Types**
     - [x] Primitive types (`u8`, `i64`, `bool`).
+    - [x] Unary operators (`!`, `-`, `*`, `&`).
     - [x] `char`.
 - [x] **Type System 2.0**
   - [x] Structs & Methods
@@ -44,10 +45,11 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Control Flow**
     - [x] `if` / `else` expressions.
     - [x] `while` loops.
+    - [x] `else if` support.
     - [x] `match` pattern matching (basic).
 - [x] **Functions**
     - [x] Arguments and Return values.
-    - [ ] Function overloading (optional, or distinct names initially).
+    - [x] Function overloading (implemented via type-based name mangling).
 
 ## Phase 3: Memory Safety System 🛡️
 
@@ -92,8 +94,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
       - [x] Stage 2: minimal lexer in NexaLang (token counting).
     - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
     - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
-    - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`).
-    - [ ] Verify `nxc` can compile `nxc`.
+    - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`, `struct`, `call`, `member`).
+    - [x] Verify `nxc` can compile `nxc`.
 - [ ] **Tooling**
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
     - [x] Syntax highlighter extension (VSCode) (TextMate grammar under `vscode-nexalang/`).
@@ -134,7 +136,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `contains(&self, needle: &str) -> bool`
   - [x] `split(&self, delimiter: char) -> Vec<String>`
 - [x] **Standard Library Organization**
-  - [x] `std/` directory structure created (`vec`, `option`)
+  - [x] `std/` directory structure created (`vec`, `option`, `string`, `fs`, `io`)
   - [x] Module resolution fixes for local/nested modules
 - [x] **Hash Maps (HashMap<K, V>)**
   - [x] `Hash` trait
@@ -170,14 +172,15 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `break` statement
   - [x] `continue` statement
   - [x] Labeled loops (`'label: loop { }`)
+  - [x] `else if` support
 
 ### 6.5 Developer Experience
 - [x] **Better Error Messages**
   - [x] Show file, line, and column numbers
   - [x] Pretty-print error context with caret (^) pointing to error
   - [x] Suggestion system ("did you mean X?")
-  - [x] Error codes and documentation links
-- [ ] **Warnings System**
+  - [x] Error codes and documentation links (E0001-E0007)
+- [x] **Warnings System**
   - [x] Unused variable warnings
   - [x] Dead code detection
   - [x] Type coercion warnings
@@ -206,10 +209,10 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Function pointers as arguments
 
 ## Phase 9: Future Directions 🚀
-- [ ] Async/await (future consideration)
+- [/] Async/await (foundation implemented in Lexer/Parser)
 - [ ] Procedural macros
 - [x] Foreign Function Interface (FFI) for C interop
-- [ ] Package manager (`nxpkg`)
+- [x] Package manager (`nxpkg`)
 - [x] Build system improvements (Project support via `nexa.json`)
 - [x] Standard library expansion (HashMap, File I/O, etc.)
 

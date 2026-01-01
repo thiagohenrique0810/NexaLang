@@ -12,11 +12,12 @@
         
         elif isinstance(node, CallExpr):
              # Handle TurboFish or generic calls
-             if '<' in node.callee:
-                  # ID<T> -> ID<i32>
-                  node.callee = self.apply_submap(node.callee, mapping)
-             if node.callee.startswith('cast<') or node.callee.startswith('sizeof<') or node.callee.startswith('ptr_offset<'):
-                  node.callee = self.apply_submap(node.callee, mapping)
+             if isinstance(node.callee, str):
+                  if '<' in node.callee:
+                       node.callee = self.apply_submap(node.callee, mapping)
+             elif isinstance(node.callee, VariableExpr):
+                  if '<' in node.callee.name:
+                       node.callee.name = self.apply_submap(node.callee.name, mapping)
              
              for arg in node.args:
                   self.substitute_generics(arg, mapping)
@@ -53,7 +54,11 @@
              for case in node.cases:
                  self.substitute_generics(case.body, mapping)
                  
-        # ... other nodes ...
+        elif isinstance(node, VariableExpr):
+             if '<' in node.name:
+                  node.name = self.apply_submap(node.name, mapping)
+             elif node.name in mapping:
+                  node.name = mapping[node.name]
         
     def apply_submap(self, type_str, mapping):
         # Handle T -> i32

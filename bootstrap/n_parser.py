@@ -5,15 +5,18 @@ class ASTNode:
 
 class Assignment(ASTNode):
     def __init__(self, target, value):
+        super().__init__()
         self.target = target # Can be name(str) or ASTNode (LValue)
         self.value = value
 
 class ArrayLiteral(ASTNode):
     def __init__(self, elements):
+        super().__init__()
         self.elements = elements
 
 class IndexAccess(ASTNode):
     def __init__(self, object, index):
+        super().__init__()
         self.object = object
         self.index = index
     
@@ -21,7 +24,8 @@ class IndexAccess(ASTNode):
         return f"{self.object}[{self.index}]"
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False, is_vararg=False):
+    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False, is_vararg=False, is_async=False):
+        super().__init__()
         self.name = name
         self.params = params
         self.return_type = return_type
@@ -30,11 +34,13 @@ class FunctionDef(ASTNode):
         self.generics = generics or []
         self.is_pub = is_pub
         self.is_vararg = is_vararg
+        self.is_async = is_async
         self.module = ""
         self.used = False
 
 class StructDef(ASTNode):
     def __init__(self, name, fields, generics=None, is_pub=False):
+        super().__init__()
         self.name = name
         self.fields = fields # list of (name, type) tuples
         self.generics = generics or []
@@ -43,6 +49,7 @@ class StructDef(ASTNode):
 
 class EnumDef(ASTNode):
     def __init__(self, name, variants, generics=None, is_pub=False):
+        super().__init__()
         self.name = name
         self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
         self.generics = generics or []
@@ -51,6 +58,7 @@ class EnumDef(ASTNode):
 
 class TraitDef(ASTNode):
     def __init__(self, name, methods, generics=None, is_pub=False, associated_types=None):
+        super().__init__()
         self.name = name
         self.methods = methods # list of FunctionDef (likely without body)
         self.generics = generics or []
@@ -60,6 +68,7 @@ class TraitDef(ASTNode):
 
 class ImplDef(ASTNode):
     def __init__(self, struct_name, methods, generics=None, trait_name=None, associated_types=None):
+        super().__init__()
         self.struct_name = struct_name
         self.methods = methods
         self.generics = generics or []
@@ -68,17 +77,20 @@ class ImplDef(ASTNode):
 
 class MatchExpr(ASTNode):
     def __init__(self, value, cases):
+        super().__init__()
         self.value = value
         self.cases = cases # list of CaseArm
 
 class CaseArm(ASTNode):
     def __init__(self, variant_name, var_names, body):
+        super().__init__()
         self.variant_name = variant_name # "Ok"
         self.var_names = var_names       # list of bound variables
         self.body = body
 
 class MemberAccess(ASTNode):
     def __init__(self, object, member):
+        super().__init__()
         self.object = object
         self.member = member
     
@@ -87,6 +99,7 @@ class MemberAccess(ASTNode):
 
 class MethodCall(ASTNode):
     def __init__(self, receiver, method_name, args):
+        super().__init__()
         self.receiver = receiver
         self.method_name = method_name
         self.args = args
@@ -97,11 +110,13 @@ class MethodCall(ASTNode):
 
 class CallExpr(ASTNode):
     def __init__(self, callee, args):
+        super().__init__()
         self.callee = callee
         self.args = args
 
 class LambdaExpr(ASTNode):
     def __init__(self, params, return_type, body):
+        super().__init__()
         self.params = params # [(name, type), ...]
         self.return_type = return_type
         self.body = body # list of statements
@@ -109,36 +124,44 @@ class LambdaExpr(ASTNode):
 
 class StringLiteral(ASTNode):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class CharLiteral(ASTNode):
     def __init__(self, value: int):
+        super().__init__()
         self.value = value
 
 class VarDecl(ASTNode):
     def __init__(self, name, type_name, initializer):
+        super().__init__()
         self.name = name
         self.type_name = type_name
         self.initializer = initializer
+        self.is_mut = False
 
 class ReturnStmt(ASTNode):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class IfStmt(ASTNode):
     def __init__(self, condition, then_branch, else_branch=None):
+        super().__init__()
         self.condition = condition
         self.then_branch = then_branch
         self.else_branch = else_branch
 
 class WhileStmt(ASTNode):
     def __init__(self, condition, body, label=None):
+        super().__init__()
         self.condition = condition
         self.body = body
         self.label = label
 
 class ForStmt(ASTNode):
     def __init__(self, var_name, start_expr, end_expr, body, inclusive=False, is_iterator=False, label=None):
+        super().__init__()
         self.var_name = var_name
         self.start_expr = start_expr
         self.end_expr = end_expr
@@ -149,12 +172,14 @@ class ForStmt(ASTNode):
 
 class BinaryExpr(ASTNode):
     def __init__(self, left, op, right):
+        super().__init__()
         self.left = left
         self.right = right
         self.op = op
 
 class UnaryExpr(ASTNode):
     def __init__(self, op, operand):
+        super().__init__()
         self.op = op
         self.operand = operand
 
@@ -272,6 +297,11 @@ class ExternBlock(ASTNode):
         self.abi = abi
         self.functions = functions
 
+class AwaitExpr(ASTNode):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
@@ -305,10 +335,15 @@ class Parser:
                 self.consume('PUB')
                 is_pub = True
 
+            is_async = False
+            if self.peek().type == 'ASYNC':
+                self.consume('ASYNC')
+                is_async = True
+
             if self.peek().type == 'KERNEL':
-                nodes.append(self.parse_function(is_kernel=True, is_pub=is_pub))
+                nodes.append(self.parse_function(is_kernel=True, is_pub=is_pub, is_async=is_async))
             elif self.peek().type == 'FN':
-                nodes.append(self.parse_function(is_kernel=False, is_pub=is_pub))
+                nodes.append(self.parse_function(is_kernel=False, is_pub=is_pub, is_async=is_async))
             elif self.peek().type == 'STRUCT':
                 nodes.append(self.parse_struct(is_pub=is_pub))
             elif self.peek().type == 'ENUM':
@@ -357,8 +392,13 @@ class Parser:
                     self.consume('PUB')
                     is_nested_pub = True
                 
+                is_nested_async = False
+                if self.peek().type == 'ASYNC':
+                    self.consume('ASYNC')
+                    is_nested_async = True
+                
                 t = self.peek().type
-                if t == 'FN': body.append(self.parse_function(is_pub=is_nested_pub))
+                if t == 'FN': body.append(self.parse_function(is_pub=is_nested_pub, is_async=is_nested_async))
                 elif t == 'STRUCT': body.append(self.parse_struct(is_pub=is_nested_pub))
                 elif t == 'ENUM': body.append(self.parse_enum(is_pub=is_nested_pub))
                 elif t == 'IMPL': body.append(self.parse_impl())
@@ -528,7 +568,7 @@ class Parser:
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
-                     bound = self.consume('IDENTIFIER').value
+                     bound = self.parse_type()
                 generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
@@ -569,7 +609,7 @@ class Parser:
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
-                     bound = self.consume('IDENTIFIER').value
+                     bound = self.parse_type()
                 generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                     self.consume('COMMA')
@@ -593,7 +633,7 @@ class Parser:
         self.consume('RBRACE')
         return EnumDef(name, variants, generics, is_pub=is_pub)
 
-    def parse_function(self, is_kernel=False, is_pub=False, allow_empty_body=False):
+    def parse_function(self, is_kernel=False, is_pub=False, allow_empty_body=False, is_async=False):
         start_token = self.peek()
         if is_kernel:
             self.consume('KERNEL')
@@ -613,7 +653,7 @@ class Parser:
                 bound = None
                 if self.peek().type == 'COLON':
                      self.consume('COLON')
-                     bound = self.consume('IDENTIFIER').value
+                     bound = self.parse_type()
                 generics.append((g_name, bound, is_const))
                 if self.peek().type == 'COMMA':
                    self.consume('COMMA')
@@ -675,7 +715,7 @@ class Parser:
                 if self.peek().type == 'SEMICOLON':
                     self.consume('SEMICOLON')
             self.consume('RBRACE')
-        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub, is_vararg=is_vararg)
+        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub, is_vararg=is_vararg, is_async=is_async)
         node.line = start_token.line
         node.column = start_token.column
         return node
@@ -936,14 +976,17 @@ class Parser:
         else_branch = None
         if self.peek().type == 'ELSE':
             self.consume('ELSE')
-            self.consume('LBRACE')
-            else_branch = []
-            while self.peek().type != 'RBRACE':
-                else_branch.append(self.parse_statement())
-                if self.peek().type == 'SEMICOLON':
-                     self.consume('SEMICOLON')
-            self.consume('RBRACE')
-            
+            if self.peek().type == 'IF':
+                else_branch = [self.parse_if()]
+            else:
+                self.consume('LBRACE')
+                else_branch = []
+                while self.peek().type != 'RBRACE':
+                    else_branch.append(self.parse_statement())
+                    if self.peek().type == 'SEMICOLON':
+                         self.consume('SEMICOLON')
+                self.consume('RBRACE')
+
         node = IfStmt(cond, then_branch, else_branch)
         node.line = start_token.line
         node.column = start_token.column
@@ -1048,6 +1091,14 @@ class Parser:
             else:
                 operand = self.parse_unary()
                 return UnaryExpr('&', operand)
+        elif token.type == 'NOT':
+            self.consume('NOT')
+            operand = self.parse_unary()
+            return UnaryExpr('!', operand)
+        elif token.type == 'MINUS':
+            self.consume('MINUS')
+            operand = self.parse_unary()
+            return UnaryExpr('-', operand)
         else:
             return self.parse_primary()
 
@@ -1063,14 +1114,19 @@ class Parser:
                 
             op = self.consume(token.type).type
             right = self.parse_binary_expr(prec + 1)
-            left = BinaryExpr(left, op, right)
+            new_node = BinaryExpr(left, op, right)
+            new_node.line = token.line
+            new_node.column = token.column
+            left = new_node
             
         return left
 
     def get_precedence(self, op_type):
-        if op_type in ('PLUS', 'MINUS'): return 1
-        if op_type in ('STAR', 'SLASH', 'PERCENT'): return 2
-        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE', 'AND', 'OR'): return 0
+        if op_type in ('OR',): return 0
+        if op_type in ('AND',): return 1
+        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 2
+        if op_type in ('PLUS', 'MINUS'): return 3
+        if op_type in ('STAR', 'SLASH', 'PERCENT'): return 4
         return -1
 
     def parse_primary(self):
@@ -1102,21 +1158,9 @@ class Parser:
             expr = BooleanLiteral(False)
         elif token.type == 'IDENTIFIER':
             peek1 = self.peek(1).type
-            # 1. Struct Instantiation: Name { ... }
-            if peek1 == 'LBRACE':
-                name = self.consume('IDENTIFIER').value
-                self.consume('LBRACE')
-                args = []
-                while self.peek().type != 'RBRACE':
-                    self.consume('IDENTIFIER') # field name
-                    self.consume('COLON')
-                    args.append(self.parse_expression())
-                    if self.peek().type == 'COMMA': self.consume('COMMA')
-                self.consume('RBRACE')
-                expr = CallExpr(name, args)
             
-            # 2. Generic Instantiation or Templated Variable (cast<T>)
-            elif peek1 == 'LT' and token.value in ('cast', 'sizeof', 'ptr_offset', 'slice_from_array', 'ptr_to_int', 'int_to_ptr'):
+            # 1. Generic Instantiation or Templated Variable (cast<T>)
+            if peek1 == 'LT' and token.value in ('cast', 'sizeof', 'ptr_offset', 'slice_from_array', 'ptr_to_int', 'int_to_ptr'):
                 name = self.consume('IDENTIFIER').value
                 self.consume('LT')
                 types = []
@@ -1128,22 +1172,9 @@ class Parser:
                     if self.peek().type == 'COMMA': self.consume('COMMA')
                 self.consume('GT')
                 full_name = f"{name}<{','.join(types)}>"
-                
-                if self.peek().type == 'LBRACE':
-                    # Struct Instantiation: Name<T> { ... }
-                    self.consume('LBRACE')
-                    args = []
-                    while self.peek().type != 'RBRACE':
-                        self.consume('IDENTIFIER')
-                        self.consume('COLON')
-                        args.append(self.parse_expression())
-                        if self.peek().type == 'COMMA': self.consume('COMMA')
-                    self.consume('RBRACE')
-                    expr = CallExpr(full_name, args)
-                else:
-                    expr = VariableExpr(full_name)
+                expr = VariableExpr(full_name)
             
-            # 3. Namespaces or TurboFish: ID :: ...
+            # 2. Namespaces or TurboFish: ID :: ...
             elif peek1 == 'DOUBLE_COLON':
                 full_name = self.consume('IDENTIFIER').value
                 while self.peek().type == 'DOUBLE_COLON':
@@ -1161,39 +1192,9 @@ class Parser:
                         rhs = self.consume('IDENTIFIER').value
                         full_name = f"{full_name}::{rhs}"
                 
-                
-                # Check for Struct Instantiation: Mod::Struct { ... }
-                if self.peek().type == 'LBRACE':
-                    self.consume('LBRACE')
-                    args = []
-                    while self.peek().type != 'RBRACE':
-                        # self.consume('IDENTIFIER') # field name (not consumed in call args logic usually? Wait.)
-                        # Logic in lines 752: self.consume('IDENTIFIER'); consume('COLON'); parse_expr()
-                        # call args usually list of exprs.
-                        # But struct instantiation logic uses field names?
-                        # My CallExpr supports named args? 
-                        # Review line 757: CallExpr(name, args). args is list of exprs.
-                        # Wait, StructDef stores fields. 
-                        # Compiler needs to know field order.
-                        # If I preserve fields?
-                        # bootstrap `visit_CallExpr` for struct (line 945 semantic.py) iterates `args` and visits them.
-                        # It assumes `args` are Expressions.
-                        # If I drop keys, I assume order matches?
-                        # Line 750 (existing Struct Instantiation)
-                        # self.consume('IDENTIFIER'); self.consume('COLON'); args.append(self.parse_expression())
-                        # It drops keys.
-                        # So I should do the same.
-                        
-                        self.consume('IDENTIFIER')
-                        self.consume('COLON')
-                        args.append(self.parse_expression())
-                        if self.peek().type == 'COMMA': self.consume('COMMA')
-                    self.consume('RBRACE')
-                    expr = CallExpr(full_name, args)
-                else:
-                    expr = VariableExpr(full_name) # Postfix handles '(' or '.'
+                expr = VariableExpr(full_name) # Postfix handles '(' or '.'
             
-            # 4. Standard Case: ID
+            # 3. Standard Case: ID
             else:
                 expr = VariableExpr(token.value)
                 self.consume('IDENTIFIER')
@@ -1234,6 +1235,10 @@ class Parser:
             return self.parse_unary()
         elif token.type == 'PIPE':
             expr = self.parse_lambda()
+        elif token.type == 'AWAIT':
+            self.consume('AWAIT')
+            val = self.parse_expression()
+            expr = AwaitExpr(val)
         else:
             # Print context
             start = max(0, self.pos - 10)

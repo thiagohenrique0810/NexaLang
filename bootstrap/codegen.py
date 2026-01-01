@@ -207,7 +207,8 @@ class CodeGen:
         # struct Arena { chunk: i8*, offset: i32, capacity: i32 }
         void_ptr = ir.IntType(8).as_pointer()
         i32 = ir.IntType(32)
-        arena_ty = ir.LiteralStructType([void_ptr, i32, i32])
+        arena_ty = self.module.context.get_identified_type("Arena")
+        arena_ty.set_body(void_ptr, i32, i32)
         self.struct_types['Arena'] = arena_ty
         self.struct_fields['Arena'] = {'chunk': 0, 'offset': 1, 'capacity': 2}
         self._define_arena_methods()
@@ -595,6 +596,12 @@ class CodeGen:
             # Dereference
             ptr_val = self.visit(node.operand)
             return self.builder.load(ptr_val)
+        elif node.op == '!':
+            val = self.visit(node.operand)
+            return self.builder.not_(val)
+        elif node.op == '-':
+            val = self.visit(node.operand)
+            return self.builder.neg(val)
         else:
             raise Exception(f"Unsupported unary operator: {node.op}")
 
@@ -663,11 +670,18 @@ class CodeGen:
     def visit_MethodCall(self, node):
         # Desugar obj.method(args) -> Type_method(obj, args)
         receiver_val = self.visit(node.receiver)
-        struct_type = node.struct_type
-        func_name = f"{struct_type}_{node.method_name}"
-
+        
+        # In modern semantic pass, node.method_name is already fully mangled
+        func_name = node.method_name
+        
         if func_name not in self.module.globals:
-            raise Exception(f"CodeGen Error: Method '{func_name}' not found in module")
+            # Fallback for old style (or if semantic didn't mangle for some reason)
+            struct_type = node.struct_type
+            legacy_name = f"{struct_type}_{node.method_name}"
+            if legacy_name in self.module.globals:
+                func_name = legacy_name
+            else:
+                raise Exception(f"CodeGen Error: Method '{func_name}' not found in module")
 
         func = self.module.globals[func_name]
         expected_param_type = func.function_type.args[0]
@@ -846,10 +860,17 @@ class CodeGen:
                 continue
             ptr, type_name = entry[0], entry[1]
             # Look for destructor: {TypeName}_drop(T) or {TypeName}_drop(&T)
-            # Current convention: {TypeName}_drop(T) (Pass by value, consumes)
+            # Modern mangled name: {TypeName}_drop__args__SELF_PTR
             drop_func_name = f"{type_name}_drop"
-            if drop_func_name in self.module.globals:
+            mangled_drop = f"{type_name}_drop__args__SELF_PTR"
+            
+            drop_func = None
+            if mangled_drop in self.module.globals:
+                drop_func = self.module.get_global(mangled_drop)
+            elif drop_func_name in self.module.globals:
                 drop_func = self.module.get_global(drop_func_name)
+                
+            if drop_func:
                 # Load value
                 val = self.builder.load(ptr)
                 # Call drop
@@ -1386,6 +1407,10 @@ class CodeGen:
             if left.type == ir.FloatType():
                 return self.builder.frem(left, right, name="fremtmp")
             return self.builder.srem(left, right, name="remtmp")
+        elif node.op == 'AND':
+            return self.builder.and_(left, right, name="andtmp")
+        elif node.op == 'OR':
+            return self.builder.or_(left, right, name="ortmp")
         elif node.op == 'EQEQ':
             if left.type == ir.FloatType():
                 return self.builder.fcmp_ordered('==', left, right, name="feqtmp")
@@ -1635,18 +1660,54 @@ class CodeGen:
         return self.builder.call(func_ptr, processed_args)
 
     def visit_CallExpr(self, node):
-        callee_name = node.callee
+        callee = node.callee
+        if isinstance(callee, VariableExpr):
+            callee = callee.name
+            
+        if isinstance(callee, str) and callee.startswith('cast<'):
+            target_ty_name = callee[5:].rstrip('>')
+            target_ty = self.get_llvm_type(target_ty_name)
+            val = self.visit(node.args[0])
+            
+            # Pointer to pointer
+            if isinstance(val.type, ir.PointerType) and isinstance(target_ty, ir.PointerType):
+                return self.builder.bitcast(val, target_ty)
+            # Int to pointer
+            if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.PointerType):
+                return self.builder.inttoptr(val, target_ty)
+            # Pointer to int
+            if isinstance(val.type, ir.PointerType) and isinstance(target_ty, ir.IntType):
+                return self.builder.ptrtoint(val, target_ty)
+            # Int to int
+            if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
+                if val.type.width < target_ty.width:
+                    return self.builder.zext(val, target_ty)
+                elif val.type.width > target_ty.width:
+                    return self.builder.trunc(val, target_ty)
+                return val
+            return self.builder.bitcast(val, target_ty)
+
+        elif isinstance(callee, str) and callee.startswith('sizeof<'):
+            type_name = callee[7:].rstrip('>')
+            llvm_ty = self.get_llvm_type(type_name)
+
+            null_ptr = ir.Constant(llvm_ty.as_pointer(), None)
+            gep = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)])
+            return self.builder.ptrtoint(gep, ir.IntType(32))
+
+        elif isinstance(callee, str) and callee.startswith('ptr_offset<'):
+            ptr_val = self.visit(node.args[0])
+            idx_val = self.visit(node.args[1])
+            return self.builder.gep(ptr_val, [idx_val])
+        
+        callee_name = callee
         if not isinstance(callee_name, str):
-            if isinstance(callee_name, VariableExpr):
-                callee_name = callee_name.name
-            else:
-                # Dynamic call (e.g. result of expression)
-                # Dynamic call (e.g. result of expression)
-                fat_ptr = self.visit(callee_name)
-                callee_type_name = getattr(callee_name, 'type_name', None)
-                if not callee_type_name or not callee_type_name.startswith('fn('):
-                     raise Exception("Dynamic call requires callee to have 'fn' type")
-                return self._emit_closure_call(fat_ptr, callee_type_name, node.args)
+            # Dynamic call (e.g. result of expression)
+            fat_ptr = self.visit(callee_name)
+            callee_type_name = getattr(callee_name, 'type_name', None)
+            if not callee_type_name or not callee_type_name.startswith('fn('):
+                 raise Exception("Dynamic call requires callee to have 'fn' type")
+            return self._emit_closure_call(fat_ptr, callee_type_name, node.args)
         
         # Now callee_name is a string. Check if it's a local variable (function pointer)
         for scope in reversed(self.scopes):
@@ -1708,7 +1769,7 @@ class CodeGen:
             # `print` is a statement-level intrinsic (void).
             return None
 
-        elif node.callee == "fs::read_file":
+        elif callee_name == "fs::read_file":
             # fs::read_file(path: string) -> Buffer<u8>
             if len(node.args) != 1:
                 raise Exception("fs::read_file expects 1 arg")
@@ -1731,6 +1792,31 @@ class CodeGen:
             is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
             with self.builder.if_then(is_null):
                 self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
+
+            # fseek(f, 0, 2)  (SEEK_END)
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
+            sz = self.builder.call(self.ftell, [f], name="file_size")
+            # fseek(f, 0, 0)  (SEEK_SET)
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 0)])
+
+            # malloc(sz + 1)
+            sz_i32 = self.builder.trunc(sz, i32, name="sz_i32")
+            cap = self.builder.add(sz_i32, ir.Constant(i32, 1), name="cap")
+            buf_void = self.builder.call(self.malloc, [cap], name="buf_void")
+            buf = self.builder.bitcast(buf_void, ir.IntType(8).as_pointer(), name="buf_u8")
+
+            # fread(buf, 1, sz, f)
+            _read = self.builder.call(self.fread, [buf_void, ir.Constant(i64, 1), sz, f])
+            _ = self.builder.call(self.fclose, [f])
+
+            # Result is Buffer<u8> { ptr, len, cap }
+            # Buffer struct was injected by SemanticAnalyzer
+            buf_struct_ty = self.get_llvm_type("Buffer<u8>")
+            bval = ir.Constant(buf_struct_ty, ir.Undefined)
+            bval = self.builder.insert_value(bval, buf, 0)
+            bval = self.builder.insert_value(bval, sz_i32, 1)
+            bval = self.builder.insert_value(bval, sz_i32, 2) # cap = len for simplicity
+            return bval
 
             # fseek(f, 0, 2)  (SEEK_END)
             self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
@@ -1921,34 +2007,34 @@ class CodeGen:
                 enum_ty, max_size = self.enum_definitions[enum_key]
                 tag = self.enum_types[enum_key][rhs]
 
-            # Create struct { tag, padding }
-            enum_val = ir.Constant(enum_ty, ir.Undefined)
+                # Create struct { tag, padding }
+                enum_val = ir.Constant(enum_ty, ir.Undefined)
 
-            # Set Tag
-            tag_val = ir.Constant(ir.IntType(32), tag)
-            enum_val = self.builder.insert_value(enum_val, tag_val, 0)
+                # Set Tag
+                tag_val = ir.Constant(ir.IntType(32), tag)
+                enum_val = self.builder.insert_value(enum_val, tag_val, 0)
 
-            # Set Payload
-            if node.args:
-                payload_val = self.visit(node.args[0])
+                # Set Payload
+                if node.args:
+                    payload_val = self.visit(node.args[0])
 
-                # Allocate temp enum
-                enum_ptr = self.builder.alloca(enum_ty)
-                self.builder.store(enum_val, enum_ptr)
+                    # Allocate temp enum
+                    enum_ptr = self.builder.alloca(enum_ty)
+                    self.builder.store(enum_val, enum_ptr)
 
-                # Get pointer to data field (index 1)
-                zero = ir.Constant(ir.IntType(32), 0)
-                one = ir.Constant(ir.IntType(32), 1)
-                data_ptr = self.builder.gep(enum_ptr, [zero, one])
+                    # Get pointer to data field (index 1)
+                    zero = ir.Constant(ir.IntType(32), 0)
+                    one = ir.Constant(ir.IntType(32), 1)
+                    data_ptr = self.builder.gep(enum_ptr, [zero, one])
 
-                # Cast data_ptr to payload type pointer (e.g. i32*)
-                payload_ptr = self.builder.bitcast(data_ptr, payload_val.type.as_pointer())
-                self.builder.store(payload_val, payload_ptr)
+                    # Cast data_ptr to payload type pointer (e.g. i32*)
+                    payload_ptr = self.builder.bitcast(data_ptr, payload_val.type.as_pointer())
+                    self.builder.store(payload_val, payload_ptr)
 
-                # Load back
-                return self.builder.load(enum_ptr)
-            else:
-                return enum_val
+                    # Load back
+                    return self.builder.load(enum_ptr)
+                else:
+                    return enum_val
 
         elif isinstance(node.callee, str) and (node.callee in self.struct_types or ('<' in node.callee and node.callee.split('<')[0] in self.struct_types)):
             # Struct Instantiation
@@ -2316,7 +2402,7 @@ class CodeGen:
         # Check if exists
         try:
             func = self.module.get_global(node.name)
-        except KeyError:
+        except (KeyError, AttributeError):
             func = ir.Function(self.module, func_ty, name=node.name)
 
         if node.is_kernel:

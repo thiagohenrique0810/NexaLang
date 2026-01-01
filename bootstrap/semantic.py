@@ -19,8 +19,10 @@ class SemanticAnalyzer:
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
         self.struct_defs = {} # name -> StructDef (for privacy check)
+        self.struct_used = {} # name -> bool
         self.enums = {} # name -> {variant: [payload_types]}
         self.enum_defs = {} # name -> EnumDef (for privacy check)
+        self.enum_used = {} # name -> bool
         self.generic_functions = {} # name -> node
         self.generic_structs = {} # name -> node
         self.generic_enums = {} # name -> node
@@ -46,6 +48,11 @@ class SemanticAnalyzer:
     def resolve_type_name(self, name):
         if not name: return name
         
+        # Mark as used if it's a known struct/enum
+        base_name = name.split('<')[0] if '<' in name else name
+        if base_name in self.struct_used: self.struct_used[base_name] = True
+        if base_name in self.enum_used: self.enum_used[base_name] = True
+
         # 1. Alias Check (Direct or Recursive)
         if name in self.aliases:
             return self.resolve_type_name(self.aliases[name])
@@ -164,6 +171,70 @@ class SemanticAnalyzer:
         if not getattr(target_node, 'is_pub', False):
             raise Exception(f"Privacy Error: '{target_name}' is private to module '{target_mod}'")
 
+    def get_mangled_name(self, name, params):
+        if name in ('print', 'panic', 'assert', 'malloc', 'free', 'realloc', 'memcpy') or name.startswith('gpu::') or name.startswith('fs::'):
+            return name
+        
+        # Don't mangle if already mangled
+        if "__args__" in name:
+            return name
+
+        param_types = []
+        for i, (pn, pt) in enumerate(params):
+            # Normalize self types for consistent mangling
+            if i == 0 and pn == 'self':
+                # Methods always mangle as having a pointer to the struct
+                # except if we ever support by-value self, but for now...
+                clean_t = "SELF_PTR"
+            else:
+                clean_t = pt.replace('*', '_ptr').replace('<', '_L_').replace('>', '_R_').replace('&', '_ref_').replace(' ', '_').replace(',', '_')
+            param_types.append(clean_t)
+        
+        res = name
+        if param_types:
+            res = f"{name}__args__{'__'.join(param_types)}"
+            
+        return res
+
+    def resolve_overload(self, base_name, arg_types, node):
+        candidates = []
+        if base_name in self.function_defs:
+            candidates = self.function_defs[base_name]
+        
+        if not candidates:
+            # Try suggestion
+            possibilities = list(self.functions) + list(self.structs.keys())
+            suggestion = self.get_suggestion(base_name, possibilities)
+            hint = f"did you mean '{suggestion}'?" if suggestion else None
+            self.error(f"Unknown function or struct: '{base_name}'", node, hint=hint, error_code="E0004")
+
+        # 1. Exact match (strongest)
+        for cand in candidates:
+            if len(cand.params) != len(arg_types): continue
+            match = True
+            for (pname, ptype), atype in zip(cand.params, arg_types):
+                if ptype != atype:
+                    match = False; break
+            if match:
+                mangled = self.get_mangled_name(base_name, cand.params)
+                cand.mangled_name = mangled
+                return cand, mangled
+
+        # 2. Match with compatibility/coercion
+        for cand in candidates:
+            if len(cand.params) != len(arg_types): continue
+            match = True
+            for (pname, ptype), atype in zip(cand.params, arg_types):
+                if not self.check_type_compatibility(ptype, atype, node):
+                    match = False; break
+            if match:
+                mangled = self.get_mangled_name(base_name, cand.params)
+                cand.mangled_name = mangled
+                return cand, mangled
+
+        # Error if no match
+        self.error(f"No overload of '{base_name}' matches arguments: ({', '.join(arg_types)})", node)
+
     def analyze(self, ast):
         self.ast_root = ast
         
@@ -177,6 +248,7 @@ class SemanticAnalyzer:
                      fields = {name: type_ for name, type_ in node.fields}
                      self.structs[node.name] = fields
                      self.struct_defs[node.name] = node
+                     self.struct_used[node.name] = getattr(node, 'is_pub', False) or node.name.startswith('std_')
             elif name == 'EnumDef':
                  if node.generics:
                      self.generic_enums[node.name] = node
@@ -184,6 +256,7 @@ class SemanticAnalyzer:
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
                      self.enum_defs[node.name] = node
+                     self.enum_used[node.name] = getattr(node, 'is_pub', False) or node.name.startswith('std_')
             elif name == 'TraitDef':
                  self.trait_defs[node.name] = node
                  methods = {m.name: m for m in node.methods}
@@ -199,7 +272,15 @@ class SemanticAnalyzer:
                     self.generic_functions[node.name] = node
                 else:
                     self.functions.add(node.name)
-                    self.function_defs[node.name] = node
+                    if node.name not in self.function_defs:
+                        self.function_defs[node.name] = []
+                    
+                    if not isinstance(self.function_defs[node.name], list):
+                        # Handle case where it was a single item from a previous turn? 
+                        # Unlikely but safer.
+                        self.function_defs[node.name] = [self.function_defs[node.name]]
+                        
+                    self.function_defs[node.name].append(node)
             elif name == 'ImplDef':
                  self.register_impl_methods(node)
         
@@ -226,15 +307,26 @@ class SemanticAnalyzer:
             self.visit(node)
         
         # 3. Dead Code Analysis
-        for name, func in self.function_defs.items():
+        for name, funcs in self.function_defs.items():
              if name == 'main' or name.endswith('::main'): continue
-             if not func.used and not func.is_pub and not name.startswith('std_'):
-                  # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
-                  if '::' in name: continue # Skip methods for now to avoid noise
-                  if self.current_module == 'std': continue # Skip std lib internal
-                  
-                  # Find original line/col? FuncDef has it.
-                  self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
+             for func in funcs:
+                  if not func.used and not func.is_pub and not name.startswith('std_'):
+                       # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
+                       if '::' in name: continue # Skip methods for now to avoid noise
+                       if self.current_module == 'std': continue # Skip std lib internal
+                       
+                       # Find original line/col? FuncDef has it.
+                       self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
+
+        for name, used in self.struct_used.items():
+             if not used and not name.startswith('std_'):
+                  node = self.struct_defs[name]
+                  self.warnings.append((f"Dead code: Struct '{name}' is never used", node.line, node.column))
+
+        for name, used in self.enum_used.items():
+             if not used and not name.startswith('std_'):
+                  node = self.enum_defs[name]
+                  self.warnings.append((f"Dead code: Enum '{name}' is never used", node.line, node.column))
 
     def canonicalize_type_refs(self, node):
         prefix = getattr(node, 'module', '')
@@ -284,7 +376,6 @@ class SemanticAnalyzer:
 
     def is_deeply_concrete(self, t):
         if not t: return True
-        print(f"DEBUG IS_CONCRETE: {t}")
         if '<' in t:
              base = t.split('<')[0]
              inside = t[t.find('<')+1:-1]
@@ -308,18 +399,34 @@ class SemanticAnalyzer:
         if getattr(node, 'module', None):
              self.current_module = node.module
              
+        struct_name = node.struct_name
+        if struct_name == 'std_hash_i32': struct_name = 'i32'
+        if struct_name == 'std_hash_string': struct_name = 'string'
+
         # Resolve associated types and Self inside this impl
-        mapping = {"Self": node.struct_name}
+        mapping = {"Self": struct_name}
         if hasattr(node, 'associated_types'):
             for assoc_name, assoc_type in node.associated_types.items():
                  mapping[f"Self_{assoc_name}"] = assoc_type
              
         for method in node.methods:
-             # Update signature
+             # Handle self parameters BEFORE submap/mangling
+             if method.params:
+                  pname, ptype = method.params[0]
+                  if pname == 'self':
+                       if ptype == 'Self': method.params[0] = ('self', struct_name)
+                       elif ptype == '&Self': method.params[0] = ('self', f"{struct_name}*")
+                       elif ptype == '&mut Self': method.params[0] = ('self', f"{struct_name}*")
+
+             # Update signature (other params)
              method.return_type = self.apply_submap(method.return_type, mapping)
              new_params = []
-             for pn, pt in method.params:
-                  new_params.append((pn, self.apply_submap(pt, mapping)))
+             for i, (pn, pt) in enumerate(method.params):
+                  # Skip self for submap as we handled it
+                  if i == 0 and pn == 'self':
+                       new_params.append((pn, pt))
+                  else:
+                       new_params.append((pn, self.apply_submap(pt, mapping)))
              method.params = new_params
              
              # Update body
@@ -402,11 +509,17 @@ class SemanticAnalyzer:
                        if ptype == 'Self': method.params[0] = ('self', struct_name)
                        elif ptype in ('&Self', '&mut Self'): method.params[0] = ('self', f"{struct_name}*")
              
-             self.struct_methods[struct_name][method.name] = method
-             mangled_name = f"{struct_name}_{method.name}"
-             method.name = mangled_name 
-             self.functions.add(mangled_name)
-             self.function_defs[mangled_name] = method
+             if method.name not in self.struct_methods[struct_name]:
+                 self.struct_methods[struct_name][method.name] = []
+             self.struct_methods[struct_name][method.name].append(method)
+             
+             # Also register in global function defs for direct calls (Type_method)
+             mangled_base = f"{struct_name}_{method.name}"
+             method.name = mangled_base # Update method name to mangled base
+             if mangled_base not in self.function_defs:
+                 self.function_defs[mangled_base] = []
+             self.function_defs[mangled_base].append(method)
+             self.functions.add(mangled_base)
 
     def check_trait_impl(self, type_name, trait_name):
         if (type_name, trait_name) in self.impls: return True
@@ -418,16 +531,21 @@ class SemanticAnalyzer:
     def visit_MemberAccess(self, node):
         obj_type = self.visit(node.object)
         base_type = obj_type.lstrip('&').replace('mut ', '').rstrip('*')
-        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
-
-        if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
-        elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
-        else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+        
+        # Try full type first (monomorphized)
+        if base_type in self.structs:
+             fields_dict = self.structs[base_type]
+             lookup_type = base_type
+        else:
+             lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
+             if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
+             elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
+             else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         if node.member not in fields_dict:
              suggestion = self.get_suggestion(node.member, list(fields_dict.keys()))
              hint = f"did you mean '.{suggestion}'?" if suggestion else None
-             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node, hint=hint)
+             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node, hint=hint, error_code="E0006")
         
         node.struct_type = lookup_type
         node.type_name = fields_dict[node.member]
@@ -445,13 +563,49 @@ class SemanticAnalyzer:
         if node.method_name not in methods:
             suggestion = self.get_suggestion(node.method_name, list(methods.keys()))
             hint = f"did you mean '.{suggestion}()'?" if suggestion else None
-            self.error(f"Method '{node.method_name}' not found on type '{base_type}'", node, hint=hint)
+            self.error(f"Method '{node.method_name}' not found on type '{base_type}'", node, hint=hint, error_code="E0005")
         
-        method_def = methods[node.method_name]
+        arg_types = [self.visit(arg) for arg in node.args]
+        
+        # Overload resolution for methods
+        candidates = methods[node.method_name]
+        best_cand = None
+        
+        # 1. Exact match
+        for cand in candidates:
+            method_params = cand.params[1:] if cand.params and cand.params[0][0] == 'self' else cand.params
+            if len(method_params) != len(arg_types): continue
+            match = True
+            for (pname, ptype), atype in zip(method_params, arg_types):
+                if ptype != atype:
+                    match = False; break
+            if match:
+                best_cand = cand; break
+        
+        # 2. Match with compatibility/coercion
+        if not best_cand:
+            for cand in candidates:
+                method_params = cand.params[1:] if cand.params and cand.params[0][0] == 'self' else cand.params
+                if len(method_params) != len(arg_types): continue
+                match = True
+                for (pname, ptype), atype in zip(method_params, arg_types):
+                    if not self.check_type_compatibility(ptype, atype, node):
+                        match = False; break
+                if match:
+                    best_cand = cand; break
+        
+        if not best_cand:
+            self.error(f"No overload of method '{node.method_name}' on type '{base_type}' matches arguments: ({', '.join(arg_types)})", node)
+
         node.struct_type = lookup_type
         node.receiver_type = receiver_type
+        node.method_def = best_cand # Store for codegen
+        best_cand.used = True
         
-        ret_type = method_def.return_type
+        # Mangle name
+        node.method_name = self.get_mangled_name(f"{lookup_type}_{node.method_name}", best_cand.params)
+        
+        ret_type = best_cand.return_type
         if '<' in receiver_type:
              struct_def = None
              if lookup_type in self.generic_structs: 
@@ -522,6 +676,16 @@ class SemanticAnalyzer:
                 self.scopes[-1]['active_borrows'].append((node.operand.name, 'writer' if node.op == '&mut' else 'reader'))
             node.type_name = f"{t}*"
             return node.type_name
+        elif node.op == '!':
+            if t != 'bool':
+                raise Exception(f"Type Error: Logical NOT requires bool, got {t}")
+            node.type_name = 'bool'
+            return 'bool'
+        elif node.op == '-':
+            if t not in ('i32', 'i64', 'f32'):
+                raise Exception(f"Type Error: Negation requires numeric type, got {t}")
+            node.type_name = t
+            return t
         return t
 
     def visit_MatchExpr(self, node):
@@ -551,7 +715,8 @@ class SemanticAnalyzer:
                 for i, vname in enumerate(case.var_names): self.declare_variable(vname, payloads[i])
             self.visit(case.body)
             self.exit_scope()
-        if len(covered) != len(variants): raise Exception("Match not exhaustive")
+        if len(covered) != len(variants):
+             raise Exception("Match not exhaustive")
 
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
@@ -566,7 +731,6 @@ class SemanticAnalyzer:
         elif base in self.generic_enums: self.instantiate_generic_enum(name)
 
     def instantiate_generic_struct(self, name):
-        print(f"DEBUG TRY MONO STRUCT: {name}")
         if name in self.structs: return
         base_name, rest = name.split('<', 1)
         args = [a.strip() for a in self.split_generic_args(rest[:-1])]
@@ -587,7 +751,6 @@ class SemanticAnalyzer:
         is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
         if is_concrete:
              self.structs[name] = dict(new_fields)
-             print(f"DEBUG MONO STRUCT: {name} fields={new_fields}")
              self.ast_root.append(StructDef(name, new_fields))
 
     def instantiate_generic_enum(self, name):
@@ -645,7 +808,6 @@ class SemanticAnalyzer:
         is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
         if is_concrete:
              new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
-             print(f"DEBUG MONO FUNC: {name} params={[p[1] for p in new_params]} ret={new_ret}")
              self.ast_root.append(new_func)
              self.functions.add(name)
              self.function_defs[name] = new_func
@@ -751,6 +913,12 @@ class SemanticAnalyzer:
             node.params[i] = (pn, pt)
             if '<' in pt: self.instantiate_generic_type(pt)
             self.declare_variable(pn, pt, node=node)
+        
+        # Mangle name for overloading (except main and externs)
+        if node.name != 'main' and not node.name.endswith('::main') and node.body is not None:
+            node.name = self.get_mangled_name(node.name, node.params)
+            self.functions.add(node.name) # Add mangled name to known functions
+            
         for s in node.body: self.visit(s)
         self.exit_scope()
         self.current_function = None
@@ -782,6 +950,12 @@ class SemanticAnalyzer:
                   self.warnings.append((f"Potential precision loss: coercing {actual} to {expected} (float to int)", node.line, node.column))
                   return True
                   
+        # String to u8* or i8* coercion
+        if expected in ('u8*', 'i8*', '*u8', '*i8') and actual == 'string':
+             return True
+        if expected == 'string' and actual in ('u8*', 'i8*', '*u8', '*i8'):
+             return True
+
         return False
 
     def visit_VarDecl(self, node):
@@ -790,7 +964,7 @@ class SemanticAnalyzer:
         if node.type_name is None: node.type_name = init_t
         if '<' in node.type_name: self.instantiate_generic_type(node.type_name)
         if init_t != node.type_name and not self.check_type_compatibility(node.type_name, init_t, node):
-             raise Exception(f"Type Error: {init_t} != {node.type_name}")
+             self.error(f"Type Error: {init_t} != {node.type_name}", node, error_code="E0002")
         if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_t): self.move_var(node.initializer.name)
         self.declare_variable(node.name, node.type_name, node=node)
 
@@ -801,12 +975,12 @@ class SemanticAnalyzer:
              if not v: raise Exception("Undefined var")
              if v['readers'] > 0: raise Exception("Variable is borrowed")
              if val_t != v['type'] and not self.check_type_compatibility(v['type'], val_t, node):
-                  raise Exception("Type mismatch in assignment")
+                  self.error("Type mismatch in assignment", node, error_code="E0002")
              v['moved'] = False
         else:
              target_t = self.visit(node.target)
              if target_t != val_t and not self.check_type_compatibility(target_t, val_t, node):
-                  raise Exception("Type mismatch in assignment")
+                  self.error("Type mismatch in assignment", node, error_code="E0002")
         if isinstance(node.value, VariableExpr) and not self.is_copy_type(val_t): self.move_var(node.value.name)
 
     def visit_BinaryExpr(self, node):
@@ -815,9 +989,9 @@ class SemanticAnalyzer:
             if l.endswith('*') and r in ('i32', 'i64'): return l
             if r.endswith('*') and l in ('i32', 'i64') and node.op == 'PLUS': return r
         if l != r and not self.check_type_compatibility(l, r, node) and not self.check_type_compatibility(r, l, node):
-            raise Exception(f"Type mismatch: {l} {node.op} {r}")
+            self.error(f"Type mismatch: {l} {node.op} {r}", node, error_code="E0002")
         if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return l
-        if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'): return 'bool'
+        if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ', 'AND', 'OR'): return 'bool'
         raise Exception("Unsupported binary op")
 
     def visit_IntegerLiteral(self, node): return 'i32'
@@ -906,7 +1080,7 @@ class SemanticAnalyzer:
              if captured:
                   node.is_capture = True
 
-        if v['moved']: self.error(f"Use of moved variable '{node.name}'", node)
+        if v['moved']: self.error(f"Use of moved variable '{node.name}'", node, error_code="E0007")
         v['used'] = True
         return v['type']
 
@@ -997,7 +1171,10 @@ class SemanticAnalyzer:
             if callee in self.function_defs:
                  self.function_defs[callee].used = True
             for a in node.args: self.visit(a)
-            if callee == 'fs::read_file': self.instantiate_generic_type('Buffer<u8>'); return 'Buffer<u8>'
+            if callee == 'fs::read_file': 
+                self.instantiate_generic_type('Buffer<u8>')
+                node.type_name = 'Buffer<u8>'
+                return 'Buffer<u8>'
             if callee in ('malloc', 'realloc'): return 'u8*'
             return 'void'
         if callee == 'gpu::global_id': return 'i32'
@@ -1022,7 +1199,7 @@ class SemanticAnalyzer:
              possibilities = list(self.functions) + list(self.structs.keys()) + list(self.generic_functions.keys()) + list(self.generic_structs.keys())
              suggestion = self.get_suggestion(callee, possibilities)
              hint = f"did you mean '{suggestion}'?" if suggestion else None
-             self.error(f"Unknown function or struct: '{callee}'", node, hint=hint)
+             self.error(f"Unknown function or struct: '{callee}'", node, hint=hint, error_code="E0004")
 
         # Generic Struct Instantiation (e.g. Wrapper<T>)
         if '<' in callee:
@@ -1034,6 +1211,11 @@ class SemanticAnalyzer:
             # Constructor call
             struct_name = callee
             if '<' in struct_name: self.instantiate_generic_struct(struct_name)
+            
+            # Mark struct as used
+            base_struct = struct_name.split('<')[0]
+            if base_struct in self.struct_used: self.struct_used[base_struct] = True
+            
             fields = self.structs[struct_name]
             # ... rest of constructor logic (unchanged)
             if len(node.args) != len(fields): raise Exception(f"Arg mismatch for '{struct_name}' constructor")
@@ -1051,24 +1233,18 @@ class SemanticAnalyzer:
                  self.instantiate_generic_function(callee)
 
         if callee in self.functions:
-            func_def = self.function_defs[callee]
+            arg_types = [self.visit(arg) for arg in node.args]
+            func_def, mangled_name = self.resolve_overload(callee, arg_types, node)
+            
+            node.callee = mangled_name
             func_def.used = True
             
-            if not func_def.is_vararg and len(node.args) != len(func_def.params): 
-                raise Exception(f"Arg count mismatch for '{callee}': expected {len(func_def.params)}, got {len(node.args)}")
-            elif func_def.is_vararg and len(node.args) < len(func_def.params):
-                raise Exception(f"Arg count mismatch for vararg '{callee}': expected at least {len(func_def.params)}, got {len(node.args)}")
-                
-            self.enter_scope()
+            # Re-visit args in scope if needed? No, already visited.
+            # But we should check for moves if not copy.
             for i, arg in enumerate(node.args):
-                 arg_t = self.visit(arg)
-                 if i < len(func_def.params):
-                     param_t = func_def.params[i][1]
-                     if generics_mapping: param_t = self.apply_submap(param_t, generics_mapping)
-                     
-                     if not self.check_type_compatibility(param_t, arg_t, node):
-                          raise Exception(f"Type mismatch arg {i} for '{callee}': expected {param_t}, got {arg_t}")
-            self.exit_scope()
+                 if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_types[i]):
+                      self.move_var(arg.name)
+
             ret = func_def.return_type
             if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
             return ret
@@ -1147,6 +1323,19 @@ class SemanticAnalyzer:
         if isinstance(node, CallExpr):
             if isinstance(node.callee, str) and '<' in node.callee:
                  node.callee = self.apply_submap(node.callee, mapping)
+            elif hasattr(node.callee, 'name'): # VariableExpr
+                 if '<' in node.callee.name:
+                      node.callee.name = self.apply_submap(node.callee.name, mapping)
+                 elif node.callee.name in mapping:
+                      node.callee.name = mapping[node.callee.name]
+
+        if hasattr(node, 'name') and not isinstance(node, (FunctionDef, StructDef, EnumDef)):
+             val = getattr(node, 'name')
+             if isinstance(val, str):
+                  if val in mapping:
+                       setattr(node, 'name', mapping[val])
+                  elif '<' in val:
+                       setattr(node, 'name', self.apply_submap(val, mapping))
 
         # 2. Recurse on Children
         for k, v in node.__dict__.items():
