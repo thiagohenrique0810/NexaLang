@@ -1,10 +1,26 @@
-# Build / scratch outputs (local development)
-dev/
+# Build / scratch outputs
+dev/artifacts/
+build/
+logs/
+bin/
 
-# Common compiler artifacts
+# Artifacts
 *.ll
 *.bc
 *.spv
 *.spvasm
+*.exe
+*.o
+*.obj
 
+# Python
+__pycache__/
+*.pyc
 
+# Debug/Logs
+*.log
+*.txt
+!readme.md
+!whitepaper.md
+!roadmap.md
+!requirements.txt
