@@ -30,6 +30,7 @@ class SemanticAnalyzer:
         self.trait_defs = {} # name -> TraitDef
         self.current_module = ""
         self.lambda_count = 0
+        self.tests = [] # list of test function names
         self.lambda_base_scopes = [] # Stack of len(self.scopes) when lambda started
         self.lambda_capture_stack = [] # Stack of dicts: {name: type}
         self.lambda_count = 0
@@ -235,9 +236,44 @@ class SemanticAnalyzer:
         # Error if no match
         self.error(f"No overload of '{base_name}' matches arguments: ({', '.join(arg_types)})", node)
 
+    def generate_derive(self, node, trait):
+        from n_parser import ImplDef, FunctionDef, CallExpr, StringLiteral, MemberAccess, VariableExpr, ReturnStmt, IntegerLiteral
+        if trait == 'Debug':
+            # Generate Debug for Struct
+            if isinstance(node, StructDef):
+                # fn debug_print(&self)
+                body = []
+                body.append(CallExpr("print", [StringLiteral(f"{node.name} {{ ")]))
+                for i, (fname, ftype) in enumerate(node.fields):
+                    body.append(CallExpr("print", [StringLiteral(f"{fname}: ")]))
+                    # print(self.field) - only works if field is primitive!
+                    # For now, let's assume primitives
+                    body.append(CallExpr("print", [MemberAccess(VariableExpr("self"), fname)]))
+                    if i < len(node.fields) - 1:
+                        body.append(CallExpr("print", [StringLiteral(", ")]))
+                body.append(CallExpr("print", [StringLiteral(" }\n")]))
+                # No explicit return needed for void functions if we handle it in codegen
+                # or use ReturnStmt(None)
+                
+                method = FunctionDef("debug_print", [("self", f"&{node.name}")], "void", body)
+                return [ImplDef(node.name, [method])]
+        return []
+
     def analyze(self, ast):
         self.ast_root = ast
         
+        # 0. Process Derives
+        new_nodes = []
+        for node in ast:
+            if isinstance(node, (StructDef, EnumDef)):
+                for attr_name, attr_args in getattr(node, 'attrs', []):
+                    if attr_name == 'derive':
+                        for trait in attr_args:
+                            generated = self.generate_derive(node, trait)
+                            if generated:
+                                new_nodes.extend(generated)
+        ast.extend(new_nodes)
+
         # Pass 1: Collect Types (Structs, Enums, Traits)
         for node in ast:
             name = type(node).__name__
@@ -914,6 +950,11 @@ class SemanticAnalyzer:
         prev_mod = self.current_module
         if getattr(node, 'module', None):
              self.current_module = node.module
+
+        # Mark as test if attribute exists
+        for attr_name, attr_args in getattr(node, 'attrs', []):
+            if attr_name == 'test':
+                self.tests.append(node.name)
 
         self.current_function = node
         self.enter_scope()

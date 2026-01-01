@@ -24,7 +24,7 @@ class IndexAccess(ASTNode):
         return f"{self.object}[{self.index}]"
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False, is_vararg=False, is_async=False):
+    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False, is_vararg=False, is_async=False, attrs=None):
         super().__init__()
         self.name = name
         self.params = params
@@ -35,25 +35,28 @@ class FunctionDef(ASTNode):
         self.is_pub = is_pub
         self.is_vararg = is_vararg
         self.is_async = is_async
+        self.attrs = attrs or []
         self.module = ""
         self.used = False
 
 class StructDef(ASTNode):
-    def __init__(self, name, fields, generics=None, is_pub=False):
+    def __init__(self, name, fields, generics=None, is_pub=False, attrs=None):
         super().__init__()
         self.name = name
         self.fields = fields # list of (name, type) tuples
         self.generics = generics or []
         self.is_pub = is_pub
+        self.attrs = attrs or []
         self.module = ""
 
 class EnumDef(ASTNode):
-    def __init__(self, name, variants, generics=None, is_pub=False):
+    def __init__(self, name, variants, generics=None, is_pub=False, attrs=None):
         super().__init__()
         self.name = name
         self.variants = variants # list of (name, payload_types) tuples. payload_types is list of strings
         self.generics = generics or []
         self.is_pub = is_pub
+        self.attrs = attrs or []
         self.module = ""
 
 class TraitDef(ASTNode):
@@ -330,6 +333,8 @@ class Parser:
     def parse(self):
         nodes = []
         while self.pos < len(self.tokens):
+            attrs = self.parse_attributes()
+            
             is_pub = False
             if self.peek().type == 'PUB':
                 self.consume('PUB')
@@ -341,13 +346,13 @@ class Parser:
                 is_async = True
 
             if self.peek().type == 'KERNEL':
-                nodes.append(self.parse_function(is_kernel=True, is_pub=is_pub, is_async=is_async))
+                nodes.append(self.parse_function(is_kernel=True, is_pub=is_pub, is_async=is_async, attrs=attrs))
             elif self.peek().type == 'FN':
-                nodes.append(self.parse_function(is_kernel=False, is_pub=is_pub, is_async=is_async))
+                nodes.append(self.parse_function(is_kernel=False, is_pub=is_pub, is_async=is_async, attrs=attrs))
             elif self.peek().type == 'STRUCT':
-                nodes.append(self.parse_struct(is_pub=is_pub))
+                nodes.append(self.parse_struct(is_pub=is_pub, attrs=attrs))
             elif self.peek().type == 'ENUM':
-                nodes.append(self.parse_enum(is_pub=is_pub))
+                nodes.append(self.parse_enum(is_pub=is_pub, attrs=attrs))
             elif self.peek().type == 'IMPL':
                 if is_pub: raise Exception("impl blocks cannot be declared public")
                 nodes.append(self.parse_impl())
@@ -364,6 +369,29 @@ class Parser:
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
+
+    def parse_attributes(self):
+        attrs = []
+        while self.peek().type == 'AT':
+            self.consume('AT')
+            self.consume('LBRACKET')
+            name = self.consume('IDENTIFIER').value
+            
+            # Support @[name(arg)]
+            args = []
+            if self.peek().type == 'LPAREN':
+                self.consume('LPAREN')
+                while self.peek().type != 'RPAREN':
+                    if self.peek().type == 'IDENTIFIER':
+                        args.append(self.consume('IDENTIFIER').value)
+                    elif self.peek().type == 'STRING':
+                        args.append(self.consume('STRING').value)
+                    if self.peek().type == 'COMMA': self.consume('COMMA')
+                self.consume('RPAREN')
+            
+            self.consume('RBRACKET')
+            attrs.append((name, args))
+        return attrs
 
     def parse_extern(self):
         self.consume('EXTERN')
@@ -385,6 +413,8 @@ class Parser:
             self.consume('LBRACE')
             body = []
             while self.peek().type != 'RBRACE':
+                attrs = self.parse_attributes()
+                
                 # Similar to parse() but within a block
                 # We need to support top-level items within mod blocks
                 is_nested_pub = False
@@ -398,9 +428,9 @@ class Parser:
                     is_nested_async = True
                 
                 t = self.peek().type
-                if t == 'FN': body.append(self.parse_function(is_pub=is_nested_pub, is_async=is_nested_async))
-                elif t == 'STRUCT': body.append(self.parse_struct(is_pub=is_nested_pub))
-                elif t == 'ENUM': body.append(self.parse_enum(is_pub=is_nested_pub))
+                if t == 'FN': body.append(self.parse_function(is_pub=is_nested_pub, is_async=is_nested_async, attrs=attrs))
+                elif t == 'STRUCT': body.append(self.parse_struct(is_pub=is_nested_pub, attrs=attrs))
+                elif t == 'ENUM': body.append(self.parse_enum(is_pub=is_nested_pub, attrs=attrs))
                 elif t == 'IMPL': body.append(self.parse_impl())
                 elif t == 'MOD': body.append(self.parse_mod(is_pub=is_nested_pub))
                 elif t == 'TRAIT': body.append(self.parse_trait(is_pub=is_nested_pub))
@@ -551,7 +581,7 @@ class Parser:
         self.consume('RBRACE')
         return TraitDef(name, methods, generics, is_pub=is_pub, associated_types=associated_types)
 
-    def parse_struct(self, is_pub=False):
+    def parse_struct(self, is_pub=False, attrs=None):
         self.consume('STRUCT')
         name = self.consume('IDENTIFIER').value
         
@@ -587,12 +617,12 @@ class Parser:
                 self.consume('COMMA')
         self.consume('RBRACE')
         start_token = self.tokens[self.pos-1] # AFTER consume
-        node = StructDef(name, fields, generics, is_pub=is_pub)
+        node = StructDef(name, fields, generics, is_pub=is_pub, attrs=attrs)
         node.line = start_token.line
         node.column = start_token.column
         return node
 
-    def parse_enum(self, is_pub=False):
+    def parse_enum(self, is_pub=False, attrs=None):
         self.consume('ENUM')
         name = self.consume('IDENTIFIER').value
         
@@ -631,9 +661,9 @@ class Parser:
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
         self.consume('RBRACE')
-        return EnumDef(name, variants, generics, is_pub=is_pub)
+        return EnumDef(name, variants, generics, is_pub=is_pub, attrs=attrs)
 
-    def parse_function(self, is_kernel=False, is_pub=False, allow_empty_body=False, is_async=False):
+    def parse_function(self, is_kernel=False, is_pub=False, allow_empty_body=False, is_async=False, attrs=None):
         start_token = self.peek()
         if is_kernel:
             self.consume('KERNEL')
@@ -715,7 +745,7 @@ class Parser:
                 if self.peek().type == 'SEMICOLON':
                     self.consume('SEMICOLON')
             self.consume('RBRACE')
-        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub, is_vararg=is_vararg, is_async=is_async)
+        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub, is_vararg=is_vararg, is_async=is_async, attrs=attrs)
         node.line = start_token.line
         node.column = start_token.column
         return node

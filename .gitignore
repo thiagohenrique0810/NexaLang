@@ -2,14 +2,12 @@
 dev/artifacts/
 build/
 logs/
-bin/
 
 # Artifacts
 *.ll
 *.bc
 *.spv
 *.spvasm
-*.exe
 *.o
 *.obj
 

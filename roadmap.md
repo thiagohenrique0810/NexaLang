@@ -181,10 +181,15 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Pretty-print error context with caret (^) pointing to error
   - [x] Suggestion system ("did you mean X?")
   - [x] Error codes and documentation links (E0001-E0007)
+- [x] **Testing & Metaprogramming**
+  - [x] Integrated testing framework (`@[test]` attribute + `nx test`)
+  - [x] Derivation system (`@[derive(Debug)]`)
 - [x] **Warnings System**
   - [x] Unused variable warnings
   - [x] Dead code detection
   - [x] Type coercion warnings
+  - [x] Integrated testing framework (`@[test]` attribute + `nx test`)
+  - [x] Derivation system (`@[derive(Debug)]`)
 
 ## Phase 7: Advanced Type System 🔧
 - [x] **Traits (Interfaces)**

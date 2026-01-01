@@ -109,6 +109,9 @@ class Lexer:
             elif char == ';':
                 tokens.append(Token('SEMICOLON', ';', start_line, start_col))
                 self.advance()
+            elif char == '@':
+                tokens.append(Token('AT', '@', start_line, start_col))
+                self.advance()
             
             # Operators
             elif char == '=':

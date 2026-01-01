@@ -81,6 +81,7 @@ def main():
     ap.add_argument("--spirv-vulkan-descriptor-set", type=int, default=0, help="(vulkan) DescriptorSet number to use for kernel args")
     ap.add_argument("--spirv-vulkan-binding-base", type=int, default=0, help="(vulkan) First binding number to assign to kernel args")
     ap.add_argument("--run-jit", action="store_true", help="Run the generated code immediately using JIT (no external compiler required)")
+    ap.add_argument("--run-tests", action="store_true", help="Find and run all functions marked with @[test]")
     ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
     args = ap.parse_args()
 
@@ -102,6 +103,14 @@ def main():
     # 3. Semantic Analysis
     from semantic import SemanticAnalyzer
     analyzer = SemanticAnalyzer()
+    
+    # Pre-analyze to find tests if --run-tests is on
+    if args.run_tests:
+        # We need to find tests first. But analyzer does that during visit.
+        # Let's run a partial pass or just inject the main later.
+        # Better: run analyze, then if tests found, inject main and re-analyze main only.
+        pass
+
     try:
         analyzer.analyze(ast)
     except CompilerError as e:
@@ -135,6 +144,26 @@ def main():
                    print(f"   | {' ' * (col-1)}^")
 
     # 4. Code Generation
+    if args.run_tests:
+        # Create a test main
+        from n_parser import FunctionDef, CallExpr, IntegerLiteral, StringLiteral
+        
+        test_body = []
+        for test_name in analyzer.tests:
+            test_body.append(CallExpr("print", [StringLiteral(f"Running test {test_name}... ")]))
+            test_body.append(CallExpr(test_name, []))
+            test_body.append(CallExpr("print", [StringLiteral("PASSED\n")]))
+        
+        test_body.append(n_parser.ReturnStmt(IntegerLiteral(0)))
+        
+        test_main = FunctionDef("main", [], "i32", test_body)
+        # Remove existing main if any
+        ast = [n for n in ast if not (isinstance(n, FunctionDef) and n.name == "main")]
+        ast.append(test_main)
+        
+        # Re-analyze the injected main
+        analyzer.visit(test_main)
+
     spirv_env = args.spirv_env if args.target == "spirv" else "opencl"
     emit_kernels_only = args.target == "spirv" and args.emit == "spv"
     codegen = CodeGen(

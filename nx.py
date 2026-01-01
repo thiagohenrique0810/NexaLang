@@ -34,6 +34,22 @@ def _python() -> list[str]:
     return [sys.executable]
 
 
+def _clang():
+    # Try to find clang
+    paths = [
+        "clang",
+        os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "apps", "llvm", "current", "bin", "clang.exe"),
+        "C:\\Program Files\\LLVM\\bin\\clang.exe"
+    ]
+    for p in paths:
+        try:
+            subprocess.run([p, "--version"], capture_output=True)
+            return p
+        except:
+            continue
+    return "clang" # Fallback
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     _ensure_dir(DEV_ARTIFACTS)
     
@@ -57,7 +73,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             return rc
         # Link
         if not args.no_link:
-            return _run(["clang", ll_out, "-o", out])
+            return _run([_clang(), ll_out, "-o", out])
         return 0
 
     # SPIR-V
@@ -134,7 +150,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     rc = _run(cmd)
     if rc != 0:
         return rc
-    rc = _run(["clang", ll_out, "-o", exe])
+    rc = _run([_clang(), ll_out, "-o", exe])
     if rc != 0:
         return rc
     return _run([exe])
@@ -144,6 +160,34 @@ def cmd_val(args: argparse.Namespace) -> int:
     if args.kind == "spirv":
         return _run(["spirv-val", args.file])
     return 2
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    _ensure_dir(DEV_ARTIFACTS)
+    
+    file = args.file
+    if not file:
+        config = load_project_config()
+        if config and "main" in config:
+            file = config["main"]
+        else:
+            print("Error: No input file specified.")
+            return 1
+
+    ll_out = os.path.join(DEV_ARTIFACTS, "test.ll")
+    exe_out = os.path.join(DEV_ARTIFACTS, "test.exe")
+
+    # We need to tell the compiler to run tests
+    rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--run-tests", "--out", ll_out])
+    if rc != 0: return rc
+    
+    # Link
+    rc = _run([_clang(), ll_out, "-o", exe_out])
+    if rc != 0: return rc
+    
+    # Run
+    print("\n[RUNNING TESTS]")
+    return _run([exe_out])
 
 
 def cmd_examples(args: argparse.Namespace) -> int:
@@ -182,6 +226,10 @@ def main() -> int:
     p_run.add_argument("--ll-out", default=None, help="Output .ll path")
     p_run.add_argument("--jit", action="store_true", help="Run using JIT (no clang required)")
     p_run.set_defaults(func=cmd_run)
+
+    p_test = sub.add_parser("test", help="Run tests (functions marked with @[test])")
+    p_test.add_argument("file", nargs="?", help="Input .nxl")
+    p_test.set_defaults(func=cmd_test)
 
     p_val = sub.add_parser("val", help="Validate artifacts (SPIR-V)")
     p_val.add_argument("kind", choices=["spirv"])

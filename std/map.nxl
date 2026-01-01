@@ -1,42 +1,92 @@
 use std::vec::Vec;
 use std::option::Option;
+use std::hash::Hash;
 
 struct Entry<K, V> {
     key: K,
-    value: V
+    value: V,
+    occupied: bool
 }
 
 pub struct HashMap<K, V> {
-    entries: Vec<Entry<K, V>>
+    entries: Vec<Entry<K, V>>,
+    count: i32
 }
 
-impl<K, V> HashMap<K, V> {
+pub struct HashMapIterator<K, V> {
+    map: *HashMap<K, V>,
+    index: i32
+}
+
+impl<K, V> HashMapIterator<K, V> {
+    fn next(&mut self) -> Option<K> {
+        while (self.index < (*self.map).entries.len()) {
+            let entry = (*self.map).entries.get(self.index).unwrap();
+            self.index = self.index + 1;
+            if (entry.occupied) {
+                return Option::<K>::Some(entry.key);
+            }
+        }
+        return Option::<K>::None;
+    }
+}
+
+impl<K: Hash, V> HashMap<K, V> {
     fn new() -> HashMap<K, V> {
-        return HashMap(Vec::<Entry<K, V>>::new());
+        let mut entries = Vec::<Entry<K, V>>::new();
+        # Pre-allocate 16 slots
+        for i in 0..16 {
+            entries.push(Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+        }
+        return HashMap(entries, 0);
     }
 
     fn insert(&mut self, key: K, value: V) {
-        for i in 0..self.entries.len() {
-             let entry = self.entries.get(i).unwrap();
-             if (entry.key == key) {
-                 self.entries.set(i, Entry::<K, V>(key, value));
-                 return;
-             }
+        let h = key.hash();
+        let cap = self.entries.len();
+        let mut idx = cast::<i32>(h % cast::<u64>(cap));
+        
+        while (true) {
+            let mut entry = self.entries.get(idx).unwrap();
+            if (!entry.occupied) {
+                self.entries.set(idx, Entry::<K, V>(key, value, true));
+                self.count = self.count + 1;
+                return;
+            }
+            if (entry.key == key) {
+                self.entries.set(idx, Entry::<K, V>(key, value, true));
+                return;
+            }
+            idx = (idx + 1) % cap;
         }
-        self.entries.push(Entry::<K, V>(key, value));
     }
 
     fn get(&self, key: K) -> Option<V> {
-        for i in 0..self.entries.len() {
-             let entry = self.entries.get(i).unwrap();
-             if (entry.key == key) {
-                 return Option::<V>::Some(entry.value);
-             }
+        let h = key.hash();
+        let cap = self.entries.len();
+        let mut idx = cast::<i32>(h % cast::<u64>(cap));
+        let start_idx = idx;
+        
+        while (true) {
+            let entry = self.entries.get(idx).unwrap();
+            if (!entry.occupied) { return Option::<V>::None; }
+            if (entry.key == key) { return Option::<V>::Some(entry.value); }
+            
+            idx = (idx + 1) % cap;
+            if (idx == start_idx) { break; }
         }
         return Option::<V>::None;
     }
-    
+
+    fn contains(&self, key: K) -> bool {
+        return self.get(key).is_some();
+    }
+
     fn len(&self) -> i32 {
-        return self.entries.len();
+        return self.count;
+    }
+
+    fn iter(&self) -> HashMapIterator<K, V> {
+        return HashMapIterator(self, 0);
     }
 }
