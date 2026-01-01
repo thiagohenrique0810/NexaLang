@@ -1,0 +1,13 @@
+pub fn sub(a: i32, b: i32) -> i32 {
+    a - b
+}
+
+pub struct Constants {
+    pi: i32
+}
+
+impl Constants {
+    pub fn get_pi() -> i32 {
+        3
+    }
+}

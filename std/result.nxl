@@ -1,0 +1,31 @@
+pub enum Result<T, E> {
+    Ok(T),
+    Err(E)
+}
+
+impl<T, E> Result<T, E> {
+    fn is_ok(&self) -> bool {
+        let s = *self;
+        match (s) {
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+
+    fn is_err(&self) -> bool {
+        if (self.is_ok()) {
+            return false;
+        }
+        return true;
+    }
+
+    fn unwrap(self) -> T {
+        let s = self;
+        match (s) {
+            Ok(val) => return val,
+            Err(_) => {
+                panic("called `Result::unwrap()` on an `Err` value");
+            }
+        }
+    }
+}

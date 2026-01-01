@@ -1,0 +1,42 @@
+use std::vec::Vec;
+use std::option::Option;
+
+struct Entry<K, V> {
+    key: K,
+    value: V
+}
+
+pub struct HashMap<K, V> {
+    entries: Vec<Entry<K, V>>
+}
+
+impl<K, V> HashMap<K, V> {
+    fn new() -> HashMap<K, V> {
+        return HashMap(Vec::<Entry<K, V>>::new());
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        for i in 0..self.entries.len() {
+             let entry = self.entries.get(i).unwrap();
+             if (entry.key == key) {
+                 self.entries.set(i, Entry::<K, V>(key, value));
+                 return;
+             }
+        }
+        self.entries.push(Entry::<K, V>(key, value));
+    }
+
+    fn get(&self, key: K) -> Option<V> {
+        for i in 0..self.entries.len() {
+             let entry = self.entries.get(i).unwrap();
+             if (entry.key == key) {
+                 return Option::<V>::Some(entry.value);
+             }
+        }
+        return Option::<V>::None;
+    }
+    
+    fn len(&self) -> i32 {
+        return self.entries.len();
+    }
+}

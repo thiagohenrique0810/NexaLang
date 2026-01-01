@@ -1,8 +1,9 @@
 from lexer import Lexer
-from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt, TypeAlias
 from errors import CompilerError
 import sys
 import copy
+
 class SemanticAnalyzer:
     def __init__(self):
         # Symbol table entries: {name: {'type': type, 'moved': bool, 'readers': int, 'writer': bool, 'is_ref': bool}}
@@ -10,22 +11,32 @@ class SemanticAnalyzer:
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
         self.current_function = None
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
-        self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
-        self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_depth = 0
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
+        self.function_defs = {} # name -> FunctionDef
+        self.structs = {} # name -> {field: type}
+        self.struct_defs = {} # name -> StructDef (for privacy check)
+        self.enums = {} # name -> {variant: [payload_types]}
+        self.enum_defs = {} # name -> EnumDef (for privacy check)
+        self.generic_functions = {} # name -> node
+        self.generic_structs = {} # name -> node
+        self.generic_enums = {} # name -> node
+        self.traits = {} # name -> {method_name: method_signature_node}
+        self.trait_defs = {} # name -> TraitDef
+        self.current_module = ""
+
 
     def error(self, message, node=None, hint=None):
         line = node.line if node else None
-        column = node.column if node else None
         column = node.column if node else None
         raise CompilerError(message, line, column, hint=hint)
 
     def resolve_type_name(self, name):
         if not name: return name
         
-        # 1. Alias Check (Direct)
+        # 1. Alias Check (Direct or Recursive)
         if name in self.aliases:
             return self.resolve_type_name(self.aliases[name])
             
@@ -55,10 +66,26 @@ class SemanticAnalyzer:
             except:
                 return name # Fallback if parsing fails
         
-        # 3. Canonicalize :: -> _
+        # 3. Canonicalize :: -> _ (with Alias resolution)
         if '::' in name:
-             return name.replace('::', '_')
+             parts = name.split('::')
+             # Start resolving from the root
+             if parts[0] in self.aliases:
+                 resolved_root = self.resolve_type_name(parts[0])
+                 # If the resolved root already contains underscores (mangled), proceed
+                 parts[0] = resolved_root
+             
+             return "_".join(parts)
             
+        # 4. Local Module Lookup
+        if self.current_module:
+             # Try prefixing with current module (mangled)
+             local_name = f"{self.current_module.replace('::', '_')}_{name}"
+             
+             # Check if this local name exists in known types (Enums, Structs)
+             if local_name in self.structs or local_name in self.enums or local_name in self.generic_structs or local_name in self.generic_enums:
+                  return local_name
+        
         return name
 
     def levenshtein_distance(self, s1, s2):
@@ -86,22 +113,13 @@ class SemanticAnalyzer:
                 min_dist = dist
                 best_match = candidate
         
-        # Threshold: allow distance up to 3 or 1/3 length
         limit = max(3, len(name) // 3)
         if min_dist <= limit and min_dist < len(name): 
              return best_match
         return None
 
     def is_copy_type(self, type_name: str) -> bool:
-        """
-        Bootstrap 'Copy' rule:
-        - Primitive scalars are copy: i32, i64, u8, bool, f32
-        - Pointers are copy: T*
-        - 'string' (i8*) is treated as copy in the bootstrap
-        Everything else is treated as move-only (structs/enums/arrays).
-        """
-        if not type_name:
-            return False
+        if not type_name: return False
         if type_name in ('i32', 'i64', 'u64', 'u8', 'bool', 'f32', 'string', 'char'):
             return True
         if type_name.endswith('*'):
@@ -109,10 +127,6 @@ class SemanticAnalyzer:
         return False
 
     def move_var(self, name: str, node=None):
-        """
-        Marks a variable as moved (consumed) if it is move-only.
-        Also enforces: cannot move while borrowed (readers/writer active).
-        """
         var_info = self.lookup(name)
         if not var_info:
             self.error(f"Semantic Error: Move of undefined variable '{name}'", node)
@@ -120,7 +134,6 @@ class SemanticAnalyzer:
         if var_info.get('moved'):
             self.error(f"Ownership Error: Use of moved variable '{name}'", node)
 
-        # Disallow moving while borrowed (bootstrap rule).
         if var_info.get('readers', 0) > 0:
             self.error(f"Borrow Error: Cannot move '{name}' because it is borrowed", node)
         if var_info.get('writer'):
@@ -130,94 +143,66 @@ class SemanticAnalyzer:
 
     def check_privacy(self, target_node, target_name):
         target_mod = getattr(target_node, 'module', "")
-        # If target has no module (e.g. built-ins), it's public.
         if not target_mod: return
 
         current_mod = ""
         if self.current_function:
             current_mod = getattr(self.current_function, 'module', "")
         
-        # If accessing member of same module, allow.
-        # Check prefix matching? name mangling handles unique definition?
-        # module "A" accessing "A" is fine.
         if current_mod == target_mod: return
         
-        # If different module, target MUST be pub.
         if not getattr(target_node, 'is_pub', False):
             raise Exception(f"Privacy Error: '{target_name}' is private to module '{target_mod}'")
 
     def analyze(self, ast):
         self.ast_root = ast
-        # 1. Collect function and struct names
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
-        self.function_defs = {} # name -> FunctionDef
-        self.structs = {} # name -> {field: type}
-        self.struct_defs = {} # name -> StructDef (for privacy check)
-        self.enums = {} # name -> {variant: [payload_types]}
-        self.enum_defs = {} # name -> EnumDef (for privacy check)
-        self.generic_functions = {} # name -> node
-        self.generic_structs = {} # name -> node
-        self.generic_enums = {} # name -> node
-        self.traits = {} # name -> {method_name: method_signature_node}
-        self.trait_defs = {} # name -> TraitDef
-
+        
         # Pass 1: Collect Types (Structs, Enums, Traits)
         for node in ast:
-            if isinstance(node, StructDef):
+            name = type(node).__name__
+            if name == 'StructDef':
                  if node.generics:
                      self.generic_structs[node.name] = node
                  else:
                      fields = {name: type_ for name, type_ in node.fields}
                      self.structs[node.name] = fields
                      self.struct_defs[node.name] = node
-            elif isinstance(node, EnumDef):
+            elif name == 'EnumDef':
                  if node.generics:
                      self.generic_enums[node.name] = node
                  else:
                      variants = {vname: payloads for vname, payloads in node.variants}
                      self.enums[node.name] = variants
                      self.enum_defs[node.name] = node
-            elif isinstance(node, TraitDef):
+            elif name == 'TraitDef':
                  self.trait_defs[node.name] = node
                  methods = {m.name: m for m in node.methods}
                  self.traits[node.name] = methods
+            elif name == 'TypeAlias':
+                 self.aliases[node.alias] = node.original_type
 
         # Pass 2: Collect Functions and Impls
         for node in ast:
-            if isinstance(node, FunctionDef):
+            name = type(node).__name__
+            if name == 'FunctionDef':
                 if node.generics:
                     self.generic_functions[node.name] = node
                 else:
                     self.functions.add(node.name)
                     self.function_defs[node.name] = node
-            elif isinstance(node, ImplDef):
+            elif name == 'ImplDef':
                  self.register_impl_methods(node)
         
-        # Built-in generic Buffer<T> (for GPU/heterogeneous APIs):
-        # struct Buffer<T> { ptr: *T, len: i32 }
-        # This stays as a generic template and gets monomorphized when used.
+        # Inject Built-ins
         if 'Buffer' not in self.generic_structs and 'Buffer' not in self.structs:
-            self.generic_structs['Buffer'] = StructDef(
-                'Buffer',
-                fields=[('ptr', 'T*'), ('len', 'i32')],
-                generics=['T'],
-            )
-
-        # Built-in generic Slice<T> (for views into arrays/buffers):
-        # struct Slice<T> { ptr: *T, len: i32 }
+            self.generic_structs['Buffer'] = StructDef('Buffer', [('ptr', 'T*'), ('len', 'i32')], generics=['T'])
         if 'Slice' not in self.generic_structs and 'Slice' not in self.structs:
-            self.generic_structs['Slice'] = StructDef(
-                'Slice',
-                fields=[('ptr', 'T*'), ('len', 'i32')],
-                generics=['T'],
-            )
-
-        # Inject Built-in Arena
+            self.generic_structs['Slice'] = StructDef('Slice', [('ptr', 'T*'), ('len', 'i32')], generics=['T'])
         self.structs['Arena'] = {'chunk': 'u8*', 'offset': 'i32', 'capacity': 'i32'}
 
         # 1.5 Process Imports (Use Statements)
         for node in ast:
-             if isinstance(node, UseStmt):
+             if type(node).__name__ == "UseStmt":
                   self.visit_UseStmt(node)
 
         # 1.6 Canonicalize Types in Definitions (Module Scoping)
@@ -226,1429 +211,652 @@ class SemanticAnalyzer:
 
         # 2. Analyze bodies
         for node in ast:
-            if type(node).__name__ == "UseStmt":
-                # print("DEBUG PASS 2 SKIPPING USESTMT", flush=True)
-                continue
-            if "UseStmt" in type(node).__name__:
-                 raise Exception(f"DEBUG CRASH: UseStmt slipped through Pass 2 check! Name='{type(node).__name__}'")
+            if type(node).__name__ == "UseStmt": continue
             self.visit(node)
 
     def canonicalize_type_refs(self, node):
-        if hasattr(node, 'module') and node.module:
-             prefix = node.module
-             
-             if isinstance(node, FunctionDef):
-                  node.return_type = self.mangle_type_if_local(node.return_type, prefix)
-                  for i, (pname, ptype) in enumerate(node.params):
-                       node.params[i] = (pname, self.mangle_type_if_local(ptype, prefix))
-             elif isinstance(node, StructDef):
-                  node.fields = [(n, self.mangle_type_if_local(t, prefix)) for n, t in node.fields]
-                  # Update self.structs entry? 
-                  # self.structs[node.name] needs update. node.name is ALREADY mangled (utils_Helper).
-                  # self.structs values are types. They need update.
-                  self.structs[node.name] = {n: self.mangle_type_if_local(t, prefix) for n, t in node.fields}
-             elif isinstance(node, ImplDef):
-                  # print(f"DEBUG: Canonicalize Impl {node.struct_name} module={getattr(node, 'module', 'None')}", flush=True)
-                  for method in node.methods:
-                       old_ret = method.return_type
-                       method.return_type = self.mangle_type_if_local(method.return_type, prefix)
-                       if old_ret != method.return_type:
-                           print(f"DEBUG: Updated method return {old_ret} -> {method.return_type}", flush=True)
-                       for i, (pname, ptype) in enumerate(method.params):
-                            method.params[i] = (pname, self.mangle_type_if_local(ptype, prefix))
+        prefix = getattr(node, 'module', '')
+        self.current_module = prefix # Set context for resolution
+        name = type(node).__name__
+        if name == 'FunctionDef':
+             node.return_type = self.resolve_type_name(self.mangle_type_if_local(node.return_type, prefix))
+             for i, (pname, ptype) in enumerate(node.params):
+                  node.params[i] = (pname, self.resolve_type_name(self.mangle_type_if_local(ptype, prefix)))
+        elif name == 'StructDef':
+             node.fields = [(n, self.resolve_type_name(self.mangle_type_if_local(t, prefix))) for n, t in node.fields]
+             self.structs[node.name] = {n: self.resolve_type_name(self.mangle_type_if_local(t, prefix)) for n, t in node.fields}
+        elif name == 'TypeAlias':
+             node.original_type = self.resolve_type_name(self.mangle_type_if_local(node.original_type, prefix))
+             if prefix:
+                 self.aliases[f"{prefix}_{node.alias}"] = node.original_type
+             else:
+                 self.aliases[node.alias] = node.original_type
+        elif name == 'ImplDef':
+             for method in node.methods:
+                  method.return_type = self.resolve_type_name(self.mangle_type_if_local(method.return_type, prefix))
+                  for i, (pname, ptype) in enumerate(method.params):
+                       method.params[i] = (pname, self.resolve_type_name(self.mangle_type_if_local(ptype, prefix)))
+
+    def visit_TypeAlias(self, node):
+        pass
 
     def mangle_type_if_local(self, type_name, prefix):
         if not type_name: return type_name
-        
-        # Generics
         if '<' in type_name and type_name.endswith('>'):
              base = type_name.split('<', 1)[0]
              base = self.mangle_type_if_local(base, prefix)
              inside = type_name[type_name.find('<')+1:-1]
-             # simplistic split for now
              args = [self.mangle_type_if_local(x.strip(), prefix) for x in inside.split(',')]
              return f"{base}<{','.join(args)}>"
              
-        mangled = f"{prefix}_{type_name}"
+        mangled = f"{prefix.replace('::', '_')}_{type_name}"
         if mangled in self.structs or mangled in self.enums:
              return mangled
         return type_name
 
     def visit(self, node):
-        name = type(node).__name__
-        if "UseStmt" in name:
-             self.visit_UseStmt(node)
-             return
-        
-        if "Use" in name:
-             raise Exception(f"DEBUG PARADOX: name='{name}' ords={[ord(c) for c in name]}")
-
-        method_name = f'visit_{name}'
+        method_name = f'visit_{type(node).__name__}'
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
 
-    def visit_TraitDef(self, node):
-        pass # Signatures already collected in analyze pass 1
-
-    def visit_StructDef(self, node):
-        pass # Already collected
-
-    def visit_EnumDef(self, node):
-        pass # Already collected
-
+    def visit_TraitDef(self, node): pass
+    def visit_StructDef(self, node): pass
+    def visit_EnumDef(self, node): pass
     def visit_ImplDef(self, node):
-        # Visit methods to check bodies
+        prev_mod = self.current_module
+        if getattr(node, 'module', None):
+             self.current_module = node.module
+             
         for method in node.methods:
-             self.visit(method) # visit_FunctionDef
+             self.visit(method)
+        
+        self.current_module = prev_mod
 
     def visit_UseStmt(self, node):
         full_name = "::".join(node.path)
-        alias = node.path[-1]
-        self.aliases[alias] = full_name
+        if node.is_glob:
+            prefix = full_name
+            for item in self.ast_root:
+                # We use name-based matching for glob imports
+                # instead of relying on a potentially missing 'module' attribute.
+                # All mangled names are 'prefix_itemname'
+                mangled_prefix = prefix.replace('::', '_') + "_"
+                if getattr(item, 'name', '').startswith(mangled_prefix):
+                    if getattr(item, 'is_pub', False):
+                        full_mangled_name = item.name
+                        short_name = full_mangled_name[len(mangled_prefix):]
+                        self.aliases[short_name] = full_mangled_name
+        else:
+            alias = node.path[-1]
+            self.aliases[alias] = full_name
 
     def register_impl_methods(self, node):
         struct_name = node.struct_name
+        if struct_name == 'std_hash_i32': struct_name = 'i32'
+        if struct_name == 'std_hash_string': struct_name = 'string'
         
-        # Initialize methods dict for this struct if needed
         if struct_name not in self.struct_methods:
             self.struct_methods[struct_name] = {}
             
-        # Validate Trait Impl
         if node.trait_name:
              if node.trait_name not in self.traits:
-                  hint = None
-                  suggestion = self.suggest_name(node.trait_name, self.traits.keys())
-                  if suggestion: hint = f"Did you mean '{suggestion}'?"
-                  self.error(f"Semantic Error: Unknown trait '{node.trait_name}'", node, hint=hint)
-             
+                  self.error(f"Semantic Error: Unknown trait '{node.trait_name}'", node)
              trait_methods = self.traits[node.trait_name]
              impl_method_names = set(m.name for m in node.methods)
-             
-             missing = []
-             for tm_name in trait_methods:
-                  if tm_name not in impl_method_names:
-                       missing.append(tm_name)
+             missing = [m for m in trait_methods if m not in impl_method_names]
              if missing:
                   self.error(f"Semantic Error: Implementation of trait '{node.trait_name}' for '{struct_name}' is missing methods: {', '.join(missing)}", node)
-
              self.impls.add((struct_name, node.trait_name))
 
-
-
-        # Mangle method names and fix 'self' types
         for method in node.methods:
-             # Check for duplicate?
-             
-             # Rewrite 'self'
              if method.params:
                   pname, ptype = method.params[0]
                   if pname == 'self':
-                       # method.params is list of tuples (name, type)
-                       # tuples are immutable. Need to replace tuple in list.
-                       if ptype == 'Self': 
-                           method.params[0] = ('self', struct_name)
-                       elif ptype == '&Self': 
-                           method.params[0] = ('self', f"{struct_name}*")
-                       elif ptype == '&mut Self':
-                           method.params[0] = ("self", f"{struct_name}*")
+                       if ptype == 'Self': method.params[0] = ('self', struct_name)
+                       elif ptype in ('&Self', '&mut Self'): method.params[0] = ('self', f"{struct_name}*")
              
-             
-             # Register method in struct_methods for resolution
              self.struct_methods[struct_name][method.name] = method
-             
-             # Mangle name
              mangled_name = f"{struct_name}_{method.name}"
-             method.name = mangled_name # Update AST for CodeGen/Semantic visitation
-             
+             method.name = mangled_name 
              self.functions.add(mangled_name)
              self.function_defs[mangled_name] = method
 
     def check_trait_impl(self, type_name, trait_name):
         if (type_name, trait_name) in self.impls: return True
-        # Check generic base (e.g. Box<i32> -> Box)
         if '<' in type_name:
              base = type_name.split('<')[0]
              if (base, trait_name) in self.impls: return True
         return False
 
     def visit_MemberAccess(self, node):
-        # 1. Evaluate object
         obj_type = self.visit(node.object)
-        
-        # 2. Check if object is a struct or pointer to struct
-        base_type = obj_type
-        if base_type.startswith('&'):
-             if base_type.startswith('&mut '):
-                  base_type = base_type[5:]
-             else:
-                  base_type = base_type[1:]
-        
-        if base_type.endswith('*'):
-             base_type = base_type[:-1]
+        base_type = obj_type.lstrip('&').replace('mut ', '').rstrip('*')
+        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
 
-        lookup_type = base_type
-        if lookup_type not in self.structs and '<' in lookup_type:
-            lookup_type = lookup_type.split('<')[0]
-
-        if lookup_type in self.structs:
-             fields_dict = self.structs[lookup_type]
-        elif lookup_type in self.generic_structs:
-             struct_def = self.generic_structs[lookup_type]
-             fields_dict = {f[0]: f[1] for f in struct_def.fields}
-        else:
-             raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+        if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
+        elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
+        else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
-        # 3. Check if member exists
         if node.member not in fields_dict:
-             hint = None
-             suggestion = self.suggest_name(node.member, fields_dict.keys())
-             if suggestion:
-                 hint = f"Did you mean '{suggestion}'?"
-             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node, hint=hint)
+             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node)
         
-        # Annotate node for CodeGen
         node.struct_type = lookup_type
-             
-        ty = fields_dict[node.member]
-        node.type_name = ty
-        return ty
+        node.type_name = fields_dict[node.member]
+        return node.type_name
 
     def visit_MethodCall(self, node):
-        # Resolve obj.method(args) and annotate for code generation
-        # 1. Get receiver type
         receiver_type = self.visit(node.receiver)
-        
-        # Strip references to get base type
-        base_type = receiver_type.lstrip('&')
-        if base_type.startswith('mut '):
-            base_type = base_type[4:]
-        if base_type.endswith('*'):
-            base_type = base_type[:-1]
-        
-        # 2. Look up method
-        lookup_type = base_type
-        if lookup_type not in self.struct_methods and '<' in lookup_type:
-            lookup_type = lookup_type.split('<')[0]
+        base_type = receiver_type.lstrip('&').replace('mut ', '').rstrip('*')
+        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
             
         if lookup_type not in self.struct_methods:
             raise Exception(f"Semantic Error: Type '{base_type}' has no methods")
         
         methods = self.struct_methods[lookup_type]
         if node.method_name not in methods:
-            hint = None
-            suggestion = self.suggest_name(node.method_name, methods.keys())
-            if suggestion:
-                hint = f"Did you mean '{suggestion}'?"
-            try:
-                self.error(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'", node, hint=hint)
-            except CompilerError as e:
-                raise e # Propagate CompilerError
-            except Exception as e:
-                # Fallback if self.error wasn't used or raised generic Exception
-                raise Exception(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'{(' (Hint: ' + hint + ')') if hint else ''}")
+            self.error(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'", node)
         
         method_def = methods[node.method_name]
-        
-        # 3. Type-check arguments
-        # Special case for generic methods in bootstrap:
-        # If method belongs to a generic struct, we should ideally monomorphize it.
-        # For now, we'll allow it if it's 'Vec' or other builtins.
-        
-        # 4. Annotate for codegen
-        node.struct_type = lookup_type # Use the type name where methods are registered
+        node.struct_type = lookup_type
         node.receiver_type = receiver_type
-        node.return_type = method_def.return_type
         
-        return method_def.return_type
-
+        ret_type = method_def.return_type
+        if '<' in receiver_type:
+             struct_def = None
+             if lookup_type in self.generic_structs: 
+                  struct_def = self.generic_structs[lookup_type]
+             elif lookup_type in self.generic_enums:
+                  struct_def = self.generic_enums[lookup_type]
+             
+             if struct_def:
+                 args_str = receiver_type[receiver_type.find('<')+1:-1]
+                 args = self.split_generic_args(args_str)
+                 
+                 mapping = dict(zip([g[0] for g in struct_def.generics], args))
+                 ret_type = self.apply_submap(ret_type, mapping)
+             
+        node.return_type = ret_type
+        return ret_type
 
     def visit_ArrayLiteral(self, node):
-        if not node.elements:
-             raise Exception("Semantic Error: Empty array literals not supported (cannot infer type)")
-        
+        if not node.elements: raise Exception("Semantic Error: Empty array literals not supported")
         first_type = self.visit(node.elements[0])
         for el in node.elements[1:]:
-            type_ = self.visit(el)
-            if type_ != first_type:
-                 raise Exception(f"Type Error: Array elements must be same type. Expected '{first_type}', got '{type_}'")
-                 
-        size = len(node.elements)
-        return f"[{first_type}:{size}]"
+            if self.visit(el) != first_type:
+                 raise Exception(f"Type Error: Array elements must be same type")
+        return f"[{first_type}:{len(node.elements)}]"
 
     def visit_IndexAccess(self, node):
-        # 1. Analyze object
         obj_type = self.visit(node.object)
-        
-        # 2. Analyze index
-        index_type = self.visit(node.index)
-        if index_type != 'i32':
-             raise Exception(f"Type Error: Array index must be i32, got {index_type}")
-
-        # 3. Arrays: [T:N]
+        if self.visit(node.index) != 'i32': raise Exception("Type Error: Array index must be i32")
         if obj_type.startswith('[') and obj_type.endswith(']'):
-            # Parse type string [T:N]
-            content = obj_type[1:-1]
-            elem_type, _size_str = content.split(':', 1)
+            elem_type = obj_type[1:-1].split(':', 1)[0]
             node.type_name = elem_type
             return elem_type
-
-        # 4. Pointers: T*
-        # Allow pointer indexing as syntactic sugar for ptr_offset + deref.
         if obj_type.endswith('*'):
             ty = obj_type[:-1]
             node.type_name = ty
             return ty
-
-        # 5. Slices: Slice<T>
-        if isinstance(obj_type, str) and obj_type.startswith("Slice<") and obj_type.endswith(">"):
+        if obj_type.startswith("Slice<") and obj_type.endswith(">"):
             inner = obj_type[len("Slice<"):-1]
             node.type_name = inner
             return inner
-
-        raise Exception(f"Type Error: Indexing non-array/non-pointer type '{obj_type}'")
+        raise Exception(f"Type Error: Indexing non-array type '{obj_type}'")
 
     def visit_UnaryExpr(self, node):
-        operand_type = self.visit(node.operand)
-        
+        t = self.visit(node.operand)
         if node.op == '*':
-            # Dereference: operand must be a pointer type "T*"
-            if not operand_type.endswith('*'):
-                 raise Exception(f"Type Error: Cannot dereference non-pointer type '{operand_type}'")
-            ty = operand_type[:-1]
-            node.type_name = ty
-            return ty
-            
-        elif node.op == '&':
-            # Address Of: return "T*"
+            if not t.endswith('*'): raise Exception("Type Error: Cannot dereference non-pointer")
+            node.type_name = t[:-1]
+            return node.type_name
+        elif node.op in ('&', '&mut'):
             if isinstance(node.operand, VariableExpr):
-                var_name = node.operand.name
-                var_info = self.lookup(var_name)
-                if not var_info:
-                     raise Exception(f"Semantic Error: Borrow of undefined variable '{var_name}'")
-                
-                # Check Borrow Rules
-                if var_info['writer']:
-                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as immutable because it is already borrowed as mutable")
-                
-                # Register Reader
-                
-                # Register Reader
-                var_info['readers'] += 1
-                
-                # Add to current scope cleanup
-                # We need to associate this borrow with the current scope lifetime.
-                # Simplest way: self.scopes[-1] needs a 'borrows' list?
-                # Using self.borrow_cleanup_stack might be tricky if scopes handle it.
-                # Let's add 'active_borrows' to self.scopes entries.
-                if 'active_borrows' not in self.scopes[-1]:
-                     self.scopes[-1]['active_borrows'] = []
-                self.scopes[-1]['active_borrows'].append((var_name, 'reader'))
-                
-            ty = f"{operand_type}*"
-            node.type_name = ty
-            return ty
-            
-        elif node.op == '&mut':
-             # Mutable Reference
-             if isinstance(node.operand, VariableExpr):
-                var_name = node.operand.name
-                var_info = self.lookup(var_name)
-                if not var_info:
-                     raise Exception(f"Semantic Error: Borrow of undefined variable '{var_name}'")
-                
-                # Check Borrow Rules
-                if var_info['writer']:
-                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as mutable because it is already borrowed as mutable")
-                if var_info['readers'] > 0:
-                     raise Exception(f"Borrow Error: Cannot borrow '{var_name}' as mutable because it is already borrowed as immutable")
-
-                # Register Writer
-                var_info['writer'] = True
-                
-                if 'active_borrows' not in self.scopes[-1]:
-                     self.scopes[-1]['active_borrows'] = []
-                self.scopes[-1]['active_borrows'].append((var_name, 'writer'))
-                
-             ty = f"{operand_type}*"
-             node.type_name = ty
-             return ty
-            
-        node.type_name = operand_type
-        return operand_type
+                var = self.lookup(node.operand.name)
+                if not var: raise Exception(f"Undefined var '{node.operand.name}'")
+                if node.op == '&mut':
+                    if var['writer'] or var['readers'] > 0: raise Exception("Borrow Error")
+                    var['writer'] = True
+                else:
+                    if var['writer']: raise Exception("Borrow Error")
+                    var['readers'] += 1
+                if 'active_borrows' not in self.scopes[-1]: self.scopes[-1]['active_borrows'] = []
+                self.scopes[-1]['active_borrows'].append((node.operand.name, 'writer' if node.op == '&mut' else 'reader'))
+            node.type_name = f"{t}*"
+            return node.type_name
+        return t
 
     def visit_MatchExpr(self, node):
-        """
-        Type-check `match` expressions and bind variant payload variables (single payload for now).
-
-        Notes:
-        - Supports generic enums by instantiating `Option<i32>`-style types on demand.
-        - Enforces basic exhaustiveness (all variants must be covered).
-        - Uses enter_scope/exit_scope to properly release borrows via `active_borrows`.
-        """
         expr_type = self.visit(node.value)
-
-        # Instantiate generic enum if needed (e.g., Option<i32>)
-        if expr_type and '<' in expr_type:
-            self.instantiate_generic_type(expr_type)
-
-        if expr_type not in self.enums:
-            raise Exception(f"Type Error: Match expression must be an Enum, got '{expr_type}'")
-
-        node.enum_name = expr_type
-        variants = self.enums[expr_type]
-
+        node.enum_name = expr_type # Set for codegen
+        if expr_type and '<' in expr_type: self.instantiate_generic_type(expr_type)
+        
+        base = expr_type.split('<')[0] if '<' in expr_type else expr_type
+        
+        if expr_type in self.enums:
+             variants = self.enums[expr_type]
+        elif base in self.generic_enums:
+             # Generic Enum Match (e.g. inside impl<T> Result<T>)
+             enum_def = self.generic_enums[base]
+             variants = {vname: payloads for vname, payloads in enum_def.variants}
+        else:
+             raise Exception(f"Match expression must be an Enum. Type: {expr_type}")
+             
         covered = set()
         for case in node.cases:
-            if case.variant_name not in variants:
-                raise Exception(f"Semantic Error: Enum '{expr_type}' has no variant '{case.variant_name}'")
-
+            if case.variant_name not in variants: raise Exception(f"Enum has no variant '{case.variant_name}'")
             covered.add(case.variant_name)
-            payloads = variants[case.variant_name]
-
-            # Bind payload variable if present (single payload supported)
             self.enter_scope()
             if case.var_names:
-                if len(case.var_names) != len(payloads):
-                     raise Exception(f"Semantic Error: Variant '{case.variant_name}' has {len(payloads)} fields, but matched with {len(case.var_names)} variables")
-                
-                for i, vname in enumerate(case.var_names):
-                     self.declare_variable(vname, payloads[i])
-            else:
-                if len(payloads) > 0:
-                     # Payload ignored
-                     pass
-
+                payloads = variants[case.variant_name]
+                if len(case.var_names) != len(payloads): raise Exception("Payload mismatch")
+                for i, vname in enumerate(case.var_names): self.declare_variable(vname, payloads[i])
             self.visit(case.body)
             self.exit_scope()
+        if len(covered) != len(variants): raise Exception("Match not exhaustive")
 
-        if len(covered) != len(variants):
-            missing = set(variants.keys()) - covered
-            raise Exception(f"Semantic Error: Match not exhaustive. Missing: {missing}")
+    def generic_visit(self, node):
+        raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
+
+    def instantiate_generic_type(self, name):
+        if not name: return
+        if name.endswith('*'): return self.instantiate_generic_type(name[:-1])
+        if name.startswith('[') and name.endswith(']'): return self.instantiate_generic_type(name[1:-1].split(':', 1)[0].strip())
+        if '<' not in name: return
+        base = name.split('<', 1)[0]
+        if base in self.generic_structs: self.instantiate_generic_struct(name)
+        elif base in self.generic_enums: self.instantiate_generic_enum(name)
+
+    def instantiate_generic_struct(self, name):
+        if name in self.structs: return
+        base_name, rest = name.split('<', 1)
+        args = [a.strip() for a in rest[:-1].split(',')]
+        def_node = self.generic_structs[base_name]
+        for (gn, gb), at in zip(def_node.generics, args):
+             if gb and not self.check_trait_impl(at, gb): raise Exception(f"Bounds check failed for {at}")
+        mapping = dict(zip([g[0] for g in def_node.generics], args))
+        new_fields = [(n, self.apply_submap(t, mapping)) for n, t in def_node.fields]
+        self.structs[name] = dict(new_fields)
+        self.ast_root.append(StructDef(name, new_fields))
+
+    def instantiate_generic_enum(self, name):
+        if name in self.enums: return
+        base_name, rest = name.split('<', 1)
+        args = [a.strip() for a in rest[:-1].split(',')]
+        def_node = self.generic_enums[base_name]
+        mapping = dict(zip([g[0] for g in def_node.generics], args))
+        new_variants = [(vn, [self.apply_submap(p, mapping) for p in ps]) for vn, ps in def_node.variants]
+        self.enums[name] = {v: ps for v, ps in new_variants}
+        self.ast_root.append(EnumDef(name, new_variants))
+
+    def instantiate_generic_function(self, name):
+        if name in self.functions: return
+        base_name, rest = name.split('<', 1)
+        args = [a.strip() for a in rest[:-1].split(',')]
+        if base_name not in self.generic_functions: return self.instantiate_generic_type(name)
+        def_node = self.generic_functions[base_name]
+        mapping = dict(zip([g[0] for g in def_node.generics], args))
+        new_params = [(pn, self.apply_submap(pt, mapping)) for pn, pt in def_node.params]
+        new_ret = self.apply_submap(def_node.return_type, mapping)
+        import copy
+        new_body = copy.deepcopy(def_node.body)
+        self.substitute_generics(new_body, mapping)
+        new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
+        self.ast_root.append(new_func)
+        self.functions.add(name)
+        self.function_defs[name] = new_func
+
+    def visit_IfStmt(self, node):
+        if self.visit(node.condition) != 'bool': raise Exception("If condition must be bool")
+        self.enter_scope()
+        for s in node.then_branch: self.visit(s)
+        self.exit_scope()
+        
+        if node.else_branch:
+             self.enter_scope()
+             for s in node.else_branch: self.visit(s)
+             self.exit_scope()
+
+    def visit_ForStmt(self, node):
+        self.enter_scope()
+        self.loop_depth += 1
+        
+        if node.is_iterator:
+            coll_type = self.visit(node.start_expr)
+            node.iterator_type = coll_type
+            
+            if '<' in coll_type:
+                base = coll_type.split('<')[0]
+                args_str = coll_type[coll_type.find('<')+1:-1]
+                args = self.split_generic_args(args_str)
+            else:
+                base = coll_type
+                args = []
+                
+            methods = self.struct_methods.get(base, {})
+            method = methods.get('next')
+            if not method:
+                 raise Exception(f"Type '{coll_type}' does not implement 'next()'")
+                 
+            ret_type = method.return_type
+            
+            real_ret = ret_type
+            if args:
+                struct_def = self.generic_structs.get(base)
+                if struct_def:
+                     mapping = {}
+                     for (gname, bound), gval in zip(struct_def.generics, args):
+                          mapping[gname] = gval
+                     real_ret = self.apply_submap(ret_type, mapping)
+            
+            item_type = None
+            if '<' in real_ret:
+                 base_ret = real_ret.split('<')[0]
+                 if base_ret in ('Option', 'std_option_Option'):
+                      item_type = real_ret[real_ret.find('<')+1:-1]
+            
+            if not item_type:
+                 raise Exception(f"Iterator next() must return Option<T>, got {real_ret}")
+            
+            node.item_type = item_type # Store for codegen
+            
+            self.declare_variable(node.var_name, item_type)
+            for s in node.body: self.visit(s)
+        else:
+            if self.visit(node.start_expr) != 'i32' or self.visit(node.end_expr) != 'i32': 
+                raise Exception("For loop range must be i32")
+            self.declare_variable(node.var_name, 'i32')
+            for s in node.body: self.visit(s)
+            
+        self.loop_depth -= 1
+        self.exit_scope()
+
+    def visit_WhileStmt(self, node):
+        if self.visit(node.condition) != 'bool': raise Exception("While condition must be bool")
+        self.enter_scope(); self.loop_depth += 1
+        for s in node.body: self.visit(s)
+        self.loop_depth -= 1; self.exit_scope()
+
+    def visit_BreakStmt(self, node):
+        if self.loop_depth == 0: raise Exception("Break outside loop")
+    def visit_ContinueStmt(self, node):
+        if self.loop_depth == 0: raise Exception("Continue outside loop")
+
+    def visit_FunctionDef(self, node):
+        if node.generics:
+            self.generic_functions[node.name] = node
+            return
+        
+        prev_mod = self.current_module
+        if getattr(node, 'module', None):
+             self.current_module = node.module
+
+        self.current_function = node
+        self.enter_scope()
+        for i, (pn, pt) in enumerate(node.params):
+            pt = self.resolve_type_name(pt)
+            node.params[i] = (pn, pt)
+            if '<' in pt: self.instantiate_generic_type(pt)
+            self.declare_variable(pn, pt)
+        for s in node.body: self.visit(s)
+        self.exit_scope()
+        self.current_function = None
+        self.current_module = prev_mod
+
+    def visit_VarDecl(self, node):
+        if node.type_name: node.type_name = self.resolve_type_name(node.type_name)
+        init_t = self.visit(node.initializer)
+        if node.type_name is None: node.type_name = init_t
+        if '<' in node.type_name: self.instantiate_generic_type(node.type_name)
+        if init_t != node.type_name and not (('<' in init_t and '<' in node.type_name) and (init_t.split('<')[0] == node.type_name.split('<')[0])):
+             raise Exception(f"Type Error: {init_t} != {node.type_name}")
+        if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_t): self.move_var(node.initializer.name)
+        self.declare_variable(node.name, node.type_name)
+
+    def visit_Assignment(self, node):
+        val_t = self.visit(node.value)
+        if isinstance(node.target, VariableExpr):
+             v = self.lookup(node.target.name)
+             if not v: raise Exception("Undefined var")
+             if v['readers'] > 0: raise Exception("Variable is borrowed")
+             if v['type'] != val_t and not (('<' in val_t and '<' in v['type']) and (val_t.split('<')[0] == v['type'].split('<')[0])):
+                  raise Exception("Type mismatch in assignment")
+             v['moved'] = False
+        else:
+             target_t = self.visit(node.target)
+             if target_t != val_t: raise Exception("Type mismatch in assignment")
+        if isinstance(node.value, VariableExpr) and not self.is_copy_type(val_t): self.move_var(node.value.name)
+
+    def visit_BinaryExpr(self, node):
+        l, r = self.visit(node.left), self.visit(node.right)
+        if node.op in ('PLUS', 'MINUS'):
+            if l.endswith('*') and r in ('i32', 'i64'): return l
+            if r.endswith('*') and l in ('i32', 'i64') and node.op == 'PLUS': return r
+        if l != r: raise Exception(f"Type mismatch: {l} {node.op} {r}")
+        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return l
+        if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'): return 'bool'
+        raise Exception("Unsupported binary op")
+
+    def visit_IntegerLiteral(self, node): return 'i32'
+    def visit_FloatLiteral(self, node): return 'f32'
+    def visit_BooleanLiteral(self, node): return 'bool'
+    def visit_StringLiteral(self, node): return 'string'
+    def visit_CharLiteral(self, node): return 'char'
+    def visit_VariableExpr(self, node):
+        if '::' in node.name:
+            parts = node.name.rsplit('::', 1)
+            prefix = self.resolve_type_name(parts[0])
+            suffix = parts[1]
+            node.name = f"{prefix}::{suffix}"
+            if '<' in prefix: self.instantiate_generic_type(prefix)
+            if prefix in self.enums:
+                 variants = self.enums[prefix]
+                 if suffix in variants:
+                      payloads = variants[suffix]
+                      if payloads: 
+                           raise Exception(f"Variant '{node.name}' expects arguments, used as value")
+                      return prefix
+            
+            if '<' in prefix and prefix.split('<')[0] in self.generic_enums:
+                 return prefix
+
+        v = self.lookup(node.name)
+        if not v: self.error(f"UNDEFINED_VAR_LOOKUP: '{node.name}'", node)
+        if v['moved']: self.error(f"Use of moved variable '{node.name}'", node)
+        return v['type']
+
+    def visit_CallExpr(self, node):
+        if isinstance(node.callee, VariableExpr):
+             node.callee = node.callee.name
+        callee = node.callee
+        
+        if callee in self.aliases:
+            callee = self.aliases[callee]
+            node.callee = callee
+        
+        # Double Colon Logic (also handles resolved aliases from glob imports)
+        generics_mapping = {}
+        # Double Colon Logic (also handles resolved aliases from glob imports)
+        if isinstance(callee, str) and '::' in callee:
+            parts = callee.rsplit('::', 1); prefix = self.resolve_type_name(parts[0]); suffix = parts[1]
+            callee = f"{prefix}::{suffix}"
+            node.callee = callee
+            if '<' in prefix: 
+                 self.instantiate_generic_type(prefix)
+                 # Capture Generics Mapping for Static Methods
+                 base = prefix.split('<')[0]
+                 if base in self.generic_structs:
+                      struct_def = self.generic_structs[base]
+                      args_str = prefix[prefix.find('<')+1:-1]
+                      args = self.split_generic_args(args_str)
+                      for (gname, bound), gval in zip(struct_def.generics, args):
+                           generics_mapping[gname] = gval
+
+            if prefix in self.enums:
+                variants = self.enums[prefix]
+                if suffix not in variants: raise Exception("Variant not found")
+                payloads = variants[suffix]
+                if len(node.args) != len(payloads): raise Exception("Arg mismatch")
+                self.enter_scope()
+                for i, arg in enumerate(node.args):
+                    if self.visit(arg) != payloads[i]: raise Exception("Type mismatch")
+                    if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]): self.move_var(arg.name)
+                self.exit_scope(); return prefix
+            
+            # Check for mangled function or struct
+            mangled = f"{prefix.split('<')[0]}_{suffix}"
+            if mangled in self.function_defs: 
+                 callee = mangled; node.callee = mangled
+            elif mangled in self.structs or mangled in self.generic_structs:
+                 callee = mangled; node.callee = mangled
+
+        if callee == 'print':
+            for a in node.args: self.visit(a)
+            return 'void'
+        if callee in ('fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'panic', 'assert', 'memcpy'):
+            # Simplified intrinsics check
+            for a in node.args: self.visit(a)
+            if callee == 'fs::read_file': self.instantiate_generic_type('Buffer<u8>'); return 'Buffer<u8>'
+            if callee in ('malloc', 'realloc'): return 'u8*'
+            return 'void'
+        if callee == 'gpu::global_id': return 'i32'
+        if callee == 'gpu::dispatch':
+             if len(node.args) >= 1:
+                  self.visit(node.args[0])
+                  if len(node.args) == 2: self.visit(node.args[1])
+             return 'void'
+        if isinstance(callee, str) and callee.startswith('cast<'): self.visit(node.args[0]); return callee[5:-1]
+        if isinstance(callee, str) and callee.startswith('sizeof<'): return 'i32'
+
+        # Try local module lookup if not found
+        if callee not in self.functions and callee not in self.structs and '<' not in callee:
+             if self.current_module:
+                  local = f"{self.current_module.replace('::', '_')}_{callee}"
+                  if local in self.functions or local in self.structs or local in self.generic_functions or local in self.generic_structs:
+                       callee = local
+                       node.callee = local
+
+        if callee in self.structs or (callee in self.generic_structs):
+            # Constructor call
+            struct_name = callee
+            if '<' in struct_name: self.instantiate_generic_struct(struct_name)
+            fields = self.structs[struct_name]
+            # ... rest of constructor logic (unchanged)
+            if len(node.args) != len(fields): raise Exception(f"Arg mismatch for '{struct_name}' constructor")
+            self.enter_scope()
+            for i, (fname, ftype) in enumerate(fields.items()):
+                arg_t = self.visit(node.args[i])
+                if arg_t != ftype: 
+                    print(f"DEBUG: arg len={len(arg_t)} exp len={len(ftype)}")
+                    if arg_t != ftype:
+                        for idx in range(min(len(arg_t), len(ftype))):
+                             if arg_t[idx] != ftype[idx]:
+                                  print(f"DIFF at {idx}: '{arg_t[idx]}' vs '{ftype[idx]}'")
+                                  break
+                        if len(arg_t) != len(ftype):
+                             print(f"DIFF len mismatch")
+                    raise Exception(f"Type mismatch field '{fname}': expected {ftype}, got {arg_t}")
+            self.exit_scope()
+            return struct_name
+            
+        if '<' in callee:
+            base = callee.split('<')[0]
+            if base in self.generic_functions:
+                 self.instantiate_generic_function(callee)
+
+        if callee in self.functions:
+            func_def = self.function_defs[callee]
+            if len(node.args) != len(func_def.params): raise Exception(f"Arg count mismatch for '{callee}'")
+            self.enter_scope()
+            for i, arg in enumerate(node.args):
+                 arg_t = self.visit(arg)
+                 param_t = func_def.params[i][1]
+                 # Apply generics mapping to param types too!
+                 if generics_mapping: param_t = self.apply_submap(param_t, generics_mapping)
+                 
+                 if arg_t != param_t: raise Exception(f"Type mismatch arg {i}: expected {param_t}, got {arg_t}")
+            self.exit_scope()
+            ret = func_def.return_type
+            if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
+            return ret
+
+        raise Exception(f"Semantic Error: Unknown function or struct definition '{callee}'")
 
     def enter_scope(self):
         self.scopes.append({})
 
     def exit_scope(self):
         current_scope = self.scopes[-1]
-        
-        # Release borrows tied to this scope
         if 'active_borrows' in current_scope:
             for var_name, role in current_scope['active_borrows']:
                 var_info = self.lookup(var_name)
                 if var_info:
-                    if role == 'reader':
-                        var_info['readers'] -= 1
-                    elif role == 'writer':
-                        var_info['writer'] = False
-                        
+                    if role == 'reader': var_info['readers'] -= 1
+                    elif role == 'writer': var_info['writer'] = False
         self.scopes.pop()
 
     def declare_variable(self, name, type_name):
         if name in self.scopes[-1]:
              raise Exception(f"Semantic Error: Variable '{name}' already declared in this scope")
-        # Initialize borrow state: readers=0 (set needed?), writer=False
-        self.scopes[-1][name] = {
-            'type': type_name, 
-            'moved': False,
-            'readers': 0,
-            'writer': False
-        }
+        self.scopes[-1][name] = {'type': type_name, 'moved': False, 'readers': 0, 'writer': False}
 
     def lookup(self, name):
         for scope in reversed(self.scopes):
-            if name in scope:
-                return scope[name]
+            if name in scope: return scope[name]
         return None
 
-    def generic_visit(self, node):
-        # Allow pass-through for some nodes if needed, or error
-        if type(node).__name__ == 'ForStmt':
-             return self.visit_ForStmt(node)
-             
-        raise Exception(f"No visit_{type(node).__name__} method in SemanticAnalyzer")
-
-    def instantiate_generic_type(self, name_with_args):
-        if not name_with_args:
-            return
-
-        # Handle pointer types like "Vec<i32>*": instantiate the inner type ("Vec<i32>")
-        # instead of accidentally trying to monomorphize a synthetic struct named "Vec<i32>*".
-        if name_with_args.endswith('*'):
-            self.instantiate_generic_type(name_with_args[:-1])
-            return
-
-        # Handle array types like "[T:3]" or "[Vec<i32>:3]" by instantiating the element type.
-        if name_with_args.startswith('[') and name_with_args.endswith(']'):
-            content = name_with_args[1:-1]
-            elem_type = content.split(':', 1)[0].strip()
-            self.instantiate_generic_type(elem_type)
-            return
-
-        if '<' not in name_with_args:
-            return
-
-        base_name = name_with_args.split('<', 1)[0]
-        
-        if base_name in self.generic_structs:
-             self.instantiate_generic_struct(name_with_args)
-        elif base_name in self.generic_enums:
-             self.instantiate_generic_enum(name_with_args)
-        else:
-             # Could be unknown or not generic type (handled elsewhere)
-             pass
-
-    def instantiate_generic_struct(self, name_with_args):
-        # name_with_args: "Box<i32>"
-        if name_with_args in self.structs:
-            return # Already instantiated
-            
-        if '<' not in name_with_args:
-             return # Not generic
-             
-        base_name, rest = name_with_args.split('<', 1)
-        rest = rest[:-1] # Remove trailing >
-        args = [a.strip() for a in rest.split(',')]
-        
-        if base_name not in self.generic_structs:
-            raise Exception(f"Semantic Error: Unknown generic struct '{base_name}'")
-            
-        def_node = self.generic_structs[base_name]
-        
-        if len(args) != len(def_node.generics):
-            raise Exception(f"Type Error: Generic '{base_name}' expects {len(def_node.generics)} args, got {len(args)}")
-            
-        # Monomorphize
-        # Monomorphize skipped
-        
-        
-        
-        # Check bounds
-        for (g_name, g_bound), arg_type in zip(def_node.generics, args):
-             if g_bound:
-                  if not self.check_trait_impl(arg_type, g_bound):
-                       raise Exception(f"Type Error: Type '{arg_type}' does not implement trait '{g_bound}' required by '{g_name}'")
-
-        mapping = dict(zip([g[0] for g in def_node.generics], args))
-        
-        new_fields = []
-        for fname, ftype in def_node.fields:
-            new_type = self.apply_submap(ftype, mapping)
-            new_fields.append((fname, new_type))
-            
-        # Register new concrete struct
-        self.structs[name_with_args] = dict(new_fields)
-        
-        new_def = StructDef(name_with_args, new_fields)
-        self.ast_root.append(new_def)
-
-    def instantiate_generic_enum(self, name_with_args):
-        # name_with_args: "Option<i32>"
-        if name_with_args in self.enums: return
-        if '<' not in name_with_args: return
-        
-        base_name, rest = name_with_args.split('<', 1)
-        rest = rest[:-1]
-        args = [a.strip() for a in rest.split(',')]
-        
-        if base_name not in self.generic_enums:
-             raise Exception(f"Semantic Error: Unknown generic enum '{base_name}'")
-             
-        def_node = self.generic_enums[base_name]
-        
-        if len(args) != len(def_node.generics):
-             raise Exception(f"Type Error: Generic '{base_name}' expects {len(def_node.generics)} args, got {len(args)}")
-             
-        mapping = dict(zip(def_node.generics, args))
-        
-        new_variants = []
-        for vname, payloads in def_node.variants:
-             new_payloads = []
-             for ptype in payloads:
-                 new_payloads.append(self.apply_submap(ptype, mapping))
-             new_variants.append((vname, new_payloads))
-             
-        self.enums[name_with_args] = {v: ps for v, ps in new_variants}
-        
-        # Append to AST for CodeGen
-        new_def = EnumDef(name_with_args, new_variants)
-        self.ast_root.append(new_def)
-
-    def instantiate_generic_function(self, name_with_args):
-        # name_with_args: "id<i32>"
-        if name_with_args in self.functions:
-            return
-            
-        if '<' not in name_with_args:
-             return
-             
-        base_name, rest = name_with_args.split('<', 1)
-        rest = rest[:-1]
-        args = [a.strip() for a in rest.split(',')]
-        
-        if base_name not in self.generic_functions:
-             if base_name in self.generic_structs:
-                  self.instantiate_generic_struct(name_with_args)
-                  return
-             elif base_name in self.generic_enums:
-                  self.instantiate_generic_enum(name_with_args)
-                  return
-             else:
-                  raise Exception(f"Semantic Error: Unknown generic function or struct '{base_name}'")
-
-        def_node = self.generic_functions[base_name]
-        
-        if len(args) != len(def_node.generics):
-             raise Exception(f"Type Error: Generic '{base_name}' expects {len(def_node.generics)} args, got {len(args)}")
-             
-        # Check bounds
-        for (g_name, g_bound), arg_type in zip(def_node.generics, args):
-             if g_bound:
-                  if not self.check_trait_impl(arg_type, g_bound):
-                       raise Exception(f"Type Error: Type '{arg_type}' does not implement trait '{g_bound}' required by '{g_name}'")
-
-        mapping = dict(zip([g[0] for g in def_node.generics], args))
-        
-        new_params = []
-        for pname, ptype in def_node.params:
-            new_params.append((pname, self.apply_submap(ptype, mapping)))
-                
-        new_return = self.apply_submap(def_node.return_type, mapping)
-            
-        # Body substitution
-        import copy
-        new_body = copy.deepcopy(def_node.body)
-        
-        self.substitute_generics(new_body, mapping)
-        
-        new_func = FunctionDef(name_with_args, new_params, new_return, new_body, def_node.is_kernel)
-        # No debug print
-        self.ast_root.append(new_func)
-        self.functions.add(name_with_args)
-        self.function_defs[name_with_args] = new_func
-        # No debug print
-
-
-
-    def visit_ForStmt(self, node):
-        # 1. Analyze Range
-        start_type = self.visit(node.start_expr)
-        end_type = self.visit(node.end_expr)
-        
-        if start_type != 'i32' or end_type != 'i32':
-             raise Exception(f"Type Error: For loop range must be i32, got '{start_type}..{end_type}'")
-             
-        # 2. Scope for Loop Variable
+    def visit_BlockStmt(self, node):
         self.enter_scope()
-        self.loop_depth += 1
-        
-        # Declare loop variable (immutable in body? usually yes, but for now just standard var)
-        self.declare_variable(node.var_name, 'i32')
-        
-        # 3. Analyze Body
-        for stmt in node.body:
-             self.visit(stmt)
-             
-        self.loop_depth -= 1
+        for s in node.stmts: self.visit(s)
         self.exit_scope()
-
-    def visit_WhileStmt(self, node):
-        if self.visit(node.condition) != 'bool':
-            raise Exception("Type Error: While condition must be bool")
-            
-        self.enter_scope()
-        self.loop_depth += 1
-        for stmt in node.body:
-            self.visit(stmt)
-        self.loop_depth -= 1
-        self.exit_scope()
-
-    def visit_BreakStmt(self, node):
-        if self.loop_depth == 0:
-            raise Exception("Semantic Error: 'break' outside of loop")
-
-    def visit_ContinueStmt(self, node):
-        if self.loop_depth == 0:
-            raise Exception("Semantic Error: 'continue' outside of loop")
-
-
-    def visit_FunctionDef(self, node):
-        if node.generics:
-             # Skip body analysis for generic definitions.
-             # They are analyzed only when instantiated.
-             self.functions.add(node.name)
-             self.generic_functions[node.name] = node
-             return
-
-        self.current_function = node
-        self.enter_scope()
-        
-        # Register parameters
-        for i, (pname, ptype) in enumerate(node.params):
-             # Resolve type alias
-             ptype = self.resolve_type_name(ptype)
-             node.params[i] = (pname, ptype) # Update AST
-             
-             if '<' in ptype:
-                  self.instantiate_generic_type(ptype)
-             self.declare_variable(pname, ptype)
-             
-        for stmt in node.body:
-            self.visit(stmt)
-        self.exit_scope()
-        self.current_function = None
-
-    def visit_VarDecl(self, node):
-        # 0. Resolve type alias in declaration
-        if node.type_name:
-             node.type_name = self.resolve_type_name(node.type_name)
-
-        # 1. Analyze initializer
-        init_type = self.visit(node.initializer)
-        
-        # 2. Infer or Check type
-        if node.type_name is None:
-             node.type_name = init_type
-        
-        # Instantiate generic type if needed
-        if node.type_name and '<' in node.type_name:
-             self.instantiate_generic_type(node.type_name)
-        
-        # No debug print
-
-        if init_type != node.type_name:
-             # Relax check for generic structs in bootstrap
-             is_generic_match = False
-             if '<' in init_type and '<' in node.type_name:
-                 if init_type.split('<')[0] == node.type_name.split('<')[0]:
-                     is_generic_match = True
-             
-             if not is_generic_match:
-                 raise Exception(f"DEBUG: init_type='{init_type}', node.type='{node.type_name}'. Type Error: Cannot assign type '{init_type}' to variable '{node.name}' of type '{node.type_name}'")
-
-        # Ownership: `let y = x` moves `x` if it's move-only.
-        if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_type):
-            self.move_var(node.initializer.name)
-        
-        # 3. Declare variable
-        self.declare_variable(node.name, node.type_name)
-
-    def visit_Assignment(self, node):
-        value_type = self.visit(node.value)
-        
-        if isinstance(node.target, VariableExpr):
-             name = node.target.name
-             var_info = self.lookup(name)
-             if not var_info:
-                 raise Exception(f"Semantic Error: Assignment to undefined variable '{name}'")
-             
-             # Borrow Check: No mutation while borrowed
-             if var_info['readers'] > 0:
-                  raise Exception(f"Borrow Error: Cannot assign to '{name}' because it is borrowed")
-             
-             target_type = var_info['type']
-             if target_type != value_type:
-                  # Relax check for generic structs
-                  is_generic_match = False
-                  if '<' in value_type and '<' in target_type:
-                      if value_type.split('<')[0] == target_type.split('<')[0]:
-                          is_generic_match = True
-                  
-                  if not is_generic_match:
-                      raise Exception(f"Type Error: Cannot assign type '{value_type}' to variable '{name}' of type '{target_type}'")
-             var_info['moved'] = False
-
-        elif isinstance(node.target, MemberAccess):
-             # Visit target
-             target_type = self.visit(node.target)
-             if target_type != value_type:
-                 raise Exception(f"Type Error: Mismatch assignment to member {target_type} != {value_type}")
-
-        elif isinstance(node.target, UnaryExpr):
-             if node.target.op == '*':
-                  # *ptr = val
-                  # visit(*ptr) returns type T (dereferenced type)
-                  # visit(node.target) checks valid dereference.
-                  target_type = self.visit(node.target)
-                  
-                  if target_type != value_type:
-                       raise Exception(f"Type Error: Cannot assign '{value_type}' to dereference of type '{target_type}'")
-             else:
-              raise Exception("Invalid assignment target")
-
-        elif isinstance(node.target, IndexAccess):
-            # arr[i] = x  OR  ptr[i] = x
-            target_elem_type = self.visit(node.target)  # visit_IndexAccess returns element type
-            if target_elem_type != value_type:
-                raise Exception(f"Type Error: Cannot assign '{value_type}' to indexed element of type '{target_elem_type}'")
-              
-        elif isinstance(node.target, MemberAccess):
-             # Assign to struct field
-             # Visit MemberAccess (which checks validity and returns field type)
-             # Note: visit_MemberAccess evaluates the OBJECT and checks field existence.
-             target_type = self.visit(node.target)
-             
-             if target_type != value_type:
-                  raise Exception(f"Type Error: Cannot assign '{value_type}' to member of type '{target_type}'")
-        else:
-             raise Exception("Invalid assignment target")
-
-        # Ownership: assigning from a variable moves it if move-only (x = y)
-        # (also applies to `*ptr = y` and `obj.field = y`).
-        if isinstance(node.value, VariableExpr) and not self.is_copy_type(value_type):
-            self.move_var(node.value.name)
-
-    def visit_BinaryExpr(self, node):
-        left_type = self.visit(node.left)
-        right_type = self.visit(node.right)
-        
-        # Pointer Arithmetic: Pointer + Integer or Pointer - Integer
-        if node.op in ('PLUS', 'MINUS'):
-            if left_type.endswith('*') and right_type in ('i32', 'i64'):
-                node.type_name = left_type
-                return left_type
-            if right_type.endswith('*') and left_type in ('i32', 'i64') and node.op == 'PLUS':
-                node.type_name = right_type
-                return right_type
-
-        if left_type != right_type:
-             raise Exception(f"Type Error: Operands must be same type. Got '{left_type}' and '{right_type}'")
-
-        # Arithmetic
-        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'):
-            if left_type not in ('i32', 'i64', 'u64', 'u8', 'f32') and not left_type.endswith('*'):
-                raise Exception(f"Type Error: Arithmetic only supported for primitives or pointers. Got '{left_type}'")
-            node.type_name = left_type
-            return left_type
-
-        # Comparisons
-        if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'):
-            if left_type not in ('i32', 'i64', 'u8', 'char', 'f32', 'bool'):
-                raise Exception(f"Type Error: Comparison not supported for type '{left_type}'")
-            node.type_name = 'bool'
-            return 'bool'
-
-        raise Exception(f"Semantic Error: Unsupported binary operator '{node.op}'")
-
-    def visit_IntegerLiteral(self, node):
-        node.type_name = 'i32'
-        return 'i32' # Default
-
-    def visit_FloatLiteral(self, node):
-        node.type_name = 'f32'
-        return 'f32'
-
-    def visit_BooleanLiteral(self, node):
-        node.type_name = 'bool'
-        return 'bool'
-
-    def visit_StringLiteral(self, node):
-        node.type_name = 'string'
-        return 'string'
-
-    def visit_CharLiteral(self, node):
-        node.type_name = 'char'
-        return 'char'
-
-    def visit_VariableExpr(self, node):
-        var_info = self.lookup(node.name)
-        if not var_info:
-             # Gather candidates
-             candidates = []
-             for scope in self.scopes:
-                 candidates.extend(scope.keys())
-             
-             hint = None
-             suggestion = self.suggest_name(node.name, candidates)
-             if suggestion:
-                 hint = f"Did you mean '{suggestion}'?"
-             
-             self.error(f"Semantic Error: Undefined variable '{node.name}'", node, hint=hint)
-             
-        if var_info['moved']:
-            self.error(f"Ownership Error: Use of moved variable '{node.name}'", node)
-            
-        ty = var_info['type']
-        node.type_name = ty
-        return ty
-
-    def visit_CallExpr(self, node):
-        callee_name = None
-        
-        # 1. Resolve Callee Name or Handle Method Call
-        if isinstance(node.callee, str):
-            callee_name = node.callee
-        elif isinstance(node.callee, VariableExpr):
-            callee_name = node.callee.name
-        
-        # Check aliases
-        if callee_name in self.aliases:
-             callee_name = self.aliases[callee_name]
-        
-        if callee_name and '::' in callee_name:
-            # Check for Struct::new
-            parts = callee_name.split('::')
-            struct_name = parts[0]
-            struct_name = self.resolve_type_name(struct_name) # Handle alias/mangle
-            
-            # Strip generics from struct name for lookup
-            if '<' in struct_name: struct_base = struct_name.split('<')[0]
-            else: struct_base = struct_name
-            
-            method_name = parts[1]
-            mangled_name = f"{struct_base}_{method_name}"
-            # print(f"DEBUG CALL: Orig='{callee_name}' Struct='{struct_name}' Mangled='{mangled_name}' Found={mangled_name in self.functions}", flush=True)
-            # Check if this mangled name exists
-            if mangled_name in self.functions:
-                callee_name = mangled_name
-            else:
-                pass
-        
-        if callee_name:
-            node.callee = callee_name
-
-        if isinstance(node.callee, MemberAccess):
-            # ... and so on ... 
-        
-             obj_node = node.callee.object
-             method_name = node.callee.member
-             obj_type = self.visit(obj_node)
-             base_type = obj_type
-             if base_type.endswith('*'): base_type = base_type[:-1]
-             mangled_name = f"{base_type}_{method_name}"
-             
-             if mangled_name in self.functions:
-                  target_func = self.function_defs[mangled_name]
-                  if target_func.params and target_func.params[0][0] == 'self':
-                      self_param_type = target_func.params[0][1]
-                      arg_expr = obj_node
-                      if obj_type == base_type and self_param_type.endswith('*'):
-                           arg_expr = UnaryExpr('&', obj_node)
-                      elif obj_type.endswith('*') and not self_param_type.endswith('*'):
-                           arg_expr = UnaryExpr('*', obj_node)
-                      node.args.insert(0, arg_expr)
-                  callee_name = mangled_name
-                  node.callee = callee_name 
-             else:
-                  print(f"DEBUG: Failed to find method {method_name} for base {base_type}. Mangled: {mangled_name}. Functions: {list(self.functions)[:10]}...", flush=True)
-                  raise Exception(f"Method '{method_name}' not found for type '{base_type}'")
-
-        if not callee_name:
-             raise Exception(f"Semantic Error: Call to complex expression or unknown method: {node.callee}")
-
-        # Intrinsics
-        if callee_name == 'print':
-            self.enter_scope()
-            for arg in node.args:
-                self.visit(arg)
-            self.exit_scope()
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name == 'fs::read_file':
-            # fs::read_file(path: string) -> Buffer<u8>
-            if len(node.args) != 1:
-                raise Exception("fs::read_file expects 1 arg: path (string)")
-            path_ty = self.visit(node.args[0])
-            if path_ty != 'string':
-                raise Exception(f"Type Error: fs::read_file expects string path, got '{path_ty}'")
-            ret_ty = "Buffer<u8>"
-            self.instantiate_generic_type(ret_ty)
-            node.type_name = ret_ty
-            return ret_ty
-        elif callee_name == 'fs::write_file' or callee_name == 'fs::append_file':
-            if len(node.args) != 3: raise Exception(f"{callee_name} expects 3 args: (path, data, len)")
-            path_ty = self.visit(node.args[0])
-            data_ty = self.visit(node.args[1])
-            len_ty = self.visit(node.args[2])
-            if path_ty != 'string': raise Exception(f"Type Error: {callee_name} expects string path")
-            if data_ty != 'string' and data_ty != 'u8*': raise Exception(f"Type Error: {callee_name} expects data as string or u8*")
-            if len_ty != 'i32': raise Exception(f"Type Error: {callee_name} expects len as i32")
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name == 'slice_from_array':
-            if len(node.args) != 1: raise Exception("slice_from_array expects 1 arg")
-            arg_ty = self.visit(node.args[0])
-            if not arg_ty.endswith('*'): raise Exception("slice_from_array expects pointer")
-            elem_type = arg_ty[:-1].split('[')[1].split(':')[0]
-            size = int(arg_ty[:-1].split(':')[1][:-1])
-            slice_ty = f"Slice<{elem_type}>"
-            self.instantiate_generic_type(slice_ty)
-            node.type_name = slice_ty
-            node.slice_elem_type = elem_type
-            node.slice_len = size
-            return slice_ty
-        elif callee_name == 'memcpy':
-            if len(node.args) != 3: raise Exception("memcpy requires 3 args")
-            self.enter_scope()
-            self.visit(node.args[0])
-            self.visit(node.args[1])
-            size_ty = self.visit(node.args[2])
-            self.exit_scope()
-            if size_ty != 'i32': raise Exception("memcpy size must be i32")
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name == 'malloc':
-             self.enter_scope()
-             size_type = self.visit(node.args[0])
-             self.exit_scope()
-             node.type_name = 'u8*'
-             return 'u8*'
-        elif callee_name == 'free':
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.exit_scope()
-             node.type_name = 'void'
-             return 'void'
-        elif callee_name == 'realloc':
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.visit(node.args[1])
-             self.exit_scope()
-             node.type_name = 'u8*'
-             return 'u8*'
-        elif callee_name == 'panic':
-            self.enter_scope()
-            self.visit(node.args[0])
-            self.exit_scope()
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name == 'assert':
-            self.enter_scope()
-            self.visit(node.args[0])
-            self.visit(node.args[1])
-            self.exit_scope()
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name == 'gpu::global_id':
-             node.type_name = 'i32'
-             return 'i32'
-        elif callee_name == 'gpu::dispatch':
-            node.type_name = 'void'
-            return 'void'
-        elif callee_name.startswith('cast<'):
-             self.visit(node.args[0])
-             return callee_name[5:-1]
-        elif callee_name.startswith('sizeof<'):
-             return 'i32'
-
-
-
-        # Try resolving relative to current module
-        if callee_name not in self.function_defs and \
-           callee_name not in self.structs and \
-           callee_name not in self.generic_structs and \
-           self.current_function and getattr(self.current_function, 'module', ""):
-             mod_prefix = self.current_function.module
-             mangled = f"{mod_prefix}_{callee_name}"
-             print(f"DEBUG: Trying resolve '{callee_name}' in '{mod_prefix}' -> '{mangled}'", flush=True)
-             
-             # Check functions
-             if mangled in self.function_defs:
-                  callee_name = mangled
-                  node.callee = mangled
-             # Check structs
-             elif mangled in self.structs or mangled in self.generic_structs:
-                  callee_name = mangled
-                  node.callee = mangled
-
-        # Generic Instantiation
-        if '<' in callee_name:
-             self.instantiate_generic_function(callee_name)
-
-        # Regular Function Call
-        if callee_name in self.function_defs:
-            fn = self.function_defs[callee_name]
-            self.check_privacy(fn, callee_name)
-            if len(node.args) != len(fn.params):
-                 raise Exception(f"Function identity '{callee_name}' expects {len(fn.params)} args, got {len(node.args)}")
-            
-            self.enter_scope()
-            for i, arg in enumerate(node.args):
-                 arg_ty = self.visit(arg)
-                 _pname, ptype = fn.params[i]
-                 if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
-                      self.move_var(arg.name)
-            self.exit_scope()
-            return fn.return_type
-
-        # Struct Constructor
-        if callee_name in self.structs or callee_name in self.generic_structs:
-            if callee_name in self.struct_defs:
-                self.check_privacy(self.struct_defs[callee_name], callee_name)
-            elif callee_name in self.generic_structs:
-                self.check_privacy(self.generic_structs[callee_name], callee_name)
-
-            self.enter_scope()
-            for arg in node.args:
-                arg_ty = self.visit(arg)
-                if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                    self.move_var(arg.name, arg)
-            self.exit_scope()
-            return callee_name  # In an impl<T>, this refers to the current generic type
-
-        # Enum Variant
-        if '::' in callee_name:
-            parts = callee_name.rsplit('::', 1)
-            enum_name = parts[0]
-            variant_name = parts[1]
-            if '<' in enum_name: self.instantiate_generic_type(enum_name)
-            if enum_name in self.enums:
-                 variants = self.enums[enum_name]
-                 if variant_name not in variants: raise Exception(f"Enum has no variant '{variant_name}'")
-                 payloads = variants[variant_name]
-                 if len(node.args) != len(payloads): raise Exception("Enum arg mismatch")
-                 self.enter_scope()
-                 for i, arg in enumerate(node.args):
-                      self.visit(arg)
-                      if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
-                           self.move_var(arg.name, arg)
-                 self.exit_scope()
-                 return enum_name
-
-        # raise Exception(...) - Moved to end
-        if node.callee == 'slice_from_array':
-            # slice_from_array(&arr) -> Slice<T>
-            if len(node.args) != 1:
-                raise Exception("slice_from_array expects 1 arg: &arr where arr is [T:N]")
-            arg_ty = self.visit(node.args[0])
-            if not (isinstance(arg_ty, str) and arg_ty.endswith('*')):
-                raise Exception("slice_from_array expects a pointer to array: use slice_from_array(&arr)")
-            inner = arg_ty[:-1]
-            if not (inner.startswith('[') and inner.endswith(']')):
-                raise Exception("slice_from_array expects &arr where arr is [T:N]")
-            content = inner[1:-1]
-            elem_type, size_str = content.split(':', 1)
-            elem_type = elem_type.strip()
-            size = int(size_str.strip())
-
-            slice_ty = f"Slice<{elem_type}>"
-            self.instantiate_generic_type(slice_ty)
-            node.type_name = slice_ty
-            node.slice_elem_type = elem_type
-            node.slice_len = size
-            return slice_ty
-        elif node.callee == 'memcpy':
-            if len(node.args) != 3: raise Exception("memcpy requires 3 args")
-            # Validation logic? dest and src should be pointers.
-            self.enter_scope()
-            dest_ty = self.visit(node.args[0])
-            src_ty = self.visit(node.args[1])
-            size_ty = self.visit(node.args[2])
-            self.exit_scope()
-            if size_ty != 'i32': raise Exception("memcpy size must be i32")
-            node.type_name = 'void'
-            return 'void'
-            
-        elif node.callee == 'malloc':
-             if len(node.args) != 1: raise Exception("malloc takes 1 arg")
-             self.enter_scope()
-             size_type = self.visit(node.args[0])
-             self.exit_scope()
-             if size_type != 'i32': raise Exception("malloc expects i32")
-             node.type_name = 'u8*'
-             return 'u8*'
-             
-        elif node.callee == 'free':
-             if len(node.args) != 1: raise Exception("free takes 1 arg")
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.exit_scope()
-             node.type_name = 'void'
-             return 'void'
-             
-        elif node.callee == 'realloc':
-             if len(node.args) != 2: raise Exception("realloc takes 2 args")
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.visit(node.args[1])
-             self.exit_scope()
-             node.type_name = 'u8*'
-             return 'u8*'
-             
-        elif node.callee == 'panic':
-            if len(node.args) != 1: raise Exception("panic expects 1 arg")
-            self.enter_scope()
-            self.visit(node.args[0])
-            self.exit_scope()
-            node.type_name = 'void'
-            return 'void'
-            
-        elif node.callee == 'assert':
-            if len(node.args) != 2: raise Exception("assert expects 2 args")
-            self.enter_scope()
-            self.visit(node.args[0])
-            self.visit(node.args[1])
-            self.exit_scope()
-            node.type_name = 'void'
-            return 'void'
-            
-        elif node.callee == 'gpu::global_id':
-             node.type_name = 'i32'
-             return 'i32'
-
-        elif node.callee == 'gpu::dispatch':
-            # gpu::dispatch(kernel_fn, threads?)
-            # This is a bootstrap/mock dispatch; the first arg is treated as a function reference.
-            if len(node.args) not in (1, 2):
-                raise Exception("gpu::dispatch expects 1 or 2 args: (kernel_fn, threads?)")
-
-            fn_arg = node.args[0]
-            if not isinstance(fn_arg, VariableExpr):
-                raise Exception("gpu::dispatch first argument must be a function name (identifier)")
-
-            # The function name is a reference, not a variable lookup.
-            fn_name = fn_arg.name
-            if fn_name not in self.functions and fn_name not in self.function_defs and fn_name not in self.generic_functions:
-                raise Exception(f"Semantic Error: gpu::dispatch unknown function '{fn_name}'")
-
-            # Optional threads argument
-            if len(node.args) == 2:
-                threads_ty = self.visit(node.args[1])
-                if threads_ty != 'i32':
-                    raise Exception(f"Type Error: gpu::dispatch threads must be i32, got '{threads_ty}'")
-
-            return 'void'
-             
-        elif node.callee.startswith('cast<'):
-             target_type = node.callee[5:-1]
-             if len(node.args) != 1: raise Exception("cast takes 1 arg")
-             self.enter_scope()
-             self.visit(node.args[0])
-             self.exit_scope()
-             return target_type
-             
-        elif node.callee.startswith('sizeof<'):
-             return 'i32'
-             
-
-
-        # Generic Instantiation if needed
-        if '<' in node.callee:
-             self.instantiate_generic_function(node.callee)
-        
-        # 1) Regular function call
-        # Note: `self.functions` may include intrinsics; those returned above.
-        if node.callee in self.function_defs:
-            fn = self.function_defs[node.callee]
-            # Visit and apply moves based on parameter types (by-value move-only).
-            self.enter_scope()
-            for i, arg in enumerate(node.args):
-                arg_ty = self.visit(arg)
-                if i < len(fn.params):
-                    _pname, ptype = fn.params[i]
-                    if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
-                        self.move_var(arg.name, arg)
-            self.exit_scope()
-            return self.function_defs[node.callee].return_type
-
-        # 2) Struct constructor call (TypeName(...))
-        if node.callee in self.structs:
-            # Keep permissive in bootstrap: only validate arg expressions,
-            # since field ordering/overloads are still evolving.
-            self.enter_scope()
-            for arg in node.args:
-                arg_ty = self.visit(arg)
-                if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                    self.move_var(arg.name, arg)
-            self.exit_scope()
-            return node.callee
-            
-        # Double Colon Logic (Enums or Static Methods)
-        if '::' in callee_name:
-            parts = callee_name.rsplit('::', 1)
-            prefix = parts[0]
-            prefix = self.resolve_type_name(prefix)
-            suffix = parts[1]
-            
-            # 1. Try Enum Variant
-            if '<' in prefix: self.instantiate_generic_type(prefix)
-            
-            if prefix in self.enums:
-                 variants = self.enums[prefix]
-                 if suffix not in variants:
-                      raise Exception(f"Semantic Error: Enum '{prefix}' has no variant '{suffix}'")
-                 
-                 payloads = variants[suffix]
-                 if len(node.args) != len(payloads):
-                      raise Exception(f"Semantic Error: Variant '{callee_name}' expects {len(payloads)} arguments, got {len(node.args)}")
-                 
-                 self.enter_scope()
-                 for i, arg in enumerate(node.args):
-                      arg_type = self.visit(arg)
-                      if arg_type != payloads[i]:
-                           raise Exception(f"Type Error: Variant '{suffix}' arg {i} expected '{payloads[i]}', got '{arg_type}'")
-
-                      # Move payload variables if the payload type is move-only
-                      if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
-                          self.move_var(arg.name, arg)
-                 self.exit_scope()
-                 return prefix
-            
-            # 2. Try Static Method (Struct_method)
-            mangled = f"{prefix}_{suffix}"
-            if mangled in self.function_defs:
-                 fn = self.function_defs[mangled]
-                 callee_name = mangled
-                 node.callee = callee_name # Update for CodeGen
-                 
-                 if len(node.args) != len(fn.params):
-                      raise Exception(f"Static Method '{callee_name}' expects {len(fn.params)} args, got {len(node.args)}")
-                 
-                 self.enter_scope()
-                 for i, arg in enumerate(node.args):
-                      arg_ty = self.visit(arg)
-                      _pname, ptype = fn.params[i]
-                      if isinstance(arg, VariableExpr) and not self.is_copy_type(ptype):
-                           self.move_var(arg.name, arg)
-                 self.exit_scope()
-                 return fn.return_type
-            
-            # 3. Try Namespaced Struct Constructor
-            if mangled in self.structs or mangled in self.generic_structs:
-                if mangled in self.struct_defs:
-                     self.check_privacy(self.struct_defs[mangled], mangled)
-                elif mangled in self.generic_structs:
-                     self.check_privacy(self.generic_structs[mangled], mangled)
-                
-                node.callee = mangled # Update AST
-                
-                self.enter_scope()
-                for arg in node.args:
-                    arg_ty = self.visit(arg)
-                    if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_ty):
-                         self.move_var(arg.name, arg)
-                self.exit_scope()
-                return mangled
-            
-            raise Exception(f"Semantic Error: Unknown function or type '{callee_name}'")
-
-        # Gather all functions
-        candidates = list(self.functions) + list(self.function_defs.keys()) + list(self.generic_functions.keys())
-        hint = None
-        suggestion = self.suggest_name(node.callee, candidates)
-        if suggestion:
-             hint = f"Did you mean '{suggestion}'?"
-        self.error(f"Semantic Error: Unknown function '{node.callee}'", node, hint=hint)
-
-    def visit_IfStmt(self, node):
-        cond_type = self.visit(node.condition)
-        # In C-like, i32 is valid bool, but let's be strict if we had bool type.
-        # For now, we allow i32 as condition.
-        
-        self.enter_scope()
-        for stmt in node.then_branch:
-            self.visit(stmt)
-        self.exit_scope()
-        
-        if node.else_branch:
-            self.enter_scope()
-            for stmt in node.else_branch:
-                self.visit(stmt)
-            self.exit_scope()
-
-
 
     def visit_RegionStmt(self, node):
-        # No debug print
-        self.enter_scope()
-        # Declare the region variable (Arena)
-        self.declare_variable(node.name, 'Arena')
-        
-        for stmt in node.body:
-            self.visit(stmt)
+        self.enter_scope(); self.declare_variable(node.name, 'Arena')
+        for s in node.body: self.visit(s)
         self.exit_scope()
 
     def visit_ReturnStmt(self, node):
         if node.value:
-            ret_ty = self.visit(node.value)
-            if isinstance(node.value, VariableExpr) and not self.is_copy_type(ret_ty):
-                self.move_var(node.value.name, node.value)
-        # Should check against function return type
+            t = self.visit(node.value)
+            if isinstance(node.value, VariableExpr) and not self.is_copy_type(t):
+                 if '::' not in node.value.name:
+                      self.move_var(node.value.name)
 
     def substitute_generics(self, node, mapping):
-        # Recursive substitution of types in AST nodes
         if isinstance(node, list):
-             for x in node: self.substitute_generics(x, mapping)
-             return
-             
+            for x in node: self.substitute_generics(x, mapping)
+            return
         if isinstance(node, VarDecl):
-             if node.type_name:
-                 node.type_name = self.apply_submap(node.type_name, mapping)
-             if node.initializer:
-                 self.substitute_generics(node.initializer, mapping)
-        
+            if node.type_name: node.type_name = self.apply_submap(node.type_name, mapping)
+            self.substitute_generics(node.initializer, mapping)
         elif isinstance(node, CallExpr):
-             # Handle TurboFish or generic calls
-             if '<' in node.callee:
-                  # ID<T> -> ID<i32>
-                  node.callee = self.apply_submap(node.callee, mapping)
-             
-             # Handle intrinsics
-             if 'cast<' in node.callee or 'sizeof<' in node.callee or 'ptr_offset<' in node.callee:
-                 node.callee = self.apply_submap(node.callee, mapping)
+            if isinstance(node.callee, str) and '<' in node.callee: node.callee = self.apply_submap(node.callee, mapping)
+            for a in node.args: self.substitute_generics(a, mapping)
+        elif hasattr(node, '__dict__'):
+            for k, v in node.__dict__.items():
+                if k in ('body', 'then_branch', 'else_branch', 'condition', 'value', 'left', 'right', 'operand', 'target'):
+                    self.substitute_generics(v, mapping)
 
-             for arg in node.args:
-                  self.substitute_generics(arg, mapping)
-                  
-        elif isinstance(node, IfStmt):
-             self.substitute_generics(node.condition, mapping)
-             self.substitute_generics(node.then_branch, mapping)
-             if node.else_branch: self.substitute_generics(node.else_branch, mapping)
-             
-        elif isinstance(node, WhileStmt):
-             self.substitute_generics(node.condition, mapping)
-             self.substitute_generics(node.body, mapping)
-             
-        elif isinstance(node, ReturnStmt):
-             if node.value: self.substitute_generics(node.value, mapping)
-             
-        elif isinstance(node, Assignment):
-             if isinstance(node.target, (UnaryExpr, IndexAccess, MemberAccess)):
-                  self.substitute_generics(node.target, mapping) 
-             self.substitute_generics(node.value, mapping)
-             
-        elif isinstance(node, BinaryExpr):
-             self.substitute_generics(node.left, mapping)
-             self.substitute_generics(node.right, mapping)
-             
-        elif isinstance(node, UnaryExpr):
-             self.substitute_generics(node.operand, mapping)
-             
-        elif isinstance(node, MatchExpr):
-             self.substitute_generics(node.value, mapping)
-             for case in node.cases:
-                 self.substitute_generics(case.body, mapping)
-        
-        elif isinstance(node, MemberAccess):
-             self.substitute_generics(node.object, mapping)
-             
-        elif isinstance(node, IndexAccess):
-             self.substitute_generics(node.object, mapping)
-             self.substitute_generics(node.index, mapping)
-             
-    def apply_submap(self, type_str, mapping):
-        if not type_str: return type_str
-        
-        # Pointer
-        if type_str.endswith('*'):
-             inner = type_str[:-1]
-             return self.apply_submap(inner, mapping) + '*'
-             
-        # Generic: Name<Args>
-        if '<' in type_str and type_str.endswith('>'):
-             base = type_str[:type_str.find('<')]
-             inside = type_str[type_str.find('<')+1:-1]
-             args = [x.strip() for x in inside.split(',')]
-             new_args = [self.apply_submap(a, mapping) for a in args]
-             return f"{base}<{','.join(new_args)}>"
-             
-        # Base type
-        if type_str in mapping:
-             return mapping[type_str]
-             
-        return type_str
+    def apply_submap(self, t, mapping):
+        if not t: return t
+        if t.endswith('*'): return self.apply_submap(t[:-1], mapping) + '*'
+        if '<' in t and t.endswith('>'):
+            b = t[:t.find('<')]; i = t[t.find('<')+1:-1]
+            args = [self.apply_submap(x.strip(), mapping) for x in self.split_generic_args(i)]
+            return f"{b}<{','.join(args)}>"
+        return mapping.get(t, t)
 
-    def visit_BlockStmt(self, node):
-        self.enter_scope()
-        for stmt in node.stmts:
-             self.visit(stmt)
-        self.exit_scope()
+    def split_generic_args(self, s):
+        args = []
+        depth = 0
+        current = ""
+        for char in s:
+            if char == '<': depth += 1
+            elif char == '>': depth -= 1
+            
+            if char == ',' and depth == 0:
+                args.append(current.strip())
+                current = ""
+            else:
+                current += char
+        if current: args.append(current.strip())
+        return args

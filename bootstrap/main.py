@@ -6,58 +6,70 @@ import n_parser
 from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef
 from codegen import CodeGen
 from errors import CompilerError
-
-# ... (mangle_ast and resolve_modules don't need changes if imports are updated) ...
+import semantic
 
 def mangle_ast(nodes, prefix):
     for node in nodes:
         if isinstance(node, (FunctionDef, StructDef, EnumDef)):
+            if getattr(node, 'module', None):
+                node.module = f"{prefix}::{node.module}"
+            else:
+                node.module = prefix
+            
             node.name = f"{prefix}_{node.name}"
-            node.module = prefix
         elif isinstance(node, ImplDef):
+            if getattr(node, 'module', None):
+                node.module = f"{prefix}::{node.module}"
+            else:
+                node.module = prefix
             node.struct_name = f"{prefix}_{node.struct_name}"
-            node.module = prefix
             for method in node.methods:
-                method.module = prefix
+                method.module = node.module
 
 def resolve_modules(ast, base_dir):
     new_ast = []
     for node in ast:
         if isinstance(node, ModDecl):
-            mod_path = os.path.join(base_dir, node.name + ".nxl")
-            if not os.path.exists(mod_path):
-                 raise Exception(f"Module file not found: {mod_path}")
-            
-            with open(mod_path, 'r') as f:
-                mod_src = f.read()
-            
-            lx = Lexer(mod_src)
-            tokens = lx.tokenize()
-            p = n_parser.Parser(tokens)
-            mod_ast = p.parse()
-            
-            # Recurse
-            mod_ast = resolve_modules(mod_ast, base_dir)
-            
-            # Mangle
-            mangle_ast(mod_ast, node.name)
-            
-            new_ast.extend(mod_ast)
+            if node.body is not None:
+                # Nested module block
+                inner_ast = resolve_modules(node.body, base_dir)
+                mangle_ast(inner_ast, node.name)
+                new_ast.extend(inner_ast)
+            else:
+                # File-based module
+                mod_path = os.path.join(base_dir, node.name + ".nxl")
+                if not os.path.exists(mod_path):
+                     mod_path = os.path.join(base_dir, node.name, "mod.nxl")
+                
+                # Fallback to CWD/Project Root for std lib
+                if not os.path.exists(mod_path):
+                     mod_path = os.path.join(os.getcwd(), node.name + ".nxl")
+                     if not os.path.exists(mod_path):
+                          mod_path = os.path.join(os.getcwd(), node.name, "mod.nxl")
+
+                if not os.path.exists(mod_path):
+                     raise Exception(f"Module file not found: {node.name}.nxl or {node.name}/mod.nxl in {base_dir} or {os.getcwd()}")
+                
+                with open(mod_path, 'r') as f:
+                    mod_src = f.read()
+                
+                lx = Lexer(mod_src)
+                tokens = lx.tokenize()
+                p = n_parser.Parser(tokens)
+                mod_ast = p.parse()
+                
+                # Recurse
+                mod_ast = resolve_modules(mod_ast, os.path.dirname(mod_path))
+                
+                # Mangle
+                mangle_ast(mod_ast, node.name)
+                
+                new_ast.extend(mod_ast)
         else:
             new_ast.append(node)
     return new_ast
 
 def main():
-    # ... (argparse) ...
-    # (Leaving argparse lines matching original content roughly, but focusing on lines below)
-
-    # I'll just match the top import line and the parser invocation line
-    pass
-
-# Wait, replace_file_content needs contiguous block. 
-# I will make two calls or one large call.
-# Large call is safer if I can match context.
-
     ap = argparse.ArgumentParser(prog="nxc (bootstrap)", add_help=True)
     ap.add_argument("file", help="Input .nxl file")
     ap.add_argument("--target", choices=["native", "spirv"], default="native", help="Compilation target")
@@ -96,7 +108,6 @@ def main():
         print(f"Error: {e.message}")
         if e.line:
             lines = source.splitlines()
-            # print(f"DEBUG: Error at line {e.line}, col {e.column}")
             if 0 <= e.line - 1 < len(lines):
                  print(f"  --> {filepath}:{e.line}:{e.column}")
                  print(f"   |")
@@ -107,7 +118,7 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"[SEMANTIC ERROR] {e}")
-        # import traceback; traceback.print_exc()
+        import traceback; traceback.print_exc()
         return
 
     # 4. Code Generation
@@ -152,10 +163,9 @@ def main():
         )
         print(f"\n[SUCCESS] SPIR-V emitted to '{out_path}'")
     except Exception as e:
-        # Still write the LLVM IR so the user can translate externally.
         ll_fallback = os.path.splitext(out_path)[0] + ".ll"
         with open(ll_fallback, "w", encoding="utf-8") as f:
-            f.write(llvm_ir)
+             f.write(llvm_ir)
         print(f"[SPIR-V EMIT ERROR] {e}")
         print(f"[FALLBACK] Wrote LLVM IR to '{ll_fallback}' (use llvm-as + llvm-spirv to convert).")
 

@@ -124,7 +124,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `len(&self) -> i32` - get length
   - [x] `get(&self, idx: i32) -> Option<&T>` (implemented as `get(&self, index: i32) -> T` for bootstrap)
   - [x] `clear(&mut self)` - remove all
-  - [ ] Iterator support (for future for-loops)
+  - [x] Iterator support (for future for-loops)
 - [x] **String Manipulation**
   - [x] `String::from(s: &str)` - convert from string literal
   - [x] `len(&self) -> i32`
@@ -132,30 +132,38 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `substring(&self, start: i32, len: i32) -> String`
   - [x] `contains(&self, needle: &str) -> bool`
   - [x] `split(&self, delimiter: char) -> Vec<String>`
+- [x] **Standard Library Organization**
+  - [x] `std/` directory structure created (`vec`, `option`)
+  - [x] Module resolution fixes for local/nested modules
+- [ ] **Hash Maps (HashMap<K, V>)**
+  - [ ] `Hash` trait
+  - [ ] `HashMap` implementation (chaining or open addressing)
+- [ ] **Result Type**
+  - [ ] `Result<T, E>` enum
+  - [ ] Helper methods (`unwrap`, `is_ok`, etc.)
 
 ### 6.3 Module System & Code Organization
 - [x] **Basic Modules**
   - [x] `mod module_name;` syntax
   - [x] File-based modules (one file = one module)
   - [x] Multi-file compilation in `nx.py` (via `main.py` resolution)
-- [ ] **Visibility & Privacy**
 - [x] **Visibility & Privacy**
   - [x] `pub` keyword for public items
   - [x] Default private visibility
   - [x] Privacy checking in semantic analysis
-- [ ] **Import System**
-  - [ ] `use module::item;` syntax
-  - [ ] `use module::*;` glob imports
-  - [ ] Path resolution across modules
+- [x] **Import System**
+  - [x] `use module::item;` syntax
+  - [x] `use module::*;` glob imports
+  - [x] Path resolution across modules
 - [ ] **Module Hierarchy**
-  - [ ] Nested modules (`mod parent { mod child { } }`)
-  - [ ] Directory-based modules (`mod.nxl` or `mod/mod.nxl`)
+  - [x] Nested modules (`mod parent { mod child { } }`)
+  - [x] Directory-based modules (`mod.nxl` or `mod/mod.nxl`)
 
 ### 6.4 Control Flow Enhancements
-- [~] **For Loops**
+- [x] **For Loops**
   - [x] Range syntax: `0..10`, `0..=10` (inclusive)
-  - [ ] `for item in collection` syntax
-  - [ ] Iterator trait (simple version)
+  - [x] `for item in collection` syntax
+  - [x] Iterator trait (simple version)
   - [x] Native Codegen implementation (direct LLVM IR)
 - [x] **Loop Control**
   - [x] `break` statement
@@ -184,8 +192,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [ ] Multiple type parameters
   - [ ] Const generics: `Array<T, const N: usize>`
   - [ ] Associated types in traits
-- [ ] **Type Aliases**
-  - [ ] `type Name = ExistingType;`
+- [x] **Type Aliases**
+  - [x] `type Name = ExistingType;`
 
 ## Phase 8: Future Directions 🚀
 - [ ] Closures and lambdas

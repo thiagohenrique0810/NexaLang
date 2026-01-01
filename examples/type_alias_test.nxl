@@ -1,0 +1,30 @@
+type Int = i32;
+
+struct Point {
+    x: Int,
+    y: Int,
+}
+
+type MyPoint = Point;
+
+mod utils {
+    pub type Float = f32;
+    pub struct Wrapper {
+        pub val: Float,
+    }
+}
+
+use utils::*;
+
+fn main() {
+    let a: Int = 10;
+    let p: MyPoint = Point { x: a, y: 20 };
+    
+    let w: Wrapper = Wrapper { val: 3.14 };
+    
+    # Simple print calls for bootstrap
+    print(a);
+    print(p.x);
+    print(p.y);
+    print(w.val);
+}

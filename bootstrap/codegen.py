@@ -416,7 +416,9 @@ class CodeGen:
         if '<' in node.name:
             return # Skip monomorphized version in bootstrap
             
-        if node.generics: return
+        # if node.generics: return # ALLOW GENERICS (Type Erasure)
+        
+        self._current_generics = [g[0] for g in node.generics]
 
         # Representation: { i32 tag, [MaxPayloadSize x i8] data }
         # 1. Determine max payload size
@@ -532,6 +534,12 @@ class CodeGen:
         method_name = f'visit_{type(node).__name__}'
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
+
+    def visit_UseStmt(self, node):
+        pass
+
+    def visit_TypeAlias(self, node):
+        pass
 
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method")
@@ -735,10 +743,12 @@ class CodeGen:
 
         # Fallback: Evaluate object to value (loads it)
         obj_val = self.visit(node.object)
+        if not isinstance(obj_val.type, ir.PointerType) and not str(obj_val.type).endswith('*'):
+             raise Exception(f"Fatal Codegen Error: Indexing non-pointer type {obj_val.type} for object {node.object}")
 
         # Pointer indexing: gep(ptr, idx) then load
-        if isinstance(obj_val.type, ir.PointerType):
-            if isinstance(obj_val.type.pointee, ir.ArrayType):
+        if isinstance(obj_val.type, ir.PointerType) or str(obj_val.type).endswith('*'):
+            if isinstance(obj_val.type, ir.PointerType) and isinstance(obj_val.type.pointee, ir.ArrayType):
                 zero = ir.Constant(ir.IntType(32), 0)
                 elem_ptr = self.builder.gep(obj_val, [zero, index_val])
             else:
@@ -798,6 +808,101 @@ class CodeGen:
         self.scopes.pop()
 
     def visit_ForStmt(self, node):
+        if hasattr(node, 'is_iterator') and node.is_iterator:
+            # Iterator Loop: for x in iterator { ... }
+            
+            # 1. Evaluate Iterator (once)
+            iter_val = self.visit(node.start_expr)
+            
+            # We need a stable memory location for the iterator (passed as &mut self)
+            func = self.builder.function
+            entry_block = func.entry_basic_block
+            
+            # Create stack slot for iterator
+            with self.builder.goto_block(entry_block):
+                 if entry_block.instructions:
+                      self.builder.position_before(entry_block.instructions[0])
+                 iter_ptr = self.builder.alloca(iter_val.type, name="iter_tmp")
+            
+            self.builder.store(iter_val, iter_ptr)
+            
+            # 2. Logic Blocks
+            cond_block = self.builder.append_basic_block(f"for_iter_cond_{node.var_name}")
+            body_block = self.builder.append_basic_block(f"for_iter_body_{node.var_name}")
+            end_block = self.builder.append_basic_block(f"for_iter_end_{node.var_name}")
+            
+            self.builder.branch(cond_block)
+            
+            # 3. Request Next Item
+            self.builder.position_at_end(cond_block)
+            
+            # Call {Type}_next(&mut iter)
+            base_type = node.iterator_type.split('<')[0]
+            func_name = f"{base_type}_next"
+            if func_name not in self.module.globals:
+                 raise Exception(f"CodeGen: Method '{func_name}' not found")
+                 
+            func_def = self.module.globals[func_name]
+            
+            # Prepare arguments: &mut self
+            # iter_ptr matches type?
+            # func expects pointer to struct. iter_ptr is pointer to struct.
+            # cast if necessary (e.g. if type erasure diff)
+            arg0 = iter_ptr
+            if arg0.type != func_def.function_type.args[0]:
+                 arg0 = self.builder.bitcast(arg0, func_def.function_type.args[0])
+            
+            option_ret = self.builder.call(func_def, [arg0])
+            
+            # 4. Debox Option
+            # Store option to stack to access fields
+            opt_mem = self.builder.alloca(option_ret.type)
+            self.builder.store(option_ret, opt_mem)
+            
+            # Extract Tag (field 0)
+            tag_ptr = self.builder.gep(opt_mem, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+            tag = self.builder.load(tag_ptr)
+            
+            # Check if Some (0) or None (1)
+            # Assuming Some is 0.
+            cond = self.builder.icmp_signed("==", tag, ir.Constant(ir.IntType(32), 0))
+            self.builder.cbranch(cond, body_block, end_block)
+            
+            # 5. Body
+            self.builder.position_at_end(body_block)
+            self.scopes.append({})
+            self.loop_stack.append((cond_block, end_block, len(self.scopes) - 1))
+            
+            # Extract Value (field 1)
+            payload_arr_ptr = self.builder.gep(opt_mem, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
+            
+            # Cast payload array to item value type
+            # We need LLVM type for item_type
+            item_llvm_type = self.get_llvm_type(node.item_type)
+            payload_ptr = self.builder.bitcast(payload_arr_ptr, item_llvm_type.as_pointer())
+            item_val = self.builder.load(payload_ptr)
+            
+            # Declare Loop Variable
+            with self.builder.goto_block(entry_block):
+                 if entry_block.instructions:
+                     self.builder.position_before(entry_block.instructions[0])
+                 var_ptr = self.builder.alloca(item_llvm_type, name=node.var_name)
+                 
+            self.builder.store(item_val, var_ptr)
+            self.scopes[-1][node.var_name] = (var_ptr, node.item_type)
+            
+            for stmt in node.body:
+                self.visit(stmt)
+                
+            self.emit_scope_drops(self.scopes[-1])
+            self.scopes.pop()
+            self.loop_stack.pop()
+            self.builder.branch(cond_block)
+            
+            self.builder.position_at_end(end_block)
+            
+            return
+
         # Range Loop: for i in start..end { body }
         
         # 1. Initialize Loop Variable
@@ -1347,6 +1452,23 @@ class CodeGen:
                         return val_or_ptr
                 ptr, _ = entry
                 return self.builder.load(ptr, name=node.name)
+        
+        # Check for Enum Variant (Unit Variant)
+        if '::' in node.name:
+             parts = node.name.rsplit('::', 1)
+             lhs = parts[0]; rhs = parts[1]
+             base_lhs = lhs.split('<')[0]
+             if base_lhs in self.enum_definitions:
+                  enum_ty, max_size = self.enum_definitions[base_lhs]
+                  if rhs in self.enum_types[base_lhs]:
+                      tag = self.enum_types[base_lhs][rhs]
+                      
+                      # Create Enum Value
+                      enum_val = ir.Constant(enum_ty, ir.Undefined)
+                      tag_val = ir.Constant(ir.IntType(32), tag)
+                      enum_val = self.builder.insert_value(enum_val, tag_val, 0)
+                      return enum_val
+
         raise Exception(f"Ref to undefined variable: {node.name}")
 
     def visit_CallExpr(self, node):
@@ -1602,10 +1724,12 @@ class CodeGen:
 
         # Enum Variant Instantiation (Enum::Variant)
         # Note: only treat `::` calls as enum constructors if the LHS is a known enum.
-        elif '::' in node.callee and node.callee.split('::', 1)[0] in self.enum_definitions:
+        elif isinstance(node.callee, str) and '::' in node.callee:
             lhs, rhs = node.callee.split('::', 1)
-            enum_ty, max_size = self.enum_definitions[lhs]
-            tag = self.enum_types[lhs][rhs]
+            base_lhs = lhs.split('<')[0]
+            if base_lhs in self.enum_definitions:
+                enum_ty, max_size = self.enum_definitions[base_lhs]
+                tag = self.enum_types[base_lhs][rhs]
 
             # Create struct { tag, padding }
             enum_val = ir.Constant(enum_ty, ir.Undefined)

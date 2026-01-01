@@ -1,0 +1,20 @@
+mod parent {
+    pub fn hello() {
+        print("Hello from parent\n");
+    }
+
+    pub mod child {
+        pub fn hello() {
+            print("Hello from child\n");
+        }
+    }
+}
+
+use parent::child::*;
+
+fn main() {
+    parent::hello();
+    parent::child::hello();
+    
+    hello();
+}

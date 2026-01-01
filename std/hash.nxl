@@ -1,0 +1,25 @@
+pub trait Hash {
+    fn hash(&self) -> u64;
+}
+
+impl Hash for i32 {
+    fn hash(&self) -> u64 {
+        return cast::<u64>(*self);
+    }
+}
+
+impl Hash for string {
+    fn hash(&self) -> u64 {
+        let s = *self;
+        let ptr = cast::<u8*>(s);
+        let i = 0;
+        let h = 5381;
+        while (true) {
+             let c = ptr[i];
+             if (cast::<i32>(c) == 0) { break; }
+             h = (h * 33) + cast::<i32>(c);
+             i = i + 1;
+        }
+        return cast::<u64>(h);
+    }
+}

@@ -126,12 +126,13 @@ class WhileStmt(ASTNode):
         self.body = body
 
 class ForStmt(ASTNode):
-    def __init__(self, var_name, start_expr, end_expr, body, inclusive=False):
+    def __init__(self, var_name, start_expr, end_expr, body, inclusive=False, is_iterator=False):
         self.var_name = var_name
         self.start_expr = start_expr
         self.end_expr = end_expr
         self.body = body
         self.inclusive = inclusive
+        self.is_iterator = is_iterator
 
 class BinaryExpr(ASTNode):
     def __init__(self, left, op, right):
@@ -145,9 +146,10 @@ class UnaryExpr(ASTNode):
         self.operand = operand
 
 class UseStmt(ASTNode):
-    def __init__(self, path, is_pub=False):
+    def __init__(self, path, is_pub=False, is_glob=False):
         self.path = path # list of strings
         self.is_pub = is_pub
+        self.is_glob = is_glob
         
     def __repr__(self):
         return f"use {'::'.join(self.path)}"
@@ -239,8 +241,15 @@ class ContinueStmt(ASTNode):
     pass
 
 class ModDecl(ASTNode):
-    def __init__(self, name, is_pub=False):
+    def __init__(self, name, body=None, is_pub=False):
         self.name = name
+        self.body = body # list of statements if it's a block mod
+        self.is_pub = is_pub
+
+class TypeAlias(ASTNode):
+    def __init__(self, alias, original_type, is_pub=False):
+        self.alias = alias
+        self.original_type = original_type
         self.is_pub = is_pub
 
 class Parser:
@@ -293,6 +302,8 @@ class Parser:
                 nodes.append(self.parse_trait(is_pub=is_pub))
             elif self.peek().type == 'USE':
                 nodes.append(self.parse_use(is_pub=is_pub))
+            elif self.peek().type == 'TYPE':
+                nodes.append(self.parse_type_alias(is_pub=is_pub))
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
@@ -300,18 +311,68 @@ class Parser:
     def parse_mod(self, is_pub=False):
         self.consume('MOD')
         name = self.consume('IDENTIFIER').value
-        self.consume('SEMICOLON')
-        return ModDecl(name, is_pub=is_pub)
+        
+        if self.peek().type == 'LBRACE':
+            self.consume('LBRACE')
+            body = []
+            while self.peek().type != 'RBRACE':
+                # Similar to parse() but within a block
+                # We need to support top-level items within mod blocks
+                is_nested_pub = False
+                if self.peek().type == 'PUB':
+                    self.consume('PUB')
+                    is_nested_pub = True
+                
+                t = self.peek().type
+                if t == 'FN': body.append(self.parse_function(is_pub=is_nested_pub))
+                elif t == 'STRUCT': body.append(self.parse_struct(is_pub=is_nested_pub))
+                elif t == 'ENUM': body.append(self.parse_enum(is_pub=is_nested_pub))
+                elif t == 'IMPL': body.append(self.parse_impl())
+                elif t == 'MOD': body.append(self.parse_mod(is_pub=is_nested_pub))
+                elif t == 'TRAIT': body.append(self.parse_trait(is_pub=is_nested_pub))
+                elif t == 'USE': body.append(self.parse_use(is_pub=is_nested_pub))
+                elif t == 'TYPE': body.append(self.parse_type_alias(is_pub=is_nested_pub))
+                else: raise Exception(f"Unexpected token in nested mod: {self.peek()}")
+                
+                # Semicolons are optional/required depending on the item, 
+                # but parse_* methods usually consume what they need.
+                # However, parse_use does NOT consume semicolon in some versions?
+                # Actually most parse_* in this codebase handle their own terminators.
+            self.consume('RBRACE')
+            return ModDecl(name, body=body, is_pub=is_pub)
+        else:
+            self.consume('SEMICOLON')
+            return ModDecl(name, body=None, is_pub=is_pub)
 
     def parse_use(self, is_pub=False):
         self.consume('USE')
         path = []
-        path.append(self.consume('IDENTIFIER').value)
-        while self.peek().type == 'DOUBLE_COLON':
-            self.consume('DOUBLE_COLON')
+        is_glob = False
+        
+        if self.peek().type == 'STAR':
+            self.consume('STAR')
+            is_glob = True
+        else:
             path.append(self.consume('IDENTIFIER').value)
+            while self.peek().type == 'DOUBLE_COLON':
+                self.consume('DOUBLE_COLON')
+                if self.peek().type == 'STAR':
+                    self.consume('STAR')
+                    is_glob = True
+                    break
+                path.append(self.consume('IDENTIFIER').value)
+        
         self.consume('SEMICOLON')
-        return UseStmt(path, is_pub=is_pub)
+        return UseStmt(path, is_pub=is_pub, is_glob=is_glob)
+
+    def parse_type_alias(self, is_pub=False):
+        self.consume('TYPE')
+        alias = self.consume('IDENTIFIER').value
+        self.consume('EQ')
+        original_type = self.parse_type()
+        if self.peek().type == 'SEMICOLON':
+            self.consume('SEMICOLON')
+        return TypeAlias(alias, original_type, is_pub=is_pub)
 
 
 
@@ -418,14 +479,11 @@ class Parser:
         self.consume('LBRACE')
         fields = []
         while self.peek().type != 'RBRACE':
-            # Check for pub fields? 
-            # For now, let's assume struct fields are private by default or public? 
-            # Rust uses pub fields. NexaLang roadmap implies default private.
-            # I won't implement field privacy yet in this step to save complexity, 
-            # just struct privacy.
+            if self.peek().type == 'PUB':
+                 self.consume('PUB')
             field_name = self.consume('IDENTIFIER').value
             self.consume('COLON')
-            field_type = self.parse_type() # Use parse_type instead of raw ID to support Generic Members
+            field_type = self.parse_type()
             fields.append((field_name, field_type))
             if self.peek().type == 'COMMA':
                 self.consume('COMMA')
@@ -573,6 +631,10 @@ class Parser:
             return ContinueStmt()
         elif token.type == 'REGION':
             return self.parse_region()
+        elif token.type == 'USE':
+            return self.parse_use()
+        elif token.type == 'TYPE':
+            return self.parse_type_alias()
         elif token.type == 'LBRACE':
             self.consume('LBRACE')
             stmts = []
@@ -781,17 +843,22 @@ class Parser:
         var_name = self.consume('IDENTIFIER').value
         self.consume('IN')
         
-        start_expr = self.parse_expression()
+        expr1 = self.parse_expression()
         
+        is_range = False
         inclusive = False
-        if self.peek().type == 'DOT_DOT_EQ':
-            self.consume('DOT_DOT_EQ')
-            inclusive = True
-        else:
-            self.consume('DOT_DOT')
-            
-        end_expr = self.parse_expression()
+        end_expr = None
         
+        if self.peek().type == 'DOT_DOT':
+            self.consume('DOT_DOT')
+            is_range = True
+            end_expr = self.parse_expression()
+        elif self.peek().type == 'DOT_DOT_EQ':
+            self.consume('DOT_DOT_EQ')
+            is_range = True
+            inclusive = True
+            end_expr = self.parse_expression()
+            
         self.consume('LBRACE')
         body = []
         while self.peek().type != 'RBRACE':
@@ -800,7 +867,7 @@ class Parser:
                  self.consume('SEMICOLON')
         self.consume('RBRACE')
         
-        node = ForStmt(var_name, start_expr, end_expr, body, inclusive)
+        node = ForStmt(var_name, expr1, end_expr, body, inclusive, is_iterator=not is_range)
         node.line = start_token.line
         node.column = start_token.column
         return node
@@ -951,29 +1018,21 @@ class Parser:
             
             # 3. Namespaces or TurboFish: ID :: ...
             elif peek1 == 'DOUBLE_COLON':
-                lhs = self.consume('IDENTIFIER').value
-                self.consume('DOUBLE_COLON')
-                
-                full_name = lhs
-                if self.peek().type == 'LT':
-                    # Turbo fish: ID :: <T, U>
-                    self.consume('LT')
-                    types = []
-                    while self.peek().type != 'GT':
-                        types.append(self.parse_type())
-                        if self.peek().type == 'COMMA': self.consume('COMMA')
-                    self.consume('GT')
-                    full_name = f"{lhs}<{','.join(types)}>"
-                    
-                    # Check for Variant chaining: :: Variant
-                    if self.peek().type == 'DOUBLE_COLON':
-                        self.consume('DOUBLE_COLON')
+                full_name = self.consume('IDENTIFIER').value
+                while self.peek().type == 'DOUBLE_COLON':
+                    self.consume('DOUBLE_COLON')
+                    if self.peek().type == 'LT':
+                        # Turbo fish: ... :: <T, U>
+                        self.consume('LT')
+                        types = []
+                        while self.peek().type != 'GT':
+                            types.append(self.parse_type())
+                            if self.peek().type == 'COMMA': self.consume('COMMA')
+                        self.consume('GT')
+                        full_name = f"{full_name}<{','.join(types)}>"
+                    else:
                         rhs = self.consume('IDENTIFIER').value
                         full_name = f"{full_name}::{rhs}"
-                else:
-                    # Namespace: ID :: ID
-                    rhs = self.consume('IDENTIFIER').value
-                    full_name = f"{lhs}::{rhs}"
                 
                 
                 # Check for Struct Instantiation: Mod::Struct { ... }

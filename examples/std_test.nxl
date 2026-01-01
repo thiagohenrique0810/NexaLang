@@ -1,0 +1,78 @@
+mod std;
+use std::vec::Vec;
+use std::option::Option;
+use std::result::Result;
+use std::map::HashMap;
+
+fn test_result() {
+    let ok_res: Result<i32, i32> = Result::<i32, i32>::Ok(10);
+    if (ok_res.is_ok()) {
+        print("Result::Ok is_ok() check passed");
+    } else {
+        print("Result::Ok is_ok() check failed");
+    }
+    
+    let val: i32 = ok_res.unwrap();
+    if (val == 10) {
+        print("Result::unwrap() passed: 10");
+    }
+    
+    let err_res: Result<i32, i32> = Result::<i32, i32>::Err(5);
+    if (err_res.is_err()) {
+        print("Result::Err is_err() check passed");
+    }
+}
+
+fn test_map() {
+    let mut map: HashMap<i32, i32> = HashMap::new();
+    map.insert(1, 100);
+    map.insert(2, 200);
+    
+    let v1 = map.get(1);
+    match (v1) {
+        Some(v) => { 
+             if (v == 100) { print("Map get(1) passed"); }
+             else { print("Map get(1) failed value"); }
+        },
+        None => print("Map get(1) failed (None)")
+    }
+
+    # Update
+    map.insert(1, 101);
+    let v1_upt = map.get(1);
+     match (v1_upt) {
+        Some(v) => { 
+             if (v == 101) { print("Map update(1) passed"); }
+             else { print("Map update(1) failed value"); }
+        },
+        None => print("Map update(1) failed (None)")
+    }
+    
+    let v3 = map.get(3);
+    match (v3) {
+        Some(_) => print("Map get(3) failed (found)"),
+        None => print("Map get(3) passed (None)")
+    }
+}
+
+fn test_map_string() {
+    let mut map_str: HashMap<string, i32> = HashMap::<string, i32>::new();
+    map_str.insert("hello", 500);
+    map_str.insert("world", 600);
+    
+    let v_hello = map_str.get("hello");
+    match (v_hello) {
+        Some(v) => {
+             if (v == 500) { print("Map string passed"); }
+             else { print("Map string failed value"); }
+        },
+        None => print("Map string failed (None)")
+    }
+}
+
+fn main() -> i32 {
+    test_result();
+    test_map();
+    test_map_string();
+    return 0;
+}

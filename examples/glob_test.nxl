@@ -1,0 +1,11 @@
+mod glob_utils;
+
+use glob_utils::*;
+
+fn main() {
+    let res = sub(10, 5);
+    print(res);
+    
+    let p = Constants::get_pi();
+    print(p);
+}

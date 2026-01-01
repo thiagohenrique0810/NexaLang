@@ -262,7 +262,7 @@ class Lexer:
                     'false': 'FALSE', 'mut': 'MUT', 'impl': 'IMPL', 'self': 'SELF',
                     'or': 'OR', 'and': 'AND', 'mod': 'MOD', 'pub': 'PUB', 'for': 'FOR',
                     'in': 'IN', 'break': 'BREAK', 'continue': 'CONTINUE', 'trait': 'TRAIT',
-                    'use': 'USE'
+                    'use': 'USE', 'type': 'TYPE'
                 }
                 
                 type_name = keywords.get(value, 'IDENTIFIER')
