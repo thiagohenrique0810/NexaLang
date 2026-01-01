@@ -74,7 +74,10 @@ class Lexer:
                 self.advance()
             elif char == '.':
                 if self.pos + 1 < self.length and self.source[self.pos+1] == '.':
-                    if self.pos + 2 < self.length and self.source[self.pos+2] == '=':
+                    if self.pos + 2 < self.length and self.source[self.pos+2] == '.':
+                        tokens.append(Token('ELLIPSIS', '...', start_line, start_col))
+                        self.advance(3)
+                    elif self.pos + 2 < self.length and self.source[self.pos+2] == '=':
                         tokens.append(Token('DOT_DOT_EQ', '..=', start_line, start_col))
                         self.advance(3)
                     else:
@@ -181,9 +184,28 @@ class Lexer:
                 tokens.append(Token('STRING', value, start_line, start_col))
                 self.advance()
 
-            # Char Literals: 'a', '\n', '\'', '\\', '\x41'
+            # Char Literals or Labels ('label)
             elif char == "'":
                 self.advance()  # consume opening '
+                if self.pos < self.length and (self.source[self.pos].isalpha() or self.source[self.pos] == '_'):
+                    # Could be a label like 'label or a char literal like 'a'
+                    start_ident = self.pos
+                    while self.pos < self.length and (self.source[self.pos].isalnum() or self.source[self.pos] == '_'):
+                        self.advance()
+                    
+                    ident_value = self.source[start_ident:self.pos]
+                    
+                    # If followed by another ', it's a char literal (if single char)
+                    if self.pos < self.length and self.source[self.pos] == "'":
+                        if len(ident_value) == 1:
+                            self.advance() # consume closing '
+                            tokens.append(Token('CHAR', str(ord(ident_value)), start_line, start_col))
+                            continue
+                    
+                    # Otherwise, it's a LABEL
+                    tokens.append(Token('LABEL', ident_value, start_line, start_col))
+                    continue
+
                 if self.pos >= self.length:
                     raise Exception(f"Unterminated char literal at {start_line}:{start_col}")
 
@@ -265,7 +287,7 @@ class Lexer:
                     'false': 'FALSE', 'mut': 'MUT', 'impl': 'IMPL', 'self': 'SELF',
                     'or': 'OR', 'and': 'AND', 'mod': 'MOD', 'pub': 'PUB', 'for': 'FOR',
                     'in': 'IN', 'break': 'BREAK', 'continue': 'CONTINUE', 'trait': 'TRAIT',
-                    'use': 'USE', 'type': 'TYPE'
+                    'use': 'USE', 'type': 'TYPE', 'extern': 'EXTERN'
                 }
                 
                 type_name = keywords.get(value, 'IDENTIFIER')

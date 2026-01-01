@@ -1,5 +1,5 @@
 from llvmlite import ir
-from n_parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, MethodCall, FloatLiteral, IndexAccess, CharLiteral
+from n_parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, MethodCall, FloatLiteral, IndexAccess, CharLiteral, ExternBlock
 
 class CodeGen:
     def __init__(
@@ -48,7 +48,7 @@ class CodeGen:
         self.enum_payloads = {} # name -> {variant: payload_type}
         self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
         self.scopes = []
-        self.loop_stack = [] # Stack of (continue_block, break_block, scope_depth)
+        self.loop_stack = [] # Stack of (continue_block, break_block, scope_depth, label)
 
         # For Vulkan SPIR-V kernels-only, avoid emitting host/runtime helpers
         # (Arena/malloc/printf) because they pull in pointer ops that are not shader-friendly.
@@ -541,6 +541,9 @@ class CodeGen:
                 if self.emit_kernels_only and not node.is_kernel:
                     continue
                 self._declare_function(node)
+            elif isinstance(node, ExternBlock):
+                for func in node.functions:
+                    self._declare_function(func)
             elif isinstance(node, ImplDef):
                 self._current_generics = [g[0] for g in node.generics]
                 for method in node.methods:
@@ -932,7 +935,7 @@ class CodeGen:
             # 5. Body
             self.builder.position_at_end(body_block)
             self.scopes.append({})
-            self.loop_stack.append((cond_block, end_block, len(self.scopes) - 1))
+            self.loop_stack.append((cond_block, end_block, len(self.scopes) - 1, node.label))
             
             # Extract Value (field 1)
             payload_arr_ptr = self.builder.gep(opt_mem, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
@@ -1006,7 +1009,7 @@ class CodeGen:
         
         # Enter Scope
         self.scopes.append({})
-        self.loop_stack.append((inc_block, end_block, len(self.scopes) - 1))
+        self.loop_stack.append((inc_block, end_block, len(self.scopes) - 1, node.label))
         
         # Register loop variable
         self.scopes[-1][node.var_name] = (loop_var_ptr, 'i32') # i32, no tag needed for primitives
@@ -1036,14 +1039,21 @@ class CodeGen:
     def visit_BreakStmt(self, node):
         if not self.loop_stack:
             raise Exception("Break statement outside of loop")
-        _, break_block, loop_scope_depth = self.loop_stack[-1]
+            
+        target = self.loop_stack[-1]
+        if node.label:
+            found = False
+            for entry in reversed(self.loop_stack):
+                if entry[3] == node.label:
+                    target = entry
+                    found = True
+                    break
+            if not found:
+                raise Exception(f"Break label '{node.label}' not found")
+                
+        _, break_block, loop_scope_depth, _ = target
         
         # Unwind scopes until loop scope
-        # Current depth: len(self.scopes) - 1
-        # Loop scope depth: loop_scope_depth
-        # We need to drop everything from current down to loop_scope_depth (inclusive of loop scope vars if breaking out)
-        # Yes, breaking exits the loop scope too.
-        
         current_depth = len(self.scopes) - 1
         while current_depth >= loop_scope_depth:
              self.emit_scope_drops(self.scopes[current_depth])
@@ -1054,14 +1064,21 @@ class CodeGen:
     def visit_ContinueStmt(self, node):
         if not self.loop_stack:
             raise Exception("Continue statement outside of loop")
-        continue_block, _, loop_scope_depth = self.loop_stack[-1]
+            
+        target = self.loop_stack[-1]
+        if node.label:
+            found = False
+            for entry in reversed(self.loop_stack):
+                if entry[3] == node.label:
+                    target = entry
+                    found = True
+                    break
+            if not found:
+                raise Exception(f"Continue label '{node.label}' not found")
+                
+        continue_block, _, loop_scope_depth, _ = target
         
         # Unwind scopes until loop scope
-        # Continue stays IN the loop, but exits current iteration scopes (e.g. if inside If)
-        # It jumps to continue_block (inc or cond).
-        # It exits the loop body scope? Yes, eventually re-enters or incs.
-        # So we drop everything down to loop_scope_depth.
-        
         current_depth = len(self.scopes) - 1
         while current_depth >= loop_scope_depth:
              self.emit_scope_drops(self.scopes[current_depth])
@@ -1447,7 +1464,7 @@ class CodeGen:
         self.builder.position_at_end(loop_bb)
         
         self.scopes.append({})
-        self.loop_stack.append((cond_bb, end_bb, len(self.scopes) - 1))
+        self.loop_stack.append((cond_bb, end_bb, len(self.scopes) - 1, node.label))
         
         for stmt in node.body:
             self.visit(stmt)
@@ -2294,7 +2311,7 @@ class CodeGen:
             # Lambda functions always take environment as first argument (fat pointer convention)
             arg_types.insert(0, ir.IntType(8).as_pointer())
 
-        func_ty = ir.FunctionType(ret_type, arg_types)
+        func_ty = ir.FunctionType(ret_type, arg_types, var_arg=getattr(node, 'is_vararg', False))
 
         # Check if exists
         try:
@@ -2307,8 +2324,15 @@ class CodeGen:
 
         return func
 
+    def visit_ExternBlock(self, node):
+        pass # Headers already declared in Pass 2
+
     def visit_FunctionDef(self, node):
         if getattr(node, 'generics', None): return
+        
+        # If it's a declaration only (extern), stop here
+        if node.body is None:
+            return
 
         # Function already declared in Pass 2
         func = self.module.get_global(node.name)

@@ -105,7 +105,8 @@ def main():
     try:
         analyzer.analyze(ast)
     except CompilerError as e:
-        print(f"Error: {e.message}")
+        code_str = f" [{e.error_code}]" if e.error_code else ""
+        print(f"\033[31mError{code_str}: {e.message}\033[0m")
         if e.line:
             lines = source.splitlines()
             if 0 <= e.line - 1 < len(lines):
@@ -115,6 +116,8 @@ def main():
                  print(f"   | {' ' * (e.column-1)}^")
         if getattr(e, 'hint', None):
              print(f"  = help: {e.hint}")
+        if e.error_code:
+             print(f"  = docs: https://nexalang.org/errors/{e.error_code}")
         sys.exit(1)
     except Exception as e:
         print(f"[SEMANTIC ERROR] {e}")

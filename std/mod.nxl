@@ -3,3 +3,5 @@ pub mod vec;
 pub mod result;
 pub mod hash;
 pub mod map;
+pub mod fs;
+pub mod string;

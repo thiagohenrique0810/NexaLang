@@ -1,11 +1,12 @@
 class CompilerError(Exception):
-    def __init__(self, message, line=None, column=None, file=None, hint=None):
+    def __init__(self, message, line=None, column=None, file=None, hint=None, error_code=None):
         super().__init__(message)
         self.message = message
         self.line = line
         self.column = column
         self.file = file
         self.hint = hint
+        self.error_code = error_code
 
     def __str__(self):
         loc = ""

@@ -107,11 +107,31 @@ enum Expr {
     Int(i32),
     Str(string),
     Var(string),
-    Binary(i32, *Expr, *Expr)  # op_kind, left, right
+    Binary(i32, *Expr, *Expr),  # op_kind, left, right
+    Cast(string, *Expr),        # type, val
+    Sizeof(string),             # type
+    Member(string, string),     # obj_name, member_name
+    Call(string, SliceExpr)     # func_name, args
+}
+
+struct SliceExpr {
+    ptr: *Expr,
+    len: i32
 }
 
 struct SliceStmt {
     ptr: *Stmt,
+    len: i32
+}
+
+struct MatchArm {
+    variant_name: string,
+    bound_var: string, # empty if none
+    body: SliceStmt
+}
+
+struct SliceMatchArm {
+    ptr: *MatchArm,
     len: i32
 }
 
@@ -121,7 +141,9 @@ enum Stmt {
     Let(string, string, Expr),   # name, type, init_expr
     Assign(string, Expr),        # name, val
     If(Expr, SliceStmt),         # cond, body (simple if)
-    While(Expr, SliceStmt)       # cond, body
+    While(Expr, SliceStmt),      # cond, body
+    Match(Expr, SliceMatchArm),  # val, arms
+    For(string, Expr, Expr, SliceStmt) # var, start, end, body
 }
 
 # --- Specialized Slices ---
@@ -139,7 +161,28 @@ struct SliceFunction {
     len: i32
 }
 
+struct Field {
+    name: string,
+    type_name: string
+}
+
+struct SliceField {
+    ptr: *Field,
+    len: i32
+}
+
+struct Struct {
+    name: string,
+    fields: SliceField
+}
+
+struct SliceStruct {
+    ptr: *Struct,
+    len: i32
+}
+
 struct Program {
+    structs: SliceStruct,
     functions: SliceFunction
 }
 
@@ -282,14 +325,16 @@ fn parse_int_val(p: *Parser, tok: Token) -> i32 {
     return res;
 }
 
-fn parse_str_val(p: *Parser, tok: Token) -> string {
-    # Token includes quotes "..."
-    # We want content inside.
-    let s: i32 = tok.start + 1;
-    let l: i32 = tok.len - 2;
+fn token_to_string(p: *Parser, tok: Token) -> string {
+    let s: i32 = tok.start;
+    let l: i32 = tok.len;
+    
+    if (tok.kind == 3) { # String literal
+        s = s + 1;
+        l = l - 2;
+    }
     
     let buf: u8* = malloc(l + 1);
-    
     let i: i32 = 0;
     while (i < l) {
         let c: u8 = ptr_offset::<u8>((*p).src, s + i)[0];
@@ -333,13 +378,74 @@ fn parse_primary(p: *Parser) -> Expr {
     }
     if ((*tok_ptr).kind == 3) { # String
         consume(p, 3);
-        let s: string = parse_str_val(p, *tok_ptr);
+        let s: string = token_to_string(p, *tok_ptr);
         return Expr::Str(s);
     }
-    if ((*tok_ptr).kind == 1) { # Ident (Var)
-        consume(p, 1);
-        let s: string = parse_str_val(p, *tok_ptr);
-        return Expr::Var(s);
+    if ((*tok_ptr).kind == 1) { # Ident (Var or Cast/Sizeof or Call)
+        # Check for cast or sizeof
+        let s_start: i32 = (*tok_ptr).start;
+        let c: u8 = ptr_offset::<u8>((*p).src, s_start)[0];
+        
+        # 'c' for cast (99)
+        if (cast::<i32>(c) == 99) {
+             # Verify it's "cast" (simplified check)
+             consume(p, 1);
+             consume(p, 5); # :
+             consume(p, 5); # :
+             consume(p, 5); # <
+             let type_tok: Token = consume(p, 1);
+             let ty: string = token_to_string(p, type_tok);
+             consume(p, 5); # >
+             consume(p, 5); # (
+             let val: Expr = parse_expr(p);
+             let val_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, sizeof::<Expr>()));
+             *val_ptr = val;
+             consume(p, 5); # )
+             return Expr::Cast(ty, val_ptr);
+        }
+        
+        # 's' for sizeof (115)
+        if (cast::<i32>(c) == 115) {
+             consume(p, 1);
+             consume(p, 5); # :
+             consume(p, 5); # :
+             consume(p, 5); # <
+             let type_tok: Token = consume(p, 1);
+             let ty: string = token_to_string(p, type_tok);
+             consume(p, 5); # >
+             consume(p, 5); # (
+             consume(p, 5); # )
+             return Expr::Sizeof(ty);
+        }
+
+        let name_tok: Token = consume(p, 1);
+        let name: string = token_to_string(p, name_tok);
+        
+        # Check for '(' for Call
+        let nt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let nt_c: u8 = ptr_offset::<u8>((*p).src, (*nt).start)[0];
+        if (cast::<i32>(nt_c) == 40) { # (
+            consume(p, 5);
+            let args_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, 10 * sizeof::<Expr>()));
+            let args_cnt: i32 = 0;
+            while (true) {
+                let cur_t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                let cur_c: u8 = ptr_offset::<u8>((*p).src, (*cur_t).start)[0];
+                if (cast::<i32>(cur_c) == 41) { break; } # )
+                
+                args_ptr[args_cnt] = parse_expr(p);
+                args_cnt = args_cnt + 1;
+                
+                # Comma
+                let nxt_t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                let nxt_c: u8 = ptr_offset::<u8>((*p).src, (*nxt_t).start)[0];
+                if (cast::<i32>(nxt_c) == 44) { consume(p, 5); }
+            }
+            consume(p, 5); # )
+            return Expr::Call(name, SliceExpr(args_ptr, args_cnt));
+        }
+
+        return Expr::Var(name);
     }
     panic("Expected primary expression");
     return Expr::Int(0);
@@ -469,11 +575,11 @@ fn parse_stmt(p: *Parser) -> Stmt {
         if (cast::<i32>(c) == 108) {
             consume(p, 1); # let
             let name_tok: Token = consume(p, 1); # name
-            let name: string = parse_str_val(p, name_tok);
+            let name: string = token_to_string(p, name_tok);
             
             consume(p, 5); # :
             let type_tok: Token = consume(p, 1); # type
-            let ty: string = parse_str_val(p, type_tok);
+            let ty: string = token_to_string(p, type_tok);
             
             # Check =
             let eq_tok: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
@@ -513,6 +619,68 @@ fn parse_stmt(p: *Parser) -> Stmt {
              return Stmt::While(cond, body);
         }
         
+        # 'f' for for (102)
+        if (cast::<i32>(c) == 102) {
+             if (cast::<i32>(c2) == 111) { # for
+                 consume(p, 1);
+                 let var_tok: Token = consume(p, 1);
+                 let var_name: string = token_to_string(p, var_tok);
+                 
+                 consume(p, 1); # in
+                 
+                 let start_expr: Expr = parse_expr(p);
+                 consume(p, 5); # .
+                 consume(p, 5); # .
+                 let end_expr: Expr = parse_expr(p);
+                 
+                 consume(p, 5); # {
+                 let body: SliceStmt = parse_stmts(p);
+                 consume(p, 5); # }
+                 
+                 return Stmt::For(var_name, start_expr, end_expr, body);
+             }
+        }
+        
+        # 'm' for match (109)
+        if (cast::<i32>(c) == 109) {
+             consume(p, 1);
+             let val: Expr = parse_expr(p);
+             consume(p, 5); # {
+             
+             let arms_ptr: *MatchArm = cast::<*MatchArm>(arena_alloc((*p).arena, 10 * sizeof::<MatchArm>()));
+             let arms_cnt: i32 = 0;
+             
+             while (true) {
+                 let t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                 let first_c: u8 = ptr_offset::<u8>((*p).src, (*t).start)[0];
+                 if (cast::<i32>(first_c) == 125) { break; } # }
+                 
+                 let variant_tok: Token = consume(p, 1);
+                 let variant_name: string = token_to_string(p, variant_tok);
+                 
+                 let bound_var: string = "";
+                 let nt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                 let nt_c: u8 = ptr_offset::<u8>((*p).src, (*nt).start)[0];
+                 if (cast::<i32>(nt_c) == 40) { # (
+                     consume(p, 5);
+                     let bv_tok: Token = consume(p, 1);
+                     bound_var = token_to_string(p, bv_tok);
+                     consume(p, 5); # )
+                 }
+                 
+                 consume(p, 5); # =
+                 consume(p, 5); # >
+                 consume(p, 5); # {
+                 let body: SliceStmt = parse_stmts(p);
+                 consume(p, 5); # }
+                 
+                 arms_ptr[arms_cnt] = MatchArm(variant_name, bound_var, body);
+                 arms_cnt = arms_cnt + 1;
+             }
+             consume(p, 5); # }
+             return Stmt::Match(val, SliceMatchArm(arms_ptr, arms_cnt));
+        }
+        
         # Assignment? If it's identifier not keyword.
         # Assume assignment if followed by = (checked via peek)
         # Or simple var usage? Statement can be expression?
@@ -521,7 +689,7 @@ fn parse_stmt(p: *Parser) -> Stmt {
         # Note: 'name' is already peeked as *tok_ptr.
         # Try to parse assignment.
         let name_tok: Token = consume(p, 1);
-        let name: string = parse_str_val(p, name_tok);
+        let name: string = token_to_string(p, name_tok);
         
         let op_tok: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
         if ((*op_tok).kind == 5) {
@@ -591,16 +759,72 @@ fn parse_fn(p: *Parser) -> Function {
     return Function(name_tok.start, name_tok.len, SliceStmt(stmts_ptr, cnt));
 }
 
-fn parse_prog(p: *Parser) -> Program {
-    let funcs_ptr: *Function = cast::<*Function>(arena_alloc((*p).arena, 10 * sizeof::<Function>()));
+fn parse_struct(p: *Parser) -> Struct {
+    consume(p, 1); # struct
+    let name_tok: Token = consume(p, 1);
+    let name: string = token_to_string(p, name_tok);
+    
+    consume(p, 5); # {
+    
+    let fields_ptr: *Field = cast::<*Field>(arena_alloc((*p).arena, 20 * sizeof::<Field>()));
     let cnt: i32 = 0;
     
-    while ((*p).pos < (*p).count - 1) { # -1 for EOF check
-        funcs_ptr[cnt] = parse_fn(p);
+    while (true) {
+        let t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let first_c: u8 = ptr_offset::<u8>((*p).src, (*t).start)[0];
+        if (cast::<i32>(first_c) == 125) { break; } # }
+        
+        let f_name_tok: Token = consume(p, 1);
+        let f_name: string = token_to_string(p, f_name_tok);
+        
+        consume(p, 5); # :
+        
+        let f_type_tok: Token = consume(p, 1);
+        let f_type: string = token_to_string(p, f_type_tok);
+        
+        # Optional comma
+        let nt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let nt_c: u8 = ptr_offset::<u8>((*p).src, (*nt).start)[0];
+        if (cast::<i32>(nt_c) == 44) { consume(p, 5); }
+        
+        fields_ptr[cnt] = Field(f_name, f_type);
         cnt = cnt + 1;
     }
     
-    return Program(SliceFunction(funcs_ptr, cnt));
+    consume(p, 5); # }
+    return Struct(name, SliceField(fields_ptr, cnt));
+}
+
+fn parse_prog(p: *Parser) -> Program {
+    let funcs_ptr: *Function = cast::<*Function>(arena_alloc((*p).arena, 20 * sizeof::<Function>()));
+    let f_cnt: i32 = 0;
+    
+    let structs_ptr: *Struct = cast::<*Struct>(arena_alloc((*p).arena, 20 * sizeof::<Struct>()));
+    let s_cnt: i32 = 0;
+    
+    while ((*p).pos < (*p).count - 1) { # -1 for EOF check
+        let t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let s_start: i32 = (*t).start;
+        let c: u8 = ptr_offset::<u8>((*p).src, s_start)[0];
+        let c2: u8 = ptr_offset::<u8>((*p).src, s_start + 1)[0];
+        
+        # 'f' for fn (102)
+        if (cast::<i32>(c) == 102 and cast::<i32>(c2) == 110) {
+            funcs_ptr[f_cnt] = parse_fn(p);
+            f_cnt = f_cnt + 1;
+        } else {
+            # 's' for struct (115)
+            if (cast::<i32>(c) == 115) {
+                structs_ptr[s_cnt] = parse_struct(p);
+                s_cnt = s_cnt + 1;
+            } else {
+                # Skip unknown top-level
+                consume(p, (*t).kind);
+            }
+        }
+    }
+    
+    return Program(SliceStruct(structs_ptr, s_cnt), SliceFunction(funcs_ptr, f_cnt));
 }
 
 # --- CodeGen Utils ---

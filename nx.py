@@ -2,6 +2,7 @@ import argparse
 import os
 import subprocess
 import sys
+import json
 
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +12,16 @@ DEV_ARTIFACTS = os.path.join(REPO_ROOT, "dev", "artifacts")
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def load_project_config():
+    if os.path.exists("nexa.json"):
+        try:
+            with open("nexa.json", "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading nexa.json: {e}")
+    return None
 
 
 def _run(cmd: list[str]) -> int:
@@ -25,13 +36,23 @@ def _python() -> list[str]:
 
 def cmd_build(args: argparse.Namespace) -> int:
     _ensure_dir(DEV_ARTIFACTS)
+    
+    file = args.file
+    if not file:
+        config = load_project_config()
+        if config and "main" in config:
+            file = config["main"]
+        else:
+            print("Error: No input file specified and no nexa.json project file found.")
+            return 1
+
     out = args.out or (os.path.join(DEV_ARTIFACTS, "output.exe") if args.target == "native" else None)
     ll_out = args.ll_out or (os.path.join(DEV_ARTIFACTS, "output.ll") if args.emit == "ll" else os.path.join(DEV_ARTIFACTS, "output.ll"))
     spv_out = args.spv_out or (os.path.join(DEV_ARTIFACTS, "output.spv") if args.emit == "spv" else None)
 
     if args.target == "native":
         # Emit LLVM IR
-        rc = _run(_python() + [BOOTSTRAP_MAIN, args.file, "--target", "native", "--emit", "ll", "--out", ll_out])
+        rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--emit", "ll", "--out", ll_out])
         if rc != 0:
             return rc
         # Link
@@ -45,7 +66,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             _python()
             + [
                 BOOTSTRAP_MAIN,
-                args.file,
+                file,
                 "--target",
                 "spirv",
                 "--emit",
@@ -63,7 +84,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         _python()
         + [
             BOOTSTRAP_MAIN,
-            args.file,
+            file,
             "--target",
             "spirv",
             "--emit",
@@ -90,7 +111,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Build native and run
     _ensure_dir(DEV_ARTIFACTS)
     
-    cmd = _python() + [BOOTSTRAP_MAIN, args.file, "--target", "native"]
+    file = args.file
+    if not file:
+        config = load_project_config()
+        if config and "main" in config:
+            file = config["main"]
+        else:
+            print("Error: No input file specified and no nexa.json project file found.")
+            return 1
+
+    cmd = _python() + [BOOTSTRAP_MAIN, file, "--target", "native"]
     
     if args.jit:
         cmd.append("--run-jit")
@@ -129,7 +159,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build", help="Build a .nxl file (native or SPIR-V)")
-    p_build.add_argument("file", help="Input .nxl")
+    p_build.add_argument("file", nargs="?", help="Input .nxl (optional if nexa.json exists)")
     p_build.add_argument("--target", choices=["native", "spirv"], default="native")
     p_build.add_argument("--emit", choices=["ll", "spv"], default="spv", help="(spirv) emit format")
     p_build.add_argument("--no-link", action="store_true", help="(native) only emit .ll, don't run clang")
@@ -147,7 +177,7 @@ def main() -> int:
     p_build.set_defaults(func=cmd_build)
 
     p_run = sub.add_parser("run", help="Build native and run")
-    p_run.add_argument("file", help="Input .nxl")
+    p_run.add_argument("file", nargs="?", help="Input .nxl (optional if nexa.json exists)")
     p_run.add_argument("--exe", default=None, help="Output exe path")
     p_run.add_argument("--ll-out", default=None, help="Output .ll path")
     p_run.add_argument("--jit", action="store_true", help="Run using JIT (no clang required)")

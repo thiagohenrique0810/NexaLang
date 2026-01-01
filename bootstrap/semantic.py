@@ -14,7 +14,7 @@ class SemanticAnalyzer:
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
-        self.loop_depth = 0
+        self.loop_stack = [] # list of labels (None if no label)
         self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file'])
         self.function_defs = {} # name -> FunctionDef
         self.structs = {} # name -> {field: type}
@@ -33,10 +33,15 @@ class SemanticAnalyzer:
         self.lambda_count = 0
 
 
-    def error(self, message, node=None, hint=None):
+    def get_suggestion(self, name, possibilities):
+        import difflib
+        matches = difflib.get_close_matches(name, possibilities, n=1, cutoff=0.6)
+        return matches[0] if matches else None
+
+    def error(self, message, node=None, hint=None, error_code=None):
         line = node.line if node else None
         column = node.column if node else None
-        raise CompilerError(message, line, column, hint=hint)
+        raise CompilerError(message, line, column, hint=hint, error_code=error_code)
 
     def resolve_type_name(self, name):
         if not name: return name
@@ -248,6 +253,12 @@ class SemanticAnalyzer:
                  self.aliases[f"{prefix}_{node.alias}"] = node.original_type
              else:
                  self.aliases[node.alias] = node.original_type
+        elif name == 'ExternBlock':
+             for func in node.functions:
+                  func.module = prefix
+                  self.canonicalize_type_refs(func)
+                  self.function_defs[func.name] = func
+                  self.functions.add(func.name)
         elif name == 'ImplDef':
              for method in node.methods:
                   method.return_type = self.resolve_type_name(self.mangle_type_if_local(method.return_type, prefix))
@@ -288,6 +299,7 @@ class SemanticAnalyzer:
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
 
+    def visit_ExternBlock(self, node): pass
     def visit_TraitDef(self, node): pass
     def visit_StructDef(self, node): pass
     def visit_EnumDef(self, node): pass
@@ -413,7 +425,9 @@ class SemanticAnalyzer:
         else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         if node.member not in fields_dict:
-             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node)
+             suggestion = self.get_suggestion(node.member, list(fields_dict.keys()))
+             hint = f"did you mean '.{suggestion}'?" if suggestion else None
+             self.error(f"Type Error: Struct '{lookup_type}' has no member '{node.member}'", node, hint=hint)
         
         node.struct_type = lookup_type
         node.type_name = fields_dict[node.member]
@@ -429,7 +443,9 @@ class SemanticAnalyzer:
         
         methods = self.struct_methods[lookup_type]
         if node.method_name not in methods:
-            self.error(f"Semantic Error: Method '{node.method_name}' not found on type '{base_type}'", node)
+            suggestion = self.get_suggestion(node.method_name, list(methods.keys()))
+            hint = f"did you mean '.{suggestion}()'?" if suggestion else None
+            self.error(f"Method '{node.method_name}' not found on type '{base_type}'", node, hint=hint)
         
         method_def = methods[node.method_name]
         node.struct_type = lookup_type
@@ -647,7 +663,7 @@ class SemanticAnalyzer:
 
     def visit_ForStmt(self, node):
         self.enter_scope()
-        self.loop_depth += 1
+        self.loop_stack.append(node.label)
         
         if node.is_iterator:
             coll_type = self.visit(node.start_expr)
@@ -696,19 +712,28 @@ class SemanticAnalyzer:
             self.declare_variable(node.var_name, 'i32', node=node)
             for s in node.body: self.visit(s)
             
-        self.loop_depth -= 1
+        self.loop_stack.pop()
         self.exit_scope()
 
     def visit_WhileStmt(self, node):
         if self.visit(node.condition) != 'bool': raise Exception("While condition must be bool")
-        self.enter_scope(); self.loop_depth += 1
+        self.loop_stack.append(node.label)
+        self.enter_scope()
         for s in node.body: self.visit(s)
-        self.loop_depth -= 1; self.exit_scope()
+        self.loop_stack.pop()
+        self.exit_scope()
 
     def visit_BreakStmt(self, node):
-        if self.loop_depth == 0: raise Exception("Break outside loop")
+        if not self.loop_stack: raise Exception("Break outside loop")
+        if node.label:
+            if node.label not in self.loop_stack:
+                raise Exception(f"Break to unknown label '{node.label}'")
+
     def visit_ContinueStmt(self, node):
-        if self.loop_depth == 0: raise Exception("Continue outside loop")
+        if not self.loop_stack: raise Exception("Continue outside loop")
+        if node.label:
+            if node.label not in self.loop_stack:
+                raise Exception(f"Continue to unknown label '{node.label}'")
 
     def visit_FunctionDef(self, node):
         if node.generics:
@@ -731,12 +756,40 @@ class SemanticAnalyzer:
         self.current_function = None
         self.current_module = prev_mod
 
+    def check_type_compatibility(self, expected, actual, node):
+        if expected == actual:
+            return True
+            
+        # Handle Generics (e.g. Vec<T> == Vec<i32> if T is generic in current context? No, that's already handled elsewhere)
+        if '<' in expected and '<' in actual:
+             if expected.split('<')[0] == actual.split('<')[0]:
+                  return True
+                  
+        # Coercion
+        numeric_types = ('i32', 'i64', 'u8', 'f32')
+        if expected in numeric_types and actual in numeric_types:
+             # Upcasts (allowed, no warning usually, or maybe warning if we want to be strict)
+             if (expected == 'i64' and actual == 'i32') or (expected == 'i64' and actual == 'u8') or (expected == 'i32' and actual == 'u8'):
+                  return True
+             if (expected == 'f32' and actual in ('i32', 'i64', 'u8')):
+                  return True
+             
+             # Downcasts (warning for potential precision loss)
+             if (expected == 'i32' and actual == 'i64') or (expected == 'u8' and actual in ('i32', 'i64', 'i32')):
+                  self.warnings.append((f"Potential precision loss: coercing {actual} to {expected}", node.line, node.column))
+                  return True
+             if (expected in ('i32', 'i64', 'u8') and actual == 'f32'):
+                  self.warnings.append((f"Potential precision loss: coercing {actual} to {expected} (float to int)", node.line, node.column))
+                  return True
+                  
+        return False
+
     def visit_VarDecl(self, node):
         if node.type_name: node.type_name = self.resolve_type_name(node.type_name)
         init_t = self.visit(node.initializer)
         if node.type_name is None: node.type_name = init_t
         if '<' in node.type_name: self.instantiate_generic_type(node.type_name)
-        if init_t != node.type_name and not (('<' in init_t and '<' in node.type_name) and (init_t.split('<')[0] == node.type_name.split('<')[0])):
+        if init_t != node.type_name and not self.check_type_compatibility(node.type_name, init_t, node):
              raise Exception(f"Type Error: {init_t} != {node.type_name}")
         if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_t): self.move_var(node.initializer.name)
         self.declare_variable(node.name, node.type_name, node=node)
@@ -747,12 +800,13 @@ class SemanticAnalyzer:
              v = self.lookup(node.target.name)
              if not v: raise Exception("Undefined var")
              if v['readers'] > 0: raise Exception("Variable is borrowed")
-             if v['type'] != val_t and not (('<' in val_t and '<' in v['type']) and (val_t.split('<')[0] == v['type'].split('<')[0])):
+             if val_t != v['type'] and not self.check_type_compatibility(v['type'], val_t, node):
                   raise Exception("Type mismatch in assignment")
              v['moved'] = False
         else:
              target_t = self.visit(node.target)
-             if target_t != val_t: raise Exception("Type mismatch in assignment")
+             if target_t != val_t and not self.check_type_compatibility(target_t, val_t, node):
+                  raise Exception("Type mismatch in assignment")
         if isinstance(node.value, VariableExpr) and not self.is_copy_type(val_t): self.move_var(node.value.name)
 
     def visit_BinaryExpr(self, node):
@@ -760,7 +814,8 @@ class SemanticAnalyzer:
         if node.op in ('PLUS', 'MINUS'):
             if l.endswith('*') and r in ('i32', 'i64'): return l
             if r.endswith('*') and l in ('i32', 'i64') and node.op == 'PLUS': return r
-        if l != r: raise Exception(f"Type mismatch: {l} {node.op} {r}")
+        if l != r and not self.check_type_compatibility(l, r, node) and not self.check_type_compatibility(r, l, node):
+            raise Exception(f"Type mismatch: {l} {node.op} {r}")
         if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return l
         if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ'): return 'bool'
         raise Exception("Unsupported binary op")
@@ -829,7 +884,16 @@ class SemanticAnalyzer:
                  return prefix
 
         v, v_depth = self.lookup_with_depth(node.name)
-        if not v: self.error(f"UNDEFINED_VAR_LOOKUP: '{node.name}'", node)
+        if not v:
+            possibilities = []
+            for scope in self.scopes:
+                possibilities.extend([k for k in scope.keys() if k != 'active_borrows'])
+            possibilities.extend(list(self.functions))
+            possibilities.extend(list(self.structs.keys()))
+            
+            suggestion = self.get_suggestion(node.name, possibilities)
+            hint = f"did you mean '{suggestion}'?" if suggestion else None
+            self.error(f"Undefined variable: '{node.name}'", node, hint=hint, error_code="E0001")
         
         if self.lambda_base_scopes:
              captured = False
@@ -930,6 +994,8 @@ class SemanticAnalyzer:
             return 'void'
         if callee in ('fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'panic', 'assert', 'memcpy'):
             # Simplified intrinsics check
+            if callee in self.function_defs:
+                 self.function_defs[callee].used = True
             for a in node.args: self.visit(a)
             if callee == 'fs::read_file': self.instantiate_generic_type('Buffer<u8>'); return 'Buffer<u8>'
             if callee in ('malloc', 'realloc'): return 'u8*'
@@ -950,6 +1016,13 @@ class SemanticAnalyzer:
                   if local in self.functions or local in self.structs or local in self.generic_functions or local in self.generic_structs:
                        callee = local
                        node.callee = local
+        
+        # If still not found, try to find a suggestion
+        if callee not in self.functions and callee not in self.structs and callee not in self.generic_functions and callee not in self.generic_structs and '<' not in callee:
+             possibilities = list(self.functions) + list(self.structs.keys()) + list(self.generic_functions.keys()) + list(self.generic_structs.keys())
+             suggestion = self.get_suggestion(callee, possibilities)
+             hint = f"did you mean '{suggestion}'?" if suggestion else None
+             self.error(f"Unknown function or struct: '{callee}'", node, hint=hint)
 
         # Generic Struct Instantiation (e.g. Wrapper<T>)
         if '<' in callee:
@@ -980,15 +1053,21 @@ class SemanticAnalyzer:
         if callee in self.functions:
             func_def = self.function_defs[callee]
             func_def.used = True
-            if len(node.args) != len(func_def.params): raise Exception(f"Arg count mismatch for '{callee}'")
+            
+            if not func_def.is_vararg and len(node.args) != len(func_def.params): 
+                raise Exception(f"Arg count mismatch for '{callee}': expected {len(func_def.params)}, got {len(node.args)}")
+            elif func_def.is_vararg and len(node.args) < len(func_def.params):
+                raise Exception(f"Arg count mismatch for vararg '{callee}': expected at least {len(func_def.params)}, got {len(node.args)}")
+                
             self.enter_scope()
             for i, arg in enumerate(node.args):
                  arg_t = self.visit(arg)
-                 param_t = func_def.params[i][1]
-                 # Apply generics mapping to param types too!
-                 if generics_mapping: param_t = self.apply_submap(param_t, generics_mapping)
-                 
-                 if arg_t != param_t: raise Exception(f"Type mismatch arg {i}: expected {param_t}, got {arg_t}")
+                 if i < len(func_def.params):
+                     param_t = func_def.params[i][1]
+                     if generics_mapping: param_t = self.apply_submap(param_t, generics_mapping)
+                     
+                     if not self.check_type_compatibility(param_t, arg_t, node):
+                          raise Exception(f"Type mismatch arg {i} for '{callee}': expected {param_t}, got {arg_t}")
             self.exit_scope()
             ret = func_def.return_type
             if generics_mapping: ret = self.apply_submap(ret, generics_mapping)

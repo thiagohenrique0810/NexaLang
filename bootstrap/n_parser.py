@@ -21,7 +21,7 @@ class IndexAccess(ASTNode):
         return f"{self.object}[{self.index}]"
 
 class FunctionDef(ASTNode):
-    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False):
+    def __init__(self, name, params, return_type, body, is_kernel=False, generics=None, is_pub=False, is_vararg=False):
         self.name = name
         self.params = params
         self.return_type = return_type
@@ -29,6 +29,7 @@ class FunctionDef(ASTNode):
         self.is_kernel = is_kernel
         self.generics = generics or []
         self.is_pub = is_pub
+        self.is_vararg = is_vararg
         self.module = ""
         self.used = False
 
@@ -131,18 +132,20 @@ class IfStmt(ASTNode):
         self.else_branch = else_branch
 
 class WhileStmt(ASTNode):
-    def __init__(self, condition, body):
+    def __init__(self, condition, body, label=None):
         self.condition = condition
         self.body = body
+        self.label = label
 
 class ForStmt(ASTNode):
-    def __init__(self, var_name, start_expr, end_expr, body, inclusive=False, is_iterator=False):
+    def __init__(self, var_name, start_expr, end_expr, body, inclusive=False, is_iterator=False, label=None):
         self.var_name = var_name
         self.start_expr = start_expr
         self.end_expr = end_expr
         self.body = body
         self.inclusive = inclusive
         self.is_iterator = is_iterator
+        self.label = label
 
 class BinaryExpr(ASTNode):
     def __init__(self, left, op, right):
@@ -245,10 +248,12 @@ class RegionStmt(ASTNode):
         self.body = body
 
 class BreakStmt(ASTNode):
-    pass
+    def __init__(self, label=None):
+        self.label = label
 
 class ContinueStmt(ASTNode):
-    pass
+    def __init__(self, label=None):
+        self.label = label
 
 class ModDecl(ASTNode):
     def __init__(self, name, body=None, is_pub=False):
@@ -261,6 +266,11 @@ class TypeAlias(ASTNode):
         self.alias = alias
         self.original_type = original_type
         self.is_pub = is_pub
+
+class ExternBlock(ASTNode):
+    def __init__(self, abi, functions):
+        self.abi = abi
+        self.functions = functions
 
 class Parser:
     def __init__(self, tokens):
@@ -314,9 +324,23 @@ class Parser:
                 nodes.append(self.parse_use(is_pub=is_pub))
             elif self.peek().type == 'TYPE':
                 nodes.append(self.parse_type_alias(is_pub=is_pub))
+            elif self.peek().type == 'EXTERN':
+                nodes.append(self.parse_extern())
             else:
                 raise Exception(f"Unexpected token at top level: {self.tokens[self.pos]}")
         return nodes
+
+    def parse_extern(self):
+        self.consume('EXTERN')
+        abi = self.consume('STRING').value
+        self.consume('LBRACE')
+        functions = []
+        while self.peek().type != 'RBRACE':
+            # Extern functions are signatures followed by semicolon
+            functions.append(self.parse_function(allow_empty_body=True))
+            # parse_function already handles semicolon if allow_empty_body is True
+        self.consume('RBRACE')
+        return ExternBlock(abi, functions)
 
     def parse_mod(self, is_pub=False):
         self.consume('MOD')
@@ -597,7 +621,13 @@ class Parser:
             
         self.consume('LPAREN')
         params = []
+        is_vararg = False
         while self.peek().type != 'RPAREN':
+            if self.peek().type == 'ELLIPSIS':
+                self.consume('ELLIPSIS')
+                is_vararg = True
+                break
+            
             # Handle self parameters
             if self.peek().type == 'SELF':
                  self.consume('SELF')
@@ -633,8 +663,9 @@ class Parser:
             self.consume('THIN_ARROW')
             return_type = self.parse_type()
             
-        if self.peek().type == 'SEMICOLON' and allow_empty_body:
-            self.consume('SEMICOLON')
+        if (self.peek().type == 'SEMICOLON' and allow_empty_body) or (self.peek().type == 'EOF' and allow_empty_body):
+            if self.peek().type == 'SEMICOLON':
+                 self.consume('SEMICOLON')
             body = None
         else:
             self.consume('LBRACE')
@@ -644,7 +675,7 @@ class Parser:
                 if self.peek().type == 'SEMICOLON':
                     self.consume('SEMICOLON')
             self.consume('RBRACE')
-        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub)
+        node = FunctionDef(name, params, return_type, body, is_kernel, generics, is_pub=is_pub, is_vararg=is_vararg)
         node.line = start_token.line
         node.column = start_token.column
         return node
@@ -653,6 +684,13 @@ class Parser:
 
     def parse_statement(self):
         token = self.peek()
+        
+        label = None
+        if token.type == 'LABEL':
+            label = self.consume('LABEL').value
+            self.consume('COLON')
+            token = self.peek()
+
         if token.type == 'LET':
             return self.parse_var_decl()
         elif token.type == 'RETURN':
@@ -660,19 +698,29 @@ class Parser:
         elif token.type == 'IF':
             return self.parse_if()
         elif token.type == 'WHILE':
-            return self.parse_while()
+            node = self.parse_while()
+            node.label = label
+            return node
         elif token.type == 'FOR':
-            return self.parse_for()
+            node = self.parse_for()
+            node.label = label
+            return node
         elif token.type == 'MATCH':
             return self.parse_match()
         elif token.type == 'BREAK':
             self.consume('BREAK')
+            target_label = None
+            if self.peek().type == 'LABEL':
+                target_label = self.consume('LABEL').value
             if self.peek().type == 'SEMICOLON': self.consume('SEMICOLON')
-            return BreakStmt()
+            return BreakStmt(target_label)
         elif token.type == 'CONTINUE':
             self.consume('CONTINUE')
+            target_label = None
+            if self.peek().type == 'LABEL':
+                target_label = self.consume('LABEL').value
             if self.peek().type == 'SEMICOLON': self.consume('SEMICOLON')
-            return ContinueStmt()
+            return ContinueStmt(target_label)
         elif token.type == 'REGION':
             return self.parse_region()
         elif token.type == 'USE':

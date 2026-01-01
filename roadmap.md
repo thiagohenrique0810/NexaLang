@@ -27,7 +27,7 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 ## Phase 2: Core Language Features 🧬
 
 - [x] **Data Types**
-    - [~] Primitive types (`u8`, `i64`, `bool`).
+    - [x] Primitive types (`u8`, `i64`, `bool`).
     - [x] `char`.
 - [x] **Type System 2.0**
   - [x] Structs & Methods
@@ -85,13 +85,14 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] `Option<T>` and `Result<T, E>` (via Enums).
     - [x] `Vec<T>` (Dynamic array).
     - [x] String manipulation.
+    - [x] `unwrap`, `map`, `and_then` helpers for Option/Result.
 - [ ] **Self-Hosting**
     - [~] Rewrite the compiler using NexaLang itself.
       - [x] Stage 1: file IO (`fs::read_file`) + Buffer<u8> sample.
       - [x] Stage 2: minimal lexer in NexaLang (token counting).
-      - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
-      - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
-      - [ ] Stage 5: emit LLVM IR (subset) or transpile to bootstrap IR.
+    - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
+    - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
+    - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`).
     - [ ] Verify `nxc` can compile `nxc`.
 - [ ] **Tooling**
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...`).
@@ -135,9 +136,9 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Standard Library Organization**
   - [x] `std/` directory structure created (`vec`, `option`)
   - [x] Module resolution fixes for local/nested modules
-- [ ] **Hash Maps (HashMap<K, V>)**
-  - [ ] `Hash` trait
-  - [/] `HashMap` implementation (chaining or open addressing)
+- [x] **Hash Maps (HashMap<K, V>)**
+  - [x] `Hash` trait
+  - [x] `HashMap` implementation (basic association list for bootstrap)
 - [x] **Result Type**
   - [x] `Result<T, E>` enum
   - [x] Helper methods (`unwrap`, `is_ok`, etc.)
@@ -168,18 +169,18 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Loop Control**
   - [x] `break` statement
   - [x] `continue` statement
-  - [ ] Labeled for circles (`'label: loop`) { }`
+  - [x] Labeled loops (`'label: loop { }`)
 
 ### 6.5 Developer Experience
 - [x] **Better Error Messages**
   - [x] Show file, line, and column numbers
   - [x] Pretty-print error context with caret (^) pointing to error
   - [x] Suggestion system ("did you mean X?")
-  - [ ] Error codes and documentation links
+  - [x] Error codes and documentation links
 - [ ] **Warnings System**
   - [x] Unused variable warnings
   - [x] Dead code detection
-  - [ ] Type coercion warnings
+  - [x] Type coercion warnings
 
 ## Phase 7: Advanced Type System 🔧
 - [x] **Traits (Interfaces)**
@@ -199,16 +200,16 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] **Closures and Lambdas**
   - [x] `|x, y| x + y` syntax
   - [x] Capturing variables from scope (environment)
-  - [/] `Fn`, `FnMut`, `FnOnce` traits (represented via fat pointers)
+  - [x] `Fn`, `FnMut`, `FnOnce` traits (represented via fat pointers)
 - [x] **High-Order Functions**
-  - [ ] `map`, `filter`, `fold` in standard library
+  - [x] `map`, `filter`, `fold` in standard library
   - [x] Function pointers as arguments
 
 ## Phase 9: Future Directions 🚀
 - [ ] Async/await (future consideration)
 - [ ] Procedural macros
-- [ ] Foreign Function Interface (FFI) for C interop
+- [x] Foreign Function Interface (FFI) for C interop
 - [ ] Package manager (`nxpkg`)
-- [ ] Build system improvements
-- [ ] Standard library expansion (HashMap, File I/O, etc.)
+- [x] Build system improvements (Project support via `nexa.json`)
+- [x] Standard library expansion (HashMap, File I/O, etc.)
 

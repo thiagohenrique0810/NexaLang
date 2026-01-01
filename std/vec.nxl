@@ -78,4 +78,31 @@ impl<T> Vec<T> {
         self.len = self.len - 1;
         return Option::<T>::Some(self.ptr[self.len]);
     }
+
+    fn map<U, F: fn(T) -> U>(&self, f: F) -> Vec<U> {
+        let mut result = Vec::<U>::new();
+        for i in 0..self.len {
+            result.push(f(self.ptr[i]));
+        }
+        return result;
+    }
+
+    fn filter<F: fn(T) -> bool>(&self, f: F) -> Vec<T> {
+        let mut result = Vec::<T>::new();
+        for i in 0..self.len {
+            let item = self.ptr[i];
+            if (f(item)) {
+                result.push(item);
+            }
+        }
+        return result;
+    }
+
+    fn fold<U, F: fn(U, T) -> U>(&self, init: U, f: F) -> U {
+        let mut acc = init;
+        for i in 0..self.len {
+            acc = f(acc, self.ptr[i]);
+        }
+        return acc;
+    }
 }

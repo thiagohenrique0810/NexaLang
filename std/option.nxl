@@ -13,4 +13,40 @@ impl<T> Option<T> {
             }
         }
     }
+
+    fn unwrap_or(self, default: T) -> T {
+        let s = self;
+        match (s) {
+            Some(v) => return v,
+            None => return default,
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        let s = *self;
+        match (s) {
+            Some(_) => return true,
+            None => return false,
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        return !self.is_some();
+    }
+
+    fn map<U, F: fn(T) -> U>(self, f: F) -> Option<U> {
+        let s = self;
+        match (s) {
+            Some(v) => return Option::<U>::Some(f(v)),
+            None => return Option::<U>::None,
+        }
+    }
+
+    fn and_then<U, F: fn(T) -> Option<U>>(self, f: F) -> Option<U> {
+        let s = self;
+        match (s) {
+            Some(v) => return f(v),
+            None => return Option::<U>::None,
+        }
+    }
 }

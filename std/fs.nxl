@@ -1,0 +1,28 @@
+extern "C" {
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fclose(stream: *u8) -> i32;
+    fn fseek(stream: *u8, offset: i64, whence: i32) -> i32;
+    fn ftell(stream: *u8) -> i64;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fwrite(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn malloc(size: i32) -> *u8;
+}
+
+pub fn read_file_as_string(path: string) -> string {
+    let mode = "rb";
+    let f = fopen(cast::<*u8>(path), cast::<*u8>(mode));
+    if (cast::<i64>(f) == 0) {
+        return "";
+    }
+    
+    fseek(f, 0, 2); # SEEK_END
+    let size = ftell(f);
+    fseek(f, 0, 0); # SEEK_SET
+    
+    let buf = malloc(cast::<i32>(size) + 1);
+    fread(buf, 1, size, f);
+    buf[cast::<i32>(size)] = cast::<u8>(0);
+    
+    fclose(f);
+    return cast::<string>(buf);
+}

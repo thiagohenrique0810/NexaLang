@@ -1,0 +1,147 @@
+use std::vec::Vec;
+
+pub struct String {
+    ptr: *u8,
+    len: i32,
+    cap: i32
+}
+
+# Helper internal function
+fn strlen(s: *u8) -> i32 {
+    let i: i32 = 0;
+    while (true) {
+        let p: *u8 = ptr_offset::<u8>(s, i);
+        if (cast::<i32>(*p) == 0) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+impl String {
+    fn new() -> String {
+        return String(cast::<*u8>(0), 0, 0);
+    }
+
+    fn from(s: string) -> String {
+        let raw_ptr = cast::<*u8>(s);
+        let len: i32 = strlen(raw_ptr);
+        let cap: i32 = len + 1;
+        
+        let ptr: *u8 = malloc(cap);
+        memcpy(ptr, raw_ptr, cap);
+        
+        return String(ptr, len, cap);
+    }
+
+    fn len(&self) -> i32 {
+        return self.len;
+    }
+
+    fn as_ptr(&self) -> *u8 {
+        return self.ptr;
+    }
+
+    fn concat(&self, other: string) -> String {
+        let other_ptr = cast::<*u8>(other);
+        let other_len = strlen(other_ptr);
+        
+        let new_len = self.len + other_len;
+        let new_cap = new_len + 1;
+        let new_ptr = malloc(new_cap);
+        
+        if (self.len > 0) {
+            memcpy(new_ptr, self.ptr, self.len);
+        }
+        
+        if (other_len > 0) {
+            let dest = ptr_offset::<u8>(new_ptr, self.len);
+            memcpy(dest, other_ptr, other_len);
+        }
+        
+        let end = ptr_offset::<u8>(new_ptr, new_len);
+        *end = cast::<u8>(0);
+        
+        return String(new_ptr, new_len, new_cap);
+    }
+
+    fn substring(&self, start: i32, length: i32) -> String {
+        if (start < 0 or start >= self.len) {
+            return String::new();
+        }
+        
+        let actual_len = length;
+        if (start + actual_len > self.len) {
+            actual_len = self.len - start;
+        }
+        
+        if (actual_len <= 0) {
+            return String::new();
+        }
+        
+        let new_cap = actual_len + 1;
+        let new_ptr = malloc(new_cap);
+        
+        let src = ptr_offset::<u8>(self.ptr, start);
+        memcpy(new_ptr, src, actual_len);
+        
+        let end = ptr_offset::<u8>(new_ptr, actual_len);
+        *end = cast::<u8>(0);
+        
+        return String(new_ptr, actual_len, new_cap);
+    }
+
+    fn contains(&self, needle: string) -> bool {
+        let n_ptr = cast::<*u8>(needle);
+        let n_len = strlen(n_ptr);
+        
+        if (n_len == 0) { return true; }
+        if (n_len > self.len) { return false; }
+        
+        for i in 0..(self.len - n_len + 1) {
+            let matches = true;
+            for j in 0..n_len {
+                let s_char = *ptr_offset::<u8>(self.ptr, i + j);
+                let n_char = *ptr_offset::<u8>(n_ptr, j);
+                if (s_char != n_char) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) { return true; }
+        }
+        
+        return false;
+    }
+
+    fn split(&self, delimiter: char) -> Vec<String> {
+        let result = Vec::<String>::new();
+        let start = 0;
+        let d_val = cast::<u8>(delimiter);
+        
+        for i in 0..self.len {
+            let c = *ptr_offset::<u8>(self.ptr, i);
+            if (c == d_val) {
+                if (i > start) {
+                    result.push(self.substring(start, i - start));
+                } else {
+                    result.push(String::new());
+                }
+                start = i + 1;
+            }
+        }
+        
+        if (start < self.len) {
+            result.push(self.substring(start, self.len - start));
+        } else if (start == self.len) {
+            result.push(String::new());
+        }
+        
+        return result;
+    }
+
+    fn drop(self) {
+        if (cast::<i64>(self.ptr) != 0) {
+            free(self.ptr);
+        }
+    }
+}

@@ -28,4 +28,28 @@ impl<T, E> Result<T, E> {
             }
         }
     }
+
+    fn unwrap_or(self, default: T) -> T {
+        let s = self;
+        match (s) {
+            Ok(val) => return val,
+            Err(_) => return default,
+        }
+    }
+
+    fn map<U, F: fn(T) -> U>(self, f: F) -> Result<U, E> {
+        let s = self;
+        match (s) {
+            Ok(v) => return Result::<U, E>::Ok(f(v)),
+            Err(e) => return Result::<U, E>::Err(e),
+        }
+    }
+
+    fn and_then<U, F: fn(T) -> Result<U, E>>(self, f: F) -> Result<U, E> {
+        let s = self;
+        match (s) {
+            Ok(v) => return f(v),
+            Err(e) => return Result::<U, E>::Err(e),
+        }
+    }
 }
