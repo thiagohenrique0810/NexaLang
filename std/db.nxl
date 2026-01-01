@@ -1,0 +1,74 @@
+extern "C" {
+    fn sqlite3_open(filename: *u8, ppDb: **u8) -> i32;
+    fn sqlite3_exec(db: *u8, sql: *u8, callback: *u8, arg: *u8, errmsg: **u8) -> i32;
+    fn sqlite3_close(db: *u8) -> i32;
+    
+    fn sqlite3_prepare_v2(db: *u8, sql: *u8, nByte: i32, ppStmt: **u8, pzTail: **u8) -> i32;
+    fn sqlite3_step(stmt: *u8) -> i32;
+    fn sqlite3_finalize(stmt: *u8) -> i32;
+    
+    fn sqlite3_column_text(stmt: *u8, iCol: i32) -> *u8;
+    fn sqlite3_column_int(stmt: *u8, iCol: i32) -> i32;
+}
+
+use std::result::Result;
+use std::option::Option;
+use std::string::String;
+
+pub struct Database {
+    handle: *u8
+}
+
+pub struct Statement {
+    handle: *u8
+}
+
+impl Statement {
+    fn step(&self) -> i32 {
+        return sqlite3_step(self.handle);
+    }
+
+    fn get_int(&self, col: i32) -> i32 {
+        return sqlite3_column_int(self.handle, col);
+    }
+
+    fn get_string(&self, col: i32) -> String {
+        let ptr = sqlite3_column_text(self.handle, col);
+        return String::from(cast::<string>(ptr));
+    }
+
+    fn finalize(self) -> i32 {
+        return sqlite3_finalize(self.handle);
+    }
+}
+
+impl Database {
+    fn open(filename: string) -> Result<Database, i32> {
+        let mut h: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_open(cast::<*u8>(filename), &h);
+        if (rc == 0) {
+            return Result::<Database, i32>::Ok(Database(h));
+        }
+        return Result::<Database, i32>::Err(rc);
+    }
+
+    fn execute(&self, sql: string) -> i32 {
+        return sqlite3_exec(self.handle, cast::<*u8>(sql), cast::<*u8>(0), cast::<*u8>(0), cast::<**u8>(0));
+    }
+
+    fn prepare(&self, sql: string) -> Result<Statement, i32> {
+        let mut stmt_handle: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.handle, cast::<*u8>(sql), -1, &stmt_handle, cast::<**u8>(0));
+        if (rc == 0) {
+            return Result::<Statement, i32>::Ok(Statement(stmt_handle));
+        }
+        return Result::<Statement, i32>::Err(rc);
+    }
+
+    fn close(self) -> i32 {
+        if (cast::<i64>(self.handle) != 0) {
+            return sqlite3_close(self.handle);
+        }
+        return 0;
+    }
+}

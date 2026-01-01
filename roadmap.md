@@ -225,5 +225,5 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] Standard library expansion (HashMap, File I/O, JSON, etc.)
 - [/] Networking Stack (FFI foundation for libcurl + Response handling)
 - [x] Data Serialization (Full JSON parser for Objects and Arrays)
-- [/] Database Drivers (FFI foundation for SQLite)
+- [x] Database Drivers (SQLite abstraction in `std::db` with Query support)
 
