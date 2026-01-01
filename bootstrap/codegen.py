@@ -577,6 +577,16 @@ class CodeGen:
     def generic_visit(self, node):
         raise Exception(f"No visit_{type(node).__name__} method")
 
+    def visit_MacroCallExpr(self, node):
+        if hasattr(node, 'expanded'):
+            return self.visit(node.expanded)
+        raise Exception(f"Macro {node.name}! was not expanded during semantic analysis")
+
+    def visit_AwaitExpr(self, node):
+        # Synchronous fallback: await just executes the expression
+        # (which is usually a CallExpr) and returns its value.
+        return self.visit(node.value)
+
     def visit_UnaryExpr(self, node):
         if node.op == '&':
             # Address Of: We need the address of the operand.

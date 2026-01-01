@@ -53,6 +53,50 @@ impl JsonValue {
             return JsonValue::Number(res);
         }
 
+        # Array [ ... ]
+        if (c == 91) { # [
+            *i = *i + 1;
+            let mut arr = Vec::<JsonValue>::new();
+            while (cast::<i32>(ptr[*i]) != 93) { # ]
+                arr.push(JsonValue::parse_internal(ptr, i));
+                # Skip comma
+                while (cast::<i32>(ptr[*i]) == 32 or cast::<i32>(ptr[*i]) == 44 or cast::<i32>(ptr[*i]) == 10) {
+                    *i = *i + 1;
+                }
+            }
+            *i = *i + 1;
+            return JsonValue::Array(arr);
+        }
+
+        # Object { ... }
+        if (c == 123) { # {
+            *i = *i + 1;
+            let mut obj = HashMap::<String, JsonValue>::new();
+            while (cast::<i32>(ptr[*i]) != 125) { # }
+                let key_val = JsonValue::parse_internal(ptr, i);
+                let key = String::from("");
+                match (key_val) {
+                    Str(s) => { key = s; }
+                    _ => {}
+                }
+                
+                # Skip colon
+                while (cast::<i32>(ptr[*i]) == 32 or cast::<i32>(ptr[*i]) == 58 or cast::<i32>(ptr[*i]) == 10) {
+                    *i = *i + 1;
+                }
+                
+                let val = JsonValue::parse_internal(ptr, i);
+                obj.insert(key, val);
+                
+                # Skip comma
+                while (cast::<i32>(ptr[*i]) == 32 or cast::<i32>(ptr[*i]) == 44 or cast::<i32>(ptr[*i]) == 10) {
+                    *i = *i + 1;
+                }
+            }
+            *i = *i + 1;
+            return JsonValue::Object(obj);
+        }
+
         # Null fallback
         *i = *i + 1;
         return JsonValue::Null;
@@ -73,15 +117,41 @@ impl JsonValue {
                 return content.concat("\"");
             }
             Array(arr) => {
-                let res = String::from("[");
+                let mut res = String::from("[");
                 for i in 0..arr.len() {
                     let val = arr.get(i).unwrap();
-                    # ... recursão e concatenação ...
+                    let s_val = val.stringify();
+                    res = res.concat(s_val.as_ptr());
+                    if (i < arr.len() - 1) {
+                        res = res.concat(", ");
+                    }
                 }
                 return res.concat("]");
             }
             Object(obj) => {
-                return String::from("{...}"); # Implementação completa exigiria mais helpers
+                let mut res = String::from("{");
+                let mut it = obj.iter();
+                let mut first = true;
+                
+                while (true) {
+                    let next_opt = it.next();
+                    match (next_opt) {
+                        Some(kv) => {
+                            if (!first) {
+                                res = res.concat(", ");
+                            }
+                            res = res.concat("\"");
+                            res = res.concat(kv.key.as_ptr());
+                            res = res.concat("\": ");
+                            
+                            let s_val = kv.value.stringify();
+                            res = res.concat(s_val.as_ptr());
+                            first = false;
+                        }
+                        None => { break; }
+                    }
+                }
+                return res.concat("}");
             }
         }
     }

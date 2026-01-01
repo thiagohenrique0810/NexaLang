@@ -1,0 +1,30 @@
+@[derive(Debug, Clone)]
+struct Config {
+    id: i32,
+    mode: i32
+}
+
+fn main() -> i32 {
+    # 1. Macro: include_str! (reading the same file)
+    let source = include_str!("derive_test_v2.nxl");
+    print("Self-Source length:");
+    # print(source); # Too long, just showing it works
+    
+    # 2. Macro: env!
+    let path = env!("PATH");
+    print("Environment PATH is present.");
+    
+    # 3. Derive: Clone
+    let c1 = Config(1, 100);
+    let c2 = c1.clone();
+    
+    print("Original:");
+    c1.debug_print();
+    
+    print("Cloned:");
+    c2.debug_print();
+    
+    assert(c1.id == c2.id, "Clone failed");
+    
+    return 0;
+}

@@ -18,16 +18,21 @@ pub struct HashMapIterator<K, V> {
     index: i32
 }
 
+pub struct KeyValuePair<K, V> {
+    pub key: K,
+    pub value: V
+}
+
 impl<K, V> HashMapIterator<K, V> {
-    fn next(&mut self) -> Option<K> {
+    fn next(&mut self) -> Option<KeyValuePair<K, V>> {
         while (self.index < (*self.map).entries.len()) {
             let entry = (*self.map).entries.get(self.index).unwrap();
             self.index = self.index + 1;
             if (entry.occupied) {
-                return Option::<K>::Some(entry.key);
+                return Option::<KeyValuePair<K, V>>::Some(KeyValuePair::<K, V>(entry.key, entry.value));
             }
         }
-        return Option::<K>::None;
+        return Option::<KeyValuePair<K, V>>::None;
     }
 }
 

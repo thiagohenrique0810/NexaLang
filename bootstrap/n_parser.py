@@ -305,6 +305,12 @@ class AwaitExpr(ASTNode):
         super().__init__()
         self.value = value
 
+class MacroCallExpr(ASTNode):
+    def __init__(self, name, args):
+        super().__init__()
+        self.name = name
+        self.args = args # list of tokens or exprs? Usually exprs for simple macros
+
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
@@ -1189,8 +1195,15 @@ class Parser:
         elif token.type == 'IDENTIFIER':
             peek1 = self.peek(1).type
             
+            # Macro Call: ident!(...)
+            if peek1 == 'NOT' and self.peek(2).type == 'LPAREN':
+                name = self.consume('IDENTIFIER').value
+                self.consume('NOT')
+                args = self.parse_call_arguments()
+                expr = MacroCallExpr(name, args)
+            
             # 1. Generic Instantiation or Templated Variable (cast<T>)
-            if peek1 == 'LT' and token.value in ('cast', 'sizeof', 'ptr_offset', 'slice_from_array', 'ptr_to_int', 'int_to_ptr'):
+            elif peek1 == 'LT' and token.value in ('cast', 'sizeof', 'ptr_offset', 'slice_from_array', 'ptr_to_int', 'int_to_ptr'):
                 name = self.consume('IDENTIFIER').value
                 self.consume('LT')
                 types = []

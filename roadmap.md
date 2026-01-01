@@ -183,13 +183,13 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Error codes and documentation links (E0001-E0007)
 - [x] **Testing & Metaprogramming**
   - [x] Integrated testing framework (`@[test]` attribute + `nx test`)
-  - [x] Derivation system (`@[derive(Debug)]`)
+  - [x] Derivation system (`@[derive(Debug, Clone)]`)
 - [x] **Warnings System**
   - [x] Unused variable warnings
   - [x] Dead code detection
   - [x] Type coercion warnings
   - [x] Integrated testing framework (`@[test]` attribute + `nx test`)
-  - [x] Derivation system (`@[derive(Debug)]`)
+  - [x] Derivation system (`@[derive(Debug, Clone)]`)
 
 ## Phase 7: Advanced Type System 🔧
 - [x] **Traits (Interfaces)**
@@ -215,13 +215,15 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Function pointers as arguments
 
 ## Phase 9: Future Directions 🚀
-- [/] Async/await (foundation implemented in Lexer/Parser)
-- [ ] Procedural macros
+- [/] Async/await (Syntax and Semantic foundation ready; Sync-fallback in Codegen)
+- [x] Procedural macros
+    - [x] Macro call syntax (`ident!(...)`).
+    - [x] Built-in macros: `include_str!`, `env!`.
 - [x] Foreign Function Interface (FFI) for C interop
 - [x] Package manager (`nxpkg`)
 - [x] Build system improvements (Project support via `nexa.json`)
-- [x] Standard library expansion (HashMap, File I/O, etc.)
-- [/] Networking Stack (FFI foundation for libcurl)
-- [/] Data Serialization (Basic JSON parser implemented)
+- [x] Standard library expansion (HashMap, File I/O, JSON, etc.)
+- [/] Networking Stack (FFI foundation for libcurl + Response handling)
+- [x] Data Serialization (Full JSON parser for Objects and Arrays)
 - [/] Database Drivers (FFI foundation for SQLite)
 

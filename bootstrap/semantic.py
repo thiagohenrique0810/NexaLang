@@ -237,7 +237,7 @@ class SemanticAnalyzer:
         self.error(f"No overload of '{base_name}' matches arguments: ({', '.join(arg_types)})", node)
 
     def generate_derive(self, node, trait):
-        from n_parser import ImplDef, FunctionDef, CallExpr, StringLiteral, MemberAccess, VariableExpr, ReturnStmt, IntegerLiteral
+        from n_parser import ImplDef, FunctionDef, CallExpr, StringLiteral, MemberAccess, VariableExpr, ReturnStmt, IntegerLiteral, MethodCall
         if trait == 'Debug':
             # Generate Debug for Struct
             if isinstance(node, StructDef):
@@ -257,7 +257,69 @@ class SemanticAnalyzer:
                 
                 method = FunctionDef("debug_print", [("self", f"&{node.name}")], "void", body)
                 return [ImplDef(node.name, [method])]
+        
+        elif trait == 'Clone':
+            if isinstance(node, StructDef):
+                # fn clone(&self) -> Self
+                args = []
+                for fname, ftype in node.fields:
+                    # Recursive clone for each field: self.field.clone()
+                    field_access = MemberAccess(VariableExpr("self"), fname)
+                    # For primitives we could just use them directly, 
+                    # but calling .clone() is safer if we have overloaded it.
+                    # Simplified: if it's primitive i32/f32/u8/bool just copy
+                    if ftype in ('i32', 'f32', 'u8', 'bool', 'i64'):
+                        args.append(field_access)
+                    else:
+                        args.append(MethodCall(field_access, "clone", []))
+                
+                body = [ReturnStmt(CallExpr(node.name, args))]
+                method = FunctionDef("clone", [("self", f"&{node.name}")], node.name, body)
+                return [ImplDef(node.name, [method])]
+                
         return []
+
+    def visit_AwaitExpr(self, node):
+        if not self.current_function or not self.current_function.is_async:
+            self.error("Await is only allowed inside async functions", node)
+        
+        inner_t = self.visit(node.value)
+        # In a real implementation, Await expects a Future<T> and returns T.
+        # For this bootstrap, we simplify: if it's not 'void', return the type.
+        node.type_name = inner_t
+        return inner_t
+
+    def visit_MacroCallExpr(self, node):
+        import os
+        if node.name == 'include_str':
+            if len(node.args) != 1: self.error("include_str! expects 1 argument", node)
+            from n_parser import StringLiteral
+            path_node = node.args[0]
+            if not isinstance(path_node, StringLiteral): self.error("include_str! expects string literal", node)
+            
+            # Find relative to source
+            base_dir = self.current_dir if hasattr(self, 'current_dir') else "."
+            full_path = os.path.join(base_dir, path_node.value)
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                node.expanded = StringLiteral(content)
+                return 'string'
+            except Exception as e:
+                self.error(f"Could not read file '{full_path}': {e}", node)
+                
+        elif node.name == 'env':
+            if len(node.args) != 1: self.error("env! expects 1 argument", node)
+            from n_parser import StringLiteral
+            var_node = node.args[0]
+            if not isinstance(var_node, StringLiteral): self.error("env! expects string literal", node)
+            
+            val = os.environ.get(var_node.value, "")
+            node.expanded = StringLiteral(val)
+            return 'string'
+            
+        else:
+            self.error(f"Unknown macro: {node.name}!", node)
 
     def analyze(self, ast):
         self.ast_root = ast
@@ -353,13 +415,13 @@ class SemanticAnalyzer:
                  funcs = [funcs]
                  
              for func in funcs:
-             if not func.used and not func.is_pub and not name.startswith('std_'):
-                  # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
-                  if '::' in name: continue # Skip methods for now to avoid noise
-                  if self.current_module == 'std': continue # Skip std lib internal
-                  
-                  # Find original line/col? FuncDef has it.
-                  self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
+                  if not func.used and not func.is_pub and not name.startswith('std_'):
+                       # Check if it's a method implementation or trait method (simplification: skip methods for now or refine)
+                       if '::' in name: continue # Skip methods for now to avoid noise
+                       if self.current_module == 'std': continue # Skip std lib internal
+                       
+                       # Find original line/col? FuncDef has it.
+                       self.warnings.append((f"Dead code: Function '{name}' is never used", func.line, func.column))
 
         for name, used in self.struct_used.items():
              if not used and not name.startswith('std_'):
@@ -469,7 +531,7 @@ class SemanticAnalyzer:
                   if i == 0 and pn == 'self':
                        new_params.append((pn, pt))
                   else:
-                  new_params.append((pn, self.apply_submap(pt, mapping)))
+                       new_params.append((pn, self.apply_submap(pt, mapping)))
              method.params = new_params
              
              # Update body
@@ -580,10 +642,10 @@ class SemanticAnalyzer:
              fields_dict = self.structs[base_type]
              lookup_type = base_type
         else:
-        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
-        if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
-        elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
-        else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
+             lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
+             if lookup_type in self.structs: fields_dict = self.structs[lookup_type]
+             elif lookup_type in self.generic_structs: fields_dict = {f[0]: f[1] for f in self.generic_structs[lookup_type].fields}
+             else: raise Exception(f"Type Error: access member '{node.member}' on non-struct type '{obj_type}'")
         
         if node.member not in fields_dict:
              suggestion = self.get_suggestion(node.member, list(fields_dict.keys()))

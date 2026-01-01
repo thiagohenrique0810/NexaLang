@@ -3,6 +3,15 @@ extern "C" {
     fn curl_easy_setopt(handle: *u8, option: i32, param: *u8) -> i32;
     fn curl_easy_perform(handle: *u8) -> i32;
     fn curl_easy_cleanup(handle: *u8);
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+}
+
+use std::string::String;
+
+pub struct Response {
+    pub status: i32,
+    pub body: String
 }
 
 pub struct HttpClient {
@@ -12,13 +21,19 @@ pub struct HttpClient {
 impl HttpClient {
     fn new() -> HttpClient {
         let h = curl_easy_init();
+        # Standard configuration could go here
         return HttpClient(h);
     }
 
-    fn get(&self, url: string) -> i32 {
+    fn get(&self, url: string) -> Response {
         # CURLOPT_URL = 10002
         curl_easy_setopt(self.handle, 10002, cast::<*u8>(url));
-        return curl_easy_perform(self.handle);
+        
+        # In a real implementation, we would set a WRITEFUNCTION callback.
+        # For this bootstrap milestone, we return a mock status and the performance result.
+        let rc = curl_easy_perform(self.handle);
+        
+        return Response(rc, String::from("Response body capture pending full callback support"));
     }
 
     fn drop(self) {
