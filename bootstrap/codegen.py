@@ -365,6 +365,8 @@ class CodeGen:
             return ir.IntType(64)
         elif type_name == 'f32':
             return ir.FloatType()
+        elif type_name == 'f64':
+            return ir.DoubleType()
         elif type_name == 'u8':
             return ir.IntType(8)
         elif type_name == 'void':
@@ -1483,6 +1485,9 @@ class CodeGen:
         elif node.op == 'EQEQ':
             if left.type == ir.FloatType():
                 return self.builder.fcmp_ordered('==', left, right, name="feqtmp")
+            # Handle pointer == 0 comparison
+            if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
+                right = ir.Constant(left.type, None) # Convert 0 to null pointer
             return self.builder.icmp_signed('==', left, right, name="eqtmp")
         elif node.op == 'NEQ':
             if left.type == ir.FloatType():
@@ -1783,10 +1788,19 @@ class CodeGen:
             # Int to int
             if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
                 if val.type.width < target_ty.width:
-                    return self.builder.zext(val, target_ty)
+                    return self.builder.sext(val, target_ty)
                 elif val.type.width > target_ty.width:
                     return self.builder.trunc(val, target_ty)
                 return val
+            
+            # Float to Float
+            if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_ty, (ir.FloatType, ir.DoubleType)):
+                if isinstance(val.type, ir.FloatType) and isinstance(target_ty, ir.DoubleType):
+                    return self.builder.fpext(val, target_ty)
+                elif isinstance(val.type, ir.DoubleType) and isinstance(target_ty, ir.FloatType):
+                    return self.builder.fptrunc(val, target_ty)
+                return val
+                
             return self.builder.bitcast(val, target_ty)
 
         elif isinstance(callee_name, str) and callee_name.startswith('sizeof<'):
@@ -1984,7 +1998,6 @@ class CodeGen:
             bval = ir.Constant(buf_struct_ty, ir.Undefined)
             bval = self.builder.insert_value(bval, buf, 0)
             bval = self.builder.insert_value(bval, sz_i32, 1)
-            bval = self.builder.insert_value(bval, sz_i32, 2)
             return bval
 
         elif callee_name in ("fs::write_file", "fs::append_file"):
@@ -2014,9 +2027,22 @@ class CodeGen:
         if isinstance(callee_func_name, str) and callee_func_name in self.module.globals:
             callee_func = self.module.globals[callee_func_name]
             processed_args = [self.visit(arg) for arg in node.args]
+            # ... simple cast ...
             for i in range(min(len(processed_args), len(callee_func.function_type.args))):
-                if processed_args[i].type != callee_func.function_type.args[i]:
-                    processed_args[i] = self.builder.bitcast(processed_args[i], callee_func.function_type.args[i])
+                expected = callee_func.function_type.args[i]
+                actual = processed_args[i]
+                if actual.type != expected:
+                    if isinstance(actual.type, ir.PointerType) and isinstance(expected, ir.IntType):
+                        processed_args[i] = self.builder.ptrtoint(actual, expected)
+                    elif isinstance(actual.type, ir.IntType) and isinstance(expected, ir.PointerType):
+                        processed_args[i] = self.builder.inttoptr(actual, expected)
+                    elif isinstance(actual.type, ir.IntType) and isinstance(expected, ir.IntType):
+                        if actual.type.width < expected.width:
+                            processed_args[i] = self.builder.sext(actual, expected)
+                        else:
+                            processed_args[i] = self.builder.trunc(actual, expected)
+                    else:
+                        processed_args[i] = self.builder.bitcast(actual, expected)
             return self.builder.call(callee_func, processed_args)
 
         raise Exception(f"Unknown function call: {callee_name}")
