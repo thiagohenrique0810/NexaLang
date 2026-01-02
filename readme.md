@@ -13,13 +13,13 @@ NexaLang is a modern, high-performance systems programming language designed to 
 ### 🧠 Hybrid Memory Management
 Safe by default, manual when you need it. NexaLang uses **Affine Ownership** and **RAII (Automatic Drop)** to prevent leaks at compile time, while offering **Region-based Arenas** for high-performance allocations.
 
-### ⚡ Native GPU Kernels
-Write kernels directly in NexaLang. Treat the GPU as a first-class citizen with seamless dispatch and SPIR-V/Vulkan support.
+### ⚡ Native GPU Kernels (Silicon Mode)
+Write kernels directly in NexaLang. Treat the GPU as a first-class citizen with **Hardware Silicon Mode**. Support for **AMD Radeon (RX 580+)** and **NVIDIA** via high-performance OpenCL hardware dispatch.
 
 ```nexalang
 kernel fn compute_physics(particles: Buffer<Particle>) {
     let i = gpu::global_id()
-    # ... logic runs on GPU ...
+    # ... logic runs directly on GPU Stream Processors ...
 }
 ```
 

@@ -1598,6 +1598,32 @@ class CodeGen:
 
         self.scopes.pop()
 
+    def _get_or_create_string(self, string_val, name="str"):
+        if not string_val.endswith('\0'):
+            string_val += '\0'
+        
+        # Check if already exists
+        if hasattr(self, "_strings") and string_val in self._strings:
+            return self.builder.bitcast(self._strings[string_val], ir.IntType(8).as_pointer())
+        
+        if not hasattr(self, "_strings"):
+            self._strings = {}
+            
+        # Create global constant
+        encoded = string_val.encode('utf-8')
+        arr_ty = ir.ArrayType(ir.IntType(8), len(encoded))
+        gv = ir.GlobalVariable(self.module, arr_ty, name=f"{name}.{len(self._strings)}")
+        gv.global_constant = True
+        gv.initializer = ir.Constant(arr_ty, bytearray(encoded))
+        gv.linkage = 'internal'
+        
+        self._strings[string_val] = gv
+        return self.builder.bitcast(gv, ir.IntType(8).as_pointer())
+
+    def visit_StringLiteral(self, node, name="str", value_override=None):
+        val = value_override if value_override is not None else node.value
+        return self._get_or_create_string(val, name=name)
+
     def visit_IntegerLiteral(self, node):
         # Infer i32 for simplicity or u8/i64 if context?
         # For now return i32 constant
@@ -1733,8 +1759,11 @@ class CodeGen:
         if isinstance(callee, VariableExpr):
             callee = callee.name
             
-        if isinstance(callee, str) and callee.startswith('cast<'):
-            target_ty_name = callee[5:].rstrip('>')
+        callee_name = callee
+        
+        # 1. Built-in generic functions (Intrinsics)
+        if isinstance(callee_name, str) and callee_name.startswith('cast<'):
+            target_ty_name = callee_name[5:].rstrip('>')
             target_ty = self.get_llvm_type(target_ty_name)
             val = self.visit(node.args[0])
             
@@ -1756,691 +1785,199 @@ class CodeGen:
                 return val
             return self.builder.bitcast(val, target_ty)
 
-        elif isinstance(callee, str) and callee.startswith('sizeof<'):
-            type_name = callee[7:].rstrip('>')
+        elif isinstance(callee_name, str) and callee_name.startswith('sizeof<'):
+            type_name = callee_name[7:].rstrip('>')
             llvm_ty = self.get_llvm_type(type_name)
-
             null_ptr = ir.Constant(llvm_ty.as_pointer(), None)
             gep = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)])
             return self.builder.ptrtoint(gep, ir.IntType(32))
 
-        elif isinstance(callee, str) and callee.startswith('ptr_offset<'):
+        elif isinstance(callee_name, str) and callee_name.startswith('ptr_offset<'):
             ptr_val = self.visit(node.args[0])
             idx_val = self.visit(node.args[1])
             return self.builder.gep(ptr_val, [idx_val])
-        
-        callee_name = callee
-        if not isinstance(callee_name, str):
-            # Dynamic call (e.g. result of expression)
-            fat_ptr = self.visit(callee_name)
-            callee_type_name = getattr(callee_name, 'type_name', None)
-            if not callee_type_name or not callee_type_name.startswith('fn('):
-                 raise Exception("Dynamic call requires callee to have 'fn' type")
-            return self._emit_closure_call(fat_ptr, callee_type_name, node.args)
-        
-        # Now callee_name is a string. Check if it's a local variable (function pointer)
-        for scope in reversed(self.scopes):
-            if callee_name in scope:
-                entry = scope[callee_name]
-                if isinstance(entry, tuple) and len(entry) >= 2:
-                    ptr, ptype_name = entry
-                    # If it's a fat pointer (fn type), load and call
-                    if isinstance(ptype_name, str) and ptype_name.startswith('fn('):
-                        fat_ptr = self.builder.load(ptr)
-                        return self._emit_closure_call(fat_ptr, ptype_name, node.args)
 
+        # 2. Local variables / Function pointers
+        if isinstance(callee_name, str):
+            for scope in reversed(self.scopes):
+                if callee_name in scope:
+                    entry = scope[callee_name]
+                    if isinstance(entry, tuple) and len(entry) >= 2:
+                        ptr, ptype_name = entry
+                        if isinstance(ptype_name, str) and ptype_name.startswith('fn('):
+                            fat_ptr = self.builder.load(ptr)
+                            return self._emit_closure_call(fat_ptr, ptype_name, node.args)
+
+        # 3. Specific Intrinsics
         if callee_name == "print":
-            # Generate printf
-            # Check arg type
             val = self.visit(node.args[0])
-
             voidptr_ty = ir.IntType(8).as_pointer()
-
             arg_node = node.args[0] if node.args else None
             arg_type_name = getattr(arg_node, "type_name", None)
             int_like = False
-
             if arg_type_name == "char":
                 fmt_str = self.visit_StringLiteral(None, name="fmt_c", value_override="%c\n\0")
-                if val.type != ir.IntType(32):
-                    val = self.builder.zext(val, ir.IntType(32))
+                if val.type != ir.IntType(32): val = self.builder.zext(val, ir.IntType(32))
                 int_like = True
-            elif arg_type_name == "bool":
+            elif arg_type_name in ("bool", "u8", "i32"):
                 fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
-                if val.type != ir.IntType(32):
-                    val = self.builder.zext(val, ir.IntType(32))
-                int_like = True
-            elif arg_type_name == "u8":
-                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
-                if val.type != ir.IntType(32):
-                    val = self.builder.zext(val, ir.IntType(32))
-                int_like = True
-            elif val.type == ir.IntType(32):
-                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+                if val.type != ir.IntType(32): val = self.builder.zext(val, ir.IntType(32))
                 int_like = True
             elif val.type == ir.FloatType():
-                # printf("%f") expects double
                 fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
             else:
-                # Assume string
                 fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
-
-            fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
-
-            if int_like:
-                self.builder.call(self.printf, [fmt_arg, val])
-            elif val.type == ir.FloatType():
-                dbl = self.builder.fpext(val, ir.DoubleType())
-                self.builder.call(self.printf, [fmt_arg, dbl])
-            else:
-                val_arg = self.builder.bitcast(val, voidptr_ty)
-                self.builder.call(self.printf, [fmt_arg, val_arg])
-            # `print` is a statement-level intrinsic (void).
-            return None
-
-        elif callee_name == "fs::read_file":
-            # fs::read_file(path: string) -> Buffer<u8>
-            if len(node.args) != 1:
-                raise Exception("fs::read_file expects 1 arg")
-            if not hasattr(node, "type_name"):
-                raise Exception("CodeGen Error: fs::read_file CallExpr missing type_name annotation from Semantic phase.")
-
-            path = self.visit(node.args[0])  # i8*
-            void_ptr = ir.IntType(8).as_pointer()
-            i32 = ir.IntType(32)
-            i64 = ir.IntType(64)
-
-            # mode = "rb"
-            mode_arr = self.visit_StringLiteral(None, name="fs_mode_rb", value_override="rb\0")
-            mode = self.builder.bitcast(mode_arr, void_ptr)
-            path_c = self.builder.bitcast(path, void_ptr) if path.type != void_ptr else path
-
-            f = self.builder.call(self.fopen, [path_c, mode], name="f")
-
-            # if (!f) exit(1)
-            is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
-            with self.builder.if_then(is_null):
-                self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
-
-            # fseek(f, 0, 2)  (SEEK_END)
-            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
-            sz = self.builder.call(self.ftell, [f], name="file_size")
-            # fseek(f, 0, 0)  (SEEK_SET)
-            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 0)])
-
-            # malloc(sz + 1)
-            sz_i32 = self.builder.trunc(sz, i32, name="sz_i32")
-            cap = self.builder.add(sz_i32, ir.Constant(i32, 1), name="cap")
-            buf_void = self.builder.call(self.malloc, [cap], name="buf_void")
-            buf = self.builder.bitcast(buf_void, ir.IntType(8).as_pointer(), name="buf_u8")
-
-            # fread(buf, 1, sz, f)
-            _read = self.builder.call(self.fread, [buf_void, ir.Constant(i64, 1), sz, f])
-            _ = self.builder.call(self.fclose, [f])
-
-            # Result is Buffer<u8> { ptr, len, cap }
-            # Buffer struct was injected by SemanticAnalyzer
-            buf_struct_ty = self.get_llvm_type("Buffer<u8>")
-            bval = ir.Constant(buf_struct_ty, ir.Undefined)
-            bval = self.builder.insert_value(bval, buf, 0)
-            bval = self.builder.insert_value(bval, sz_i32, 1)
-            bval = self.builder.insert_value(bval, sz_i32, 2) # cap = len for simplicity
-            return bval
-
-            # fseek(f, 0, 2)  (SEEK_END)
-            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
-            sz = self.builder.call(self.ftell, [f], name="file_size")
-            # fseek(f, 0, 0)  (SEEK_SET)
-            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 0)])
-
-            # malloc(sz + 1)
-            sz_i32 = self.builder.trunc(sz, i32, name="sz_i32")
-            cap = self.builder.add(sz_i32, ir.Constant(i32, 1), name="cap")
-            buf_void = self.builder.call(self.malloc, [cap], name="buf_void")
-            buf = self.builder.bitcast(buf_void, ir.IntType(8).as_pointer(), name="buf_u8")
-
-            # fread(buf, 1, sz, f)
-            _read = self.builder.call(self.fread, [buf_void, ir.Constant(i64, 1), sz, f])
-            _ = self.builder.call(self.fclose, [f])
-
-            # null-terminate: buf[sz] = 0
-            end_ptr = self.builder.gep(buf, [sz_i32], name="end_ptr")
-            self.builder.store(ir.Constant(ir.IntType(8), 0), end_ptr)
-
-            # return Buffer<u8> { ptr: u8*, len: i32 }
-            buf_ty = self.get_llvm_type(node.type_name)
-            out = ir.Constant(buf_ty, ir.Undefined)
-            out = self.builder.insert_value(out, buf, 0)
-            out = self.builder.insert_value(out, sz_i32, 1)
-            return out
-
-        elif node.callee == "fs::write_file" or node.callee == "fs::append_file":
-            if len(node.args) != 3:
-                raise Exception(f"{node.callee} expects 3 args")
-            path = self.visit(node.args[0])  # i8*
-            data = self.visit(node.args[1])  # i8* (string) or u8*
-            length = self.visit(node.args[2])  # i32
-
-            void_ptr = ir.IntType(8).as_pointer()
-            i32 = ir.IntType(32)
-            i64 = ir.IntType(64)
-
-            path_c = self.builder.bitcast(path, void_ptr) if path.type != void_ptr else path
-            data_c = self.builder.bitcast(data, void_ptr) if data.type != void_ptr else data
-
-            mode = "wb\0" if node.callee == "fs::write_file" else "ab\0"
-            mode_arr = self.visit_StringLiteral(None, name="fs_mode_write", value_override=mode)
-            mode_ptr = self.builder.bitcast(mode_arr, void_ptr)
-
-            f = self.builder.call(self.fopen, [path_c, mode_ptr], name="f")
-            is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
-            with self.builder.if_then(is_null):
-                self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
-
-            nmemb = self.builder.zext(length, i64, name="len_i64")
-            _written = self.builder.call(self.fwrite, [data_c, ir.Constant(i64, 1), nmemb, f])
-            _ = self.builder.call(self.fclose, [f])
-            return None
-
-        elif node.callee == "slice_from_array":
-            # slice_from_array(&arr) where arr is [T:N]
-            if len(node.args) != 1:
-                raise Exception("slice_from_array expects 1 arg")
-            arr_ptr = self.visit(node.args[0])
-            if not isinstance(arr_ptr.type, ir.PointerType):
-                raise Exception("slice_from_array expects pointer to array")
-            if not hasattr(node, "type_name"):
-                raise Exception("CodeGen Error: slice_from_array CallExpr missing type_name annotation from Semantic phase.")
-            if not isinstance(arr_ptr.type.pointee, ir.ArrayType):
-                raise Exception("slice_from_array expects pointer to [N x T]")
-
-            slice_ty = self.get_llvm_type(node.type_name)
-
-            zero = ir.Constant(ir.IntType(32), 0)
-            data_ptr = self.builder.gep(arr_ptr, [zero, zero], name="slice_data")
-
-            n = getattr(node, "slice_len", None)
-            if n is None:
-                raise Exception("CodeGen Error: slice_from_array CallExpr missing slice_len")
-            len_val = ir.Constant(ir.IntType(32), int(n))
-
-            s = ir.Constant(slice_ty, ir.Undefined)
-            s = self.builder.insert_value(s, data_ptr, 0)
-            s = self.builder.insert_value(s, len_val, 1)
-            return s
-
-        elif node.callee == 'panic':
-            # Print message
-            msg_val = self.visit(node.args[0]) # Assuming string literal
-
-            # Hardcoded "PANIC: " prefix
-            prefix = self.visit_StringLiteral(None, name="panic_prefix", value_override="PANIC: ")
-
-            voidptr_ty = ir.IntType(8).as_pointer()
-            fmt_prefix = self.builder.bitcast(prefix, voidptr_ty)
-
-            # Print "PANIC: "
-            # We need a format string for pure string printing? Or just printf(str)
-            # printf(str) works if str contains no %
-            # Let's verify visit_StringLiteral returns a [N x i8]*
-
-            # Reuse helper for printing string:
-            fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
-            fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
-
-            prefix_arg = self.builder.bitcast(prefix, voidptr_ty)
-            self.builder.call(self.printf, [fmt_arg, prefix_arg])
-
-            msg_arg = self.builder.bitcast(msg_val, voidptr_ty)
-            self.builder.call(self.printf, [fmt_arg, msg_arg])
-
-            # Call exit(1)
-            one = ir.Constant(ir.IntType(32), 1)
-            self.builder.call(self.exit_func, [one])
-
-            # Unreachable instruction to terminate block
-            self.builder.unreachable()
-            return None
-
-        elif node.callee == 'malloc':
-            # Call malloc
-            size_val = self.visit(node.args[0])
-            return self.builder.call(self.malloc, [size_val])
-
-        elif node.callee == 'free':
-            ptr_val = self.visit(node.args[0])
-            # Cast to void* (i8*) if needed?
-            # self.free expects i8*.
-            if ptr_val.type != ir.IntType(8).as_pointer():
-                ptr_val = self.builder.bitcast(ptr_val, ir.IntType(8).as_pointer())
-            return self.builder.call(self.free, [ptr_val])
-
-        elif node.callee == 'realloc':
-            ptr_val = self.visit(node.args[0])
-            size_val = self.visit(node.args[1])
-
-            if ptr_val.type != ir.IntType(8).as_pointer():
-                ptr_val = self.builder.bitcast(ptr_val, ir.IntType(8).as_pointer())
-
-            return self.builder.call(self.realloc, [ptr_val, size_val])
-
-        elif node.callee == 'assert':
-            cond_val = self.visit(node.args[0])
-            msg_val = self.visit(node.args[1]) # Should be string
-
-            # Compare cond != 0
-            zero = ir.Constant(ir.IntType(32), 0)
-            cmp = self.builder.icmp_signed('!=', cond_val, zero, name="assert_cond")
-
-            # Create blocks
-            fail_bb = self.builder.append_basic_block(name="assert_fail")
-            cont_bb = self.builder.append_basic_block(name="assert_cont")
-
-            self.builder.cbranch(cmp, cont_bb, fail_bb)
-
-            # Fail Block
-            self.builder.position_at_end(fail_bb)
-
-            # Reuse panic logic? Or just manually do it to avoid recursion issues if helper
-            # Let's manually print assertion failed
-
-            # Print "ASSERTION FAILED: "
-            voidptr_ty = ir.IntType(8).as_pointer()
-            fails_str = self.visit_StringLiteral(None, name="assert_prefix", value_override="ASSERTION FAILED: ")
-            fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
-            fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
-            fails_arg = self.builder.bitcast(fails_str, voidptr_ty)
-
-            self.builder.call(self.printf, [fmt_arg, fails_arg])
-
-            msg_arg = self.builder.bitcast(msg_val, voidptr_ty)
-            self.builder.call(self.printf, [fmt_arg, msg_arg])
-
-            one = ir.Constant(ir.IntType(32), 1)
-            self.builder.call(self.exit_func, [one])
-            self.builder.unreachable()
-
-            # Continue Block
-            self.builder.position_at_end(cont_bb)
-            return ir.Constant(ir.IntType(32), 0) # void check returns 0
-
-        # Enum Variant Instantiation (Enum::Variant)
-        # Note: only treat `::` calls as enum constructors if the LHS is a known enum.
-        elif isinstance(node.callee, str) and '::' in node.callee:
-            lhs, rhs = node.callee.split('::', 1)
-            enum_key = lhs
-            if enum_key not in self.enum_definitions and '<' in enum_key:
-                 enum_key = enum_key.split('<')[0]
             
-            if enum_key in self.enum_definitions:
-                enum_ty, max_size = self.enum_definitions[enum_key]
-                tag = self.enum_types[enum_key][rhs]
-
-                # Create struct { tag, padding }
-                enum_val = ir.Constant(enum_ty, ir.Undefined)
-
-                # Set Tag
-                tag_val = ir.Constant(ir.IntType(32), tag)
-                enum_val = self.builder.insert_value(enum_val, tag_val, 0)
-
-                # Set Payload
-                if node.args:
-                    payload_val = self.visit(node.args[0])
-
-                    # Allocate temp enum
-                    enum_ptr = self.builder.alloca(enum_ty)
-                    self.builder.store(enum_val, enum_ptr)
-
-                    # Get pointer to data field (index 1)
-                    zero = ir.Constant(ir.IntType(32), 0)
-                    one = ir.Constant(ir.IntType(32), 1)
-                    data_ptr = self.builder.gep(enum_ptr, [zero, one])
-
-                    # Cast data_ptr to payload type pointer (e.g. i32*)
-                    payload_ptr = self.builder.bitcast(data_ptr, payload_val.type.as_pointer())
-                    self.builder.store(payload_val, payload_ptr)
-
-                    # Load back
-                    return self.builder.load(enum_ptr)
+            fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
+            if int_like: self.builder.call(self.printf, [fmt_arg, val])
+            elif val.type == ir.FloatType(): self.builder.call(self.printf, [fmt_arg, self.builder.fpext(val, ir.DoubleType())])
+            else:
+                # Converte para void* apenas se for um ponteiro
+                if isinstance(val.type, ir.PointerType):
+                    val_arg = self.builder.bitcast(val, voidptr_ty)
                 else:
-                    return enum_val
+                    # Se for um valor escalar (ex: i32 de um loop), passa diretamente se o printf aceitar, 
+                    # ou converte para o tipo que o format string espera.
+                    val_arg = val
+                self.builder.call(self.printf, [fmt_arg, val_arg])
+            return None
 
-        elif isinstance(node.callee, str) and (node.callee in self.struct_types or ('<' in node.callee and node.callee.split('<')[0] in self.struct_types)):
-            # Struct Instantiation
-            struct_key = node.callee
+        elif callee_name == "gpu::global_id":
+            if self.target == "spirv" and hasattr(self, "spirv_global_invocation_id"):
+                gid = self.builder.load(self.spirv_global_invocation_id, name="spirv_gid")
+                return self.builder.extract_element(gid, ir.Constant(ir.IntType(32), 0), name="spirv_gid_x")
+            if not hasattr(self, "gpu_global_id") or self.gpu_global_id is None:
+                self.gpu_global_id = ir.GlobalVariable(self.module, ir.IntType(32), name="__gpu_global_id_sim")
+                self.gpu_global_id.initializer = ir.Constant(ir.IntType(32), 0)
+                self.gpu_global_id.linkage = "internal"
+            return self.builder.load(self.gpu_global_id, name="gpu_global_id")
+
+        elif callee_name == "gpu::dispatch":
+            if len(node.args) < 2: raise Exception("gpu::dispatch expects at least 2 args")
+            fn_ref = node.args[0]
+            if not isinstance(fn_ref, VariableExpr): raise Exception("gpu::dispatch first argument must be a function name")
+            kernel_name = fn_ref.name
+            threads_val = self.visit(node.args[1])
+            gpu_args = [self.visit(node.args[i]) for i in range(2, len(node.args))]
+            if self.target == "native":
+                if "__nexa_gpu_dispatch" not in self.module.globals:
+                    void_ptr = ir.IntType(8).as_pointer()
+                    dispatch_ty = ir.FunctionType(ir.VoidType(), [void_ptr, ir.IntType(32), ir.IntType(32), void_ptr.as_pointer()])
+                    ir.Function(self.module, dispatch_ty, name="__nexa_gpu_dispatch")
+                dispatch_fn = self.module.globals["__nexa_gpu_dispatch"]
+                k_name_const = self._get_or_create_string(kernel_name)
+                i32 = ir.IntType(32)
+                arg_count = len(gpu_args)
+                args_array = self.builder.alloca(ir.IntType(8).as_pointer(), size=ir.Constant(i32, max(1, arg_count)), name="gpu_args_array")
+                for i, arg in enumerate(gpu_args):
+                    arg_ptr = self.builder.alloca(arg.type)
+                    self.builder.store(arg, arg_ptr)
+                    void_arg = self.builder.bitcast(arg_ptr, ir.IntType(8).as_pointer())
+                    ptr_to_slot = self.builder.gep(args_array, [ir.Constant(i32, i)])
+                    self.builder.store(void_arg, ptr_to_slot)
+                self.builder.call(dispatch_fn, [k_name_const, threads_val, ir.Constant(i32, arg_count), args_array])
+            return None
+
+        # 4. Struct Instantiation
+        if isinstance(callee_name, str) and (callee_name in self.struct_types or ('<' in callee_name and callee_name.split('<')[0] in self.struct_types)):
+            struct_key = callee_name
             if '<' in struct_key and struct_key not in self.struct_types:
-                 struct_key = struct_key.split('<')[0]
+                 base_name = struct_key.split('<')[0]
+                 if base_name in self.struct_types: struct_key = base_name
+                 else:
+                     struct_ty = self.module.context.get_identified_type(struct_key)
+                     self.struct_types[struct_key] = struct_ty
             struct_ty = self.struct_types[struct_key]
             struct_val = ir.Constant(struct_ty, ir.Undefined)
-
             for i, arg in enumerate(node.args):
                 arg_val = self.visit(arg)
                 struct_val = self.builder.insert_value(struct_val, arg_val, i)
             return struct_val
 
+        # 5. Enum Variant Instantiation
+        if isinstance(node.callee, str) and '::' in node.callee:
+            parts = node.callee.split('::', 1)
+            enum_key = parts[0]
+            if enum_key not in self.enum_definitions and '<' in enum_key:
+                 enum_key = enum_key.split('<')[0]
+            if enum_key in self.enum_definitions:
+                enum_ty, max_size = self.enum_definitions[enum_key]
+                tag = self.enum_types[enum_key][parts[1]]
+                enum_val = ir.Constant(enum_ty, ir.Undefined)
+                tag_val = ir.Constant(ir.IntType(32), tag)
+                enum_val = self.builder.insert_value(enum_val, tag_val, 0)
+                if node.args:
+                    payload_val = self.visit(node.args[0])
+                    enum_ptr = self.builder.alloca(enum_ty)
+                    self.builder.store(enum_val, enum_ptr)
+                    zero = ir.Constant(ir.IntType(32), 0)
+                    one = ir.Constant(ir.IntType(32), 1)
+                    data_ptr = self.builder.gep(enum_ptr, [zero, one])
+                    payload_ptr = self.builder.bitcast(data_ptr, payload_val.type.as_pointer())
+                    self.builder.store(payload_val, payload_ptr)
+                    return self.builder.load(enum_ptr)
+                return enum_val
 
-        elif isinstance(node.callee, str) and node.callee.startswith('cast<'):
-            val = self.visit(node.args[0])
-            target_type_name = node.callee[5:].rstrip('>')
+        # 6. Built-in complex intrinsics
+        if callee_name == "fs::read_file":
+            path = self.visit(node.args[0])
+            void_ptr = ir.IntType(8).as_pointer()
+            i32 = ir.IntType(32)
+            i64 = ir.IntType(64)
+            mode_arr = self.visit_StringLiteral(None, name="fs_mode_rb", value_override="rb\0")
+            mode = self.builder.bitcast(mode_arr, void_ptr)
+            f = self.builder.call(self.fopen, [path, mode], name="f")
+            is_null = self.builder.icmp_unsigned("==", f, ir.Constant(void_ptr, None))
+            with self.builder.if_then(is_null): self.builder.call(self.exit_func, [ir.Constant(i32, 1)])
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 2)])
+            sz = self.builder.call(self.ftell, [f], name="file_size")
+            self.builder.call(self.fseek, [f, ir.Constant(i64, 0), ir.Constant(i32, 0)])
+            sz_i32 = self.builder.trunc(sz, i32)
+            buf_void = self.builder.call(self.malloc, [self.builder.add(sz_i32, ir.Constant(i32, 1))])
+            buf = self.builder.bitcast(buf_void, ir.IntType(8).as_pointer())
+            self.builder.call(self.fread, [buf_void, ir.Constant(i64, 1), sz, f])
+            self.builder.call(self.fclose, [f])
+            buf_struct_ty = self.get_llvm_type("Buffer<u8>")
+            bval = ir.Constant(buf_struct_ty, ir.Undefined)
+            bval = self.builder.insert_value(bval, buf, 0)
+            bval = self.builder.insert_value(bval, sz_i32, 1)
+            bval = self.builder.insert_value(bval, sz_i32, 2)
+            return bval
 
-            # Resolve target LLVM type
-            try:
-                target_ty = self.get_llvm_type(target_type_name)
-            except Exception:
-                # Fallback for legacy targets
-                if target_type_name == 'i32':
-                    target_ty = ir.IntType(32)
-                elif target_type_name == 'u8':
-                    target_ty = ir.IntType(8)
-                elif target_type_name == 'u64' or target_type_name == 'i64':
-                    target_ty = ir.IntType(64)
-                elif target_type_name == 'bool':
-                    target_ty = ir.IntType(1)
-                else:
-                    raise Exception(f"Unsupported cast target type: {target_type_name}")
+        elif callee_name in ("fs::write_file", "fs::append_file"):
+            path = self.visit(node.args[0])
+            data = self.visit(node.args[1])
+            length = self.visit(node.args[2])
+            mode = "wb\0" if callee_name == "fs::write_file" else "ab\0"
+            mode_ptr = self.builder.bitcast(self.visit_StringLiteral(None, value_override=mode), ir.IntType(8).as_pointer())
+            f = self.builder.call(self.fopen, [path, mode_ptr])
+            self.builder.call(self.fwrite, [data, ir.Constant(ir.IntType(64), 1), self.builder.zext(length, ir.IntType(64)), f])
+            self.builder.call(self.fclose, [f])
+            return None
 
-
-            src_ty = val.type
-            # Integer casting
-            if isinstance(src_ty, ir.IntType) and isinstance(target_ty, ir.IntType):
-                if src_ty.width > target_ty.width:
-                    return self.builder.trunc(val, target_ty)
-                elif src_ty.width < target_ty.width:
-                    return self.builder.zext(val, target_ty)
-                else:
-                    return val
-
-            # Pointer casting
-            if isinstance(src_ty, ir.PointerType) and isinstance(target_ty, ir.PointerType):
-                return self.builder.bitcast(val, target_ty)
-
-            # Ptr <-> Int
-            if isinstance(src_ty, ir.PointerType) and isinstance(target_ty, ir.IntType):
-                return self.builder.ptrtoint(val, target_ty)
-            if isinstance(src_ty, ir.IntType) and isinstance(target_ty, ir.PointerType):
-                return self.builder.inttoptr(val, target_ty)
-
-            # Fallback
-            return self.builder.bitcast(val, target_ty)
-
-        elif isinstance(node.callee, str) and node.callee.startswith('sizeof<'):
-            type_name = node.callee[7:].rstrip('>')
-            llvm_ty = self.get_llvm_type(type_name)
-
-            null_ptr = ir.Constant(llvm_ty.as_pointer(), None)
-            gep = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)])
-            return self.builder.ptrtoint(gep, ir.IntType(32))
-
-        elif isinstance(node.callee, str) and node.callee.startswith('ptr_offset<'):
-            ptr_val = self.visit(node.args[0])
-            idx_val = self.visit(node.args[1])
-            return self.builder.gep(ptr_val, [idx_val])
-
-        elif node.callee == 'memcpy':
+        elif callee_name == "memcpy":
             dest = self.visit(node.args[0])
             src = self.visit(node.args[1])
             size = self.visit(node.args[2])
+            return self.builder.call(self.memcpy, [dest, src, size, ir.Constant(ir.IntType(1), 0)])
 
-            # Cast to i8* if needed
-            void_ptr = ir.IntType(8).as_pointer()
-            if dest.type != void_ptr: dest = self.builder.bitcast(dest, void_ptr)
-            if src.type != void_ptr: src = self.builder.bitcast(src, void_ptr)
+        # 7. Regular Function Calls
+        callee_func_name = callee_name
+        if isinstance(callee_func_name, str) and '::' in callee_func_name:
+            parts = callee_func_name.split('::')
+            struct_name = parts[0].split('<')[0]
+            callee_func_name = f"{struct_name}_{parts[1]}"
 
-            # Volatile = false
-            is_volatile = ir.Constant(ir.IntType(1), 0)
+        if isinstance(callee_func_name, str) and callee_func_name in self.module.globals:
+            callee_func = self.module.globals[callee_func_name]
+            processed_args = [self.visit(arg) for arg in node.args]
+            # ... simple cast ...
+            for i in range(min(len(processed_args), len(callee_func.function_type.args))):
+                if processed_args[i].type != callee_func.function_type.args[i]:
+                    processed_args[i] = self.builder.bitcast(processed_args[i], callee_func.function_type.args[i])
+            return self.builder.call(callee_func, processed_args)
 
-            return self.builder.call(self.memcpy, [dest, src, size, is_volatile])
-
-        elif callee == "__nexa_panic":
-            # __nexa_panic(msg, file, line)
-            msg = self.visit(node.args[0])
-            file = self.visit(node.args[1])
-            line = self.visit(node.args[2])
-            
-            voidptr_ty = ir.IntType(8).as_pointer()
-            fmt_s = self.visit_StringLiteral(None, name="panic_fmt", value_override="PANIC: %s at %s:%d\n\0")
-            fmt_arg = self.builder.bitcast(fmt_s, voidptr_ty)
-            
-            self.builder.call(self.printf, [fmt_arg, msg, file, line])
-            self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
-            return None
-
-        elif callee == "__nexa_assert":
-            # __nexa_assert(cond, msg, file, line)
-            cond_val = self.visit(node.args[0])
-            msg = self.visit(node.args[1])
-            file = self.visit(node.args[2])
-            line = self.visit(node.args[3])
-            
-            # if (!cond) { panic... }
-            if cond_val.type != ir.IntType(1):
-                cond_val = self.builder.icmp_signed('!=', cond_val, ir.Constant(cond_val.type, 0))
-            
-            with self.builder.if_then(self.builder.not_(cond_val)):
-                voidptr_ty = ir.IntType(8).as_pointer()
-                fmt_s = self.visit_StringLiteral(None, name="assert_fmt", value_override="ASSERTION FAILED: %s at %s:%d\n\0")
-                fmt_arg = self.builder.bitcast(fmt_s, voidptr_ty)
-                self.builder.call(self.printf, [fmt_arg, msg, file, line])
-                self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
-            return None
-
-        elif node.callee == "gpu::global_id":
-            if self.target == "spirv" and hasattr(self, "spirv_global_invocation_id"):
-                gid = self.builder.load(self.spirv_global_invocation_id, name="spirv_gid")
-                return self.builder.extract_element(gid, ir.Constant(ir.IntType(32), 0), name="spirv_gid_x")
-            return self.builder.load(self.gpu_global_id, name="gpu_global_id")
-
-        elif node.callee == "gpu::dispatch":
-            # gpu::dispatch(kernel_fn, threads?)
-            # Bootstrap implementation: CPU loop calling the kernel while updating __gpu_global_id.
-            if len(node.args) not in (1, 2):
-                raise Exception("gpu::dispatch expects 1 or 2 args")
-
-            fn_ref = node.args[0]
-            if type(fn_ref).__name__ != "VariableExpr":
-                raise Exception("gpu::dispatch first argument must be a function name (identifier)")
-
-            kernel_name = fn_ref.name
-            if kernel_name not in self.module.globals:
-                raise Exception(f"gpu::dispatch: unknown function '{kernel_name}'")
-
-            kernel_fn = self.module.globals[kernel_name]
-
-            threads_val = ir.Constant(ir.IntType(32), 1)
-            if len(node.args) == 2:
-                threads_val = self.visit(node.args[1])
-
-            # for (i=0; i<threads; i++) { __gpu_global_id=i; call kernel(); }
-            i32 = ir.IntType(32)
-            idx_ptr = self.builder.alloca(i32, name="gpu_i")
-            self.builder.store(ir.Constant(i32, 0), idx_ptr)
-
-            cond_bb = self.builder.append_basic_block(name="gpu_dispatch_cond")
-            body_bb = self.builder.append_basic_block(name="gpu_dispatch_body")
-            end_bb = self.builder.append_basic_block(name="gpu_dispatch_end")
-
-            self.builder.branch(cond_bb)
-
-            # cond
-            self.builder.position_at_end(cond_bb)
-            idx_val = self.builder.load(idx_ptr, name="gpu_i_val")
-            cond = self.builder.icmp_signed("<", idx_val, threads_val, name="gpu_cond")
-            self.builder.cbranch(cond, body_bb, end_bb)
-
-            # body
-            self.builder.position_at_end(body_bb)
-            self.builder.store(idx_val, self.gpu_global_id)
-            self.builder.call(kernel_fn, [])
-            inc = self.builder.add(idx_val, ir.Constant(i32, 1), name="gpu_i_inc")
-            self.builder.store(inc, idx_ptr)
-            self.builder.branch(cond_bb)
-
-            # end
-            self.builder.position_at_end(end_bb)
-            return None
-        else:
-            # Resolve static method calls: Struct::Method -> Struct_Method
-            callee_name = node.callee
-            if isinstance(callee_name, str) and '::' in callee_name:
-                parts = callee_name.split('::')
-                struct_name = parts[0]
-                method_name = parts[1]
-                # Strip generics if present: Vec<i32> -> Vec
-                if '<' in struct_name: struct_name = struct_name.split('<')[0]
-                callee_name = f"{struct_name}_{method_name}"
-
-            # Try to find function in module
-            if isinstance(callee_name, str) and callee_name in self.module.globals:
-                callee_func = self.module.globals[callee_name]
-                processed_args = [self.visit(arg) for arg in node.args]
-                
-                # Auto-cast arguments to match function signature (for type erasure)
-                for i in range(len(processed_args)):
-                    if i < len(callee_func.function_type.args):
-                        expected_type = callee_func.function_type.args[i]
-                        actual_val = processed_args[i]
-                        if actual_val.type != expected_type:
-                            if isinstance(actual_val.type, ir.PointerType) and isinstance(expected_type, ir.PointerType):
-                                processed_args[i] = self.builder.bitcast(actual_val, expected_type)
-                            elif isinstance(actual_val.type, ir.IntType) and isinstance(expected_type, ir.IntType):
-                                if actual_val.type.width > expected_type.width:
-                                    processed_args[i] = self.builder.trunc(actual_val, expected_type)
-                                else:
-                                    processed_args[i] = self.builder.zext(actual_val, expected_type)
-                            elif isinstance(actual_val.type, ir.LiteralStructType) and isinstance(expected_type, ir.LiteralStructType):
-                                tmp = self.builder.alloca(actual_val.type)
-                                self.builder.store(actual_val, tmp)
-                                tmp_cast = self.builder.bitcast(tmp, expected_type.as_pointer())
-                                processed_args[i] = self.builder.load(tmp_cast)
-                            else:
-                                try:
-                                    processed_args[i] = self.builder.bitcast(actual_val, expected_type)
-                                except:
-                                    pass
-                
-                return self.builder.call(callee_func, processed_args)
-            else:
-                # Try dynamic call (e.g. function pointer or closure)
-                callee_val = self.visit(node.callee)
-                if isinstance(callee_val.type, ir.PointerType) and isinstance(callee_val.type.pointee, ir.FunctionType):
-                    processed_args = [self.visit(arg) for arg in node.args]
-                    return self.builder.call(callee_val, processed_args)
-                
-                raise Exception(f"Unknown function call: {node.callee} (resolved as {callee_name}) type={callee_val.type if 'callee_val' in locals() else 'N/A'}")
-
-    def visit_StringLiteral(self, node, name="str", value_override=None):
-        # Create a global constant string
-        if value_override:
-            value = value_override
-            if not value.endswith('\0'): 
-                value += '\0'
-        else:
-            if isinstance(node, ir.Constant):
-                # Fallback if internal code passes constants (which I removed, but just in case)
-                # But really execution shouldn't reach here if callers are fixed.
-                # Let's just create a unique name based on content if possible
-                value = node.constant.decode('utf-8')
-            else:
-                value = node.value + '\0'
-
-        # Optimization: Deduplicate strings?
-        # For now, just generate unique name if not provided or collision risk
-        # But instructions verify unique name usage
-
-        # Use simple hashing or counter?
-        # Helper: self.module.get_unique_name(name) is standard usage
-
-        c_str_val = ir.Constant(ir.ArrayType(ir.IntType(8), len(value)), bytearray(value.encode("utf8")))
-
-        unique_name = self.module.get_unique_name(name)
-        global_var = ir.GlobalVariable(self.module, c_str_val.type, name=unique_name)
-        global_var.linkage = 'internal'
-        global_var.global_constant = True
-        global_var.initializer = c_str_val
-        # Return i8* pointer to start
-        return self.builder.bitcast(global_var, ir.IntType(8).as_pointer())
-
-    def visit_MatchExpr(self, node):
-        # 1. Evaluate value
-        val = self.visit(node.value) # Expect {tag, data} (value or pointer?)
-        # No debug print
-
-        # Allocate val to stack to easily access payload address later
-        val_ptr = self.builder.alloca(val.type)
-        self.builder.store(val, val_ptr)
-
-        # Extract Tag
-        tag_val = self.builder.extract_value(val, 0)
-
-        # Create blocks
-        merge_bb = self.builder.append_basic_block("match_merge")
-
-        # Switch
-        switch = self.builder.switch(tag_val, merge_bb)
-
-        enum_name = node.enum_name
-        # Prioritize full monomorphized name if it exists in enum_definitions
-        enum_lookup_key = enum_name
-        if enum_lookup_key not in self.enum_types and '<' in enum_lookup_key:
-             enum_lookup_key = enum_lookup_key.split('<')[0]
-        
-        # Cases
-        for case in node.cases:
-            tag_id = self.enum_types[enum_lookup_key][case.variant_name]
-            case_bb = self.builder.append_basic_block(f"case_{case.variant_name}")
-            switch.add_case(ir.Constant(ir.IntType(32), tag_id), case_bb)
-
-            self.builder.position_at_end(case_bb)
-
-            # Scope for this case (so bound variables don't leak between arms)
-            self.scopes.append({})
-
-            # Bound Variables
-            if case.var_names:
-                # Get Payload Address
-                # Ensure val_ptr points to the correct enum struct (handles type erasure fallback)
-                actual_enum_ty = self.get_llvm_type(node.enum_name)
-                current_val_ptr = val_ptr
-                if current_val_ptr.type.pointee != actual_enum_ty:
-                     current_val_ptr = self.builder.bitcast(current_val_ptr, actual_enum_ty.as_pointer())
-
-                zero = ir.Constant(ir.IntType(32), 0)
-                one = ir.Constant(ir.IntType(32), 1)
-                data_ptr = self.builder.gep(current_val_ptr, [zero, one])
-
-                # Bitcast to payload type
-                payload_ty = self.enum_payloads[enum_lookup_key][case.variant_name]
-                if payload_ty:
-                    cast_ptr = self.builder.bitcast(data_ptr, payload_ty.as_pointer())
-
-                    if len(case.var_names) == 1:
-                        # Single bind: bind entire payload
-                        type_name = self._infer_type_name_from_llvm(payload_ty)
-                        self.scopes[-1][case.var_names[0]] = (cast_ptr, type_name)
-                    else:
-                        # Multiple binds: destructure struct
-                        for i, vname in enumerate(case.var_names):
-                            z = ir.Constant(ir.IntType(32), 0)
-                            idx = ir.Constant(ir.IntType(32), i)
-                            field_ptr = self.builder.gep(cast_ptr, [z, idx])
-
-                            field_ty = payload_ty.elements[i]
-                            type_name = self._infer_type_name_from_llvm(field_ty)
-                            # Store info
-                            self.scopes[-1][vname] = (field_ptr, type_name)
-
-            # Execute body
-            self.visit(case.body)
-
-            # Pop case scope (no drops needed for payload views)
-            self.scopes.pop()
-
-            # Branch to merge
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_bb)
-
-        self.builder.position_at_end(merge_bb)
-        return ir.Constant(ir.IntType(32), 0) # Void
+        raise Exception(f"Unknown function call: {callee_name}")
 
     def visit_ReturnStmt(self, node):
         # Evaluate return value FIRST (before drops)
@@ -2485,7 +2022,9 @@ class CodeGen:
 
         # Determine function type
         arg_types = []
-        # ...
+        if not (self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel):
+            for pname, ptype in node.params:
+                arg_types.append(self.get_llvm_type(ptype))
         
         ret_type = ir.VoidType()
         if getattr(node, 'is_async', False):

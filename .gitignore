@@ -2,6 +2,7 @@
 dev/artifacts/
 build/
 logs/
+projects-test/
 
 # Artifacts
 *.ll

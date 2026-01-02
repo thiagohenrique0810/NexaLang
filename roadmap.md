@@ -78,7 +78,9 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] Map `gpu::global_id()` to SPIR-V BuiltIn `GlobalInvocationId` (bootstrap: loads from `__spirv_BuiltInGlobalInvocationId` as `<3 x i32>` in `addrspace(5)` and extracts `.x`).
     - [x] Vulkan env (bootstrap): `--spirv-env vulkan` emits `OpCapability Shader` + `OpMemoryModel Logical GLSL450`, supports `--spirv-local-size`, maps kernel args to interface globals (no params), and auto-patches access chains + descriptor bindings using `spirv-dis`/`spirv-as` so `spirv-val` passes for `Buffer<T>` indexing.
 - [x] **Runtime Dispatch**
-    - [x] Implement `gpu::dispatch` (bootstrap/mock: CPU loop calling kernel + sets `gpu::global_id()`).
+    - [x] Implement `gpu::dispatch` (REAL HARDWARE Silicon Mode: OpenCL dynamic link).
+    - [x] Pass complex arguments (Buffer<T>) to silicon kernels.
+    - [x] Verified execution on AMD Radeon RX 580.
 
 ## Phase 5: Self-Hosting & Ecosystem 🚀
 

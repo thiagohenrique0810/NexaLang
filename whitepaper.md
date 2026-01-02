@@ -65,14 +65,16 @@ fn main() {
 }
 ```
 
-### 4.2 Native GPU Kernels
-Write GPU code directly in NexaLang using the `kernel` keyword.
+### 4.2 Native GPU Kernels (Silicon Mode)
+Write GPU code directly in NexaLang using the `kernel` keyword. NexaLang supports **Silicon Mode**, allowing direct execution on AMD and NVIDIA hardware via a high-performance OpenCL bridge.
 ```nexalang
 kernel fn fill(buf: Buffer<i32>, val: i32) {
     let i = gpu::global_id()
     buf[i] = val
 }
 ```
+*   **Zero-Copy Memory**: Direct mapping of host buffers to GPU address space.
+*   **Hardware Agnostic**: Single binary works across different GPU vendors.
 
 ---
 

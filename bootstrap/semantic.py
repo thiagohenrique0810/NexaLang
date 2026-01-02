@@ -1278,13 +1278,22 @@ class SemanticAnalyzer:
             node.callee = callee
         
         # Handle built-in intrinsics and special internal functions
-        if callee in ('print', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'memcpy', '__nexa_panic', '__nexa_assert'):
+        if callee in ('print', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'memcpy', '__nexa_panic', '__nexa_assert', 'gpu::dispatch', 'gpu::global_id'):
+            if callee == 'gpu::dispatch':
+                # O primeiro argumento de gpu::dispatch é um nome de função (kernel), não uma variável
+                if len(node.args) > 0:
+                    # Skip visit para o primeiro arg se for o nome do kernel
+                    for i in range(1, len(node.args)):
+                        self.visit(node.args[i])
+                return 'void'
+            
             for a in node.args: self.visit(a)
             if callee == 'fs::read_file': 
                 self.instantiate_generic_type('Buffer<u8>')
                 node.type_name = 'Buffer<u8>'
                 return 'Buffer<u8>'
             if callee in ('malloc', 'realloc'): return 'u8*'
+            if callee == 'gpu::global_id': return 'i32'
             return 'void'
 
         # Double Colon Logic (also handles resolved aliases from glob imports)
