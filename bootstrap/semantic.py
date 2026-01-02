@@ -223,8 +223,8 @@ class SemanticAnalyzer:
             for i, atype in enumerate(arg_types):
                 if i < len(cand.params):
                     ptype = cand.params[i][1]
-                    if ptype != atype:
-                        match = False; break
+                if ptype != atype:
+                    match = False; break
                 else:
                     # Vararg part
                     break
@@ -247,8 +247,8 @@ class SemanticAnalyzer:
             for i, atype in enumerate(arg_types):
                 if i < len(cand.params):
                     ptype = cand.params[i][1]
-                    if not self.check_type_compatibility(ptype, atype, node):
-                        match = False; break
+                if not self.check_type_compatibility(ptype, atype, node):
+                    match = False; break
                 else:
                     # Vararg part - assume compatible for now in bootstrap
                     break
@@ -445,14 +445,14 @@ class SemanticAnalyzer:
                         self.function_defs[node.name] = []
                     self.function_defs[node.name].append(node)
             elif name == 'ExternBlock':
-             for func in node.functions:
-                  func.module = getattr(node, 'module', '')
-                  func.is_extern = True # Mark as extern
-                  self.canonicalize_type_refs(func)
-                  if func.name not in self.function_defs:
-                      self.function_defs[func.name] = []
-                  self.function_defs[func.name].append(func)
-                  self.functions.add(func.name)
+                 for func in node.functions:
+                      func.module = getattr(node, 'module', '')
+                      func.is_extern = True # Mark as extern
+                      self.canonicalize_type_refs(func)
+                      if func.name not in self.function_defs:
+                          self.function_defs[func.name] = []
+                      self.function_defs[func.name].append(func)
+                      self.functions.add(func.name)
             elif name == 'ImplDef':
                  self.register_impl_methods(node)
         
