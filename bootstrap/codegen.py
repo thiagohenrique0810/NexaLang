@@ -1487,6 +1487,9 @@ class CodeGen:
         elif node.op == 'NEQ':
             if left.type == ir.FloatType():
                 return self.builder.fcmp_ordered('!=', left, right, name="fneqtmp")
+            # Handle pointer != 0 comparison
+            if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
+                right = ir.Constant(left.type, None) # Convert 0 to null pointer
             return self.builder.icmp_signed('!=', left, right, name="neqtmp")
         elif node.op == 'LT':
             if left.type == ir.FloatType():
@@ -1610,6 +1613,8 @@ class CodeGen:
             self._strings = {}
             
         # Create global constant
+        # Use bytearray without the explicit \0 if it was already handled by Python strings
+        # Wait, the issue is how it's encoded.
         encoded = string_val.encode('utf-8')
         arr_ty = ir.ArrayType(ir.IntType(8), len(encoded))
         gv = ir.GlobalVariable(self.module, arr_ty, name=f"{name}.{len(self._strings)}")
@@ -1753,7 +1758,6 @@ class CodeGen:
         
         processed_args = [env_ptr_raw] + [self.visit(arg) for arg in args]
         return self.builder.call(func_ptr, processed_args)
-
     def visit_CallExpr(self, node):
         callee = node.callee
         if isinstance(callee, VariableExpr):
@@ -1832,15 +1836,54 @@ class CodeGen:
             if int_like: self.builder.call(self.printf, [fmt_arg, val])
             elif val.type == ir.FloatType(): self.builder.call(self.printf, [fmt_arg, self.builder.fpext(val, ir.DoubleType())])
             else:
-                # Converte para void* apenas se for um ponteiro
-                if isinstance(val.type, ir.PointerType):
-                    val_arg = self.builder.bitcast(val, voidptr_ty)
-                else:
-                    # Se for um valor escalar (ex: i32 de um loop), passa diretamente se o printf aceitar, 
-                    # ou converte para o tipo que o format string espera.
-                    val_arg = val
+                if isinstance(val.type, ir.PointerType): val_arg = self.builder.bitcast(val, voidptr_ty)
+                else: val_arg = val
                 self.builder.call(self.printf, [fmt_arg, val_arg])
             return None
+
+        elif callee_name == "fprintf":
+            file_ptr = self.visit(node.args[0])
+            fmt_ptr = self.visit(node.args[1])
+            
+            # Coleta args variádicos
+            call_args = [file_ptr, fmt_ptr]
+            for i in range(2, len(node.args)):
+                call_args.append(self.visit(node.args[i]))
+            
+            # Usa a função já declarada no módulo (pelo ExternBlock do Semantic)
+            func = self.module.globals.get("fprintf")
+            if not func:
+                void_ptr = ir.IntType(8).as_pointer()
+                fprintf_ty = ir.FunctionType(ir.IntType(32), [void_ptr, void_ptr], var_arg=True)
+                func = ir.Function(self.module, fprintf_ty, name="fprintf")
+            
+            # Garante que os dois primeiros args fixos sejam compatíveis com a assinatura
+            for i in range(min(len(call_args), len(func.function_type.args))):
+                expected = func.function_type.args[i]
+                actual = call_args[i]
+                if actual.type != expected:
+                    if isinstance(actual.type, ir.PointerType) and isinstance(expected, ir.IntType):
+                        call_args[i] = self.builder.ptrtoint(actual, expected)
+                    elif isinstance(actual.type, ir.IntType) and isinstance(expected, ir.PointerType):
+                        call_args[i] = self.builder.inttoptr(actual, expected)
+                    else:
+                        call_args[i] = self.builder.bitcast(actual, expected)
+            
+            return self.builder.call(func, call_args)
+
+        elif callee_name == "fopen":
+            path_ptr = self.visit(node.args[0])
+            mode_ptr = self.visit(node.args[1])
+            void_ptr = ir.IntType(8).as_pointer()
+            if path_ptr.type != void_ptr: path_ptr = self.builder.bitcast(path_ptr, void_ptr)
+            if mode_ptr.type != void_ptr: mode_ptr = self.builder.bitcast(mode_ptr, void_ptr)
+            return self.builder.call(self.fopen, [path_ptr, mode_ptr])
+
+        elif callee_name == "fclose":
+            file_ptr = self.visit(node.args[0])
+            void_ptr = ir.IntType(8).as_pointer()
+            if file_ptr.type != void_ptr: file_ptr = self.builder.bitcast(file_ptr, void_ptr)
+            return self.builder.call(self.fclose, [file_ptr])
 
         elif callee_name == "gpu::global_id":
             if self.target == "spirv" and hasattr(self, "spirv_global_invocation_id"):
@@ -1862,7 +1905,7 @@ class CodeGen:
             if self.target == "native":
                 if "__nexa_gpu_dispatch" not in self.module.globals:
                     void_ptr = ir.IntType(8).as_pointer()
-                    dispatch_ty = ir.FunctionType(ir.VoidType(), [void_ptr, ir.IntType(32), ir.IntType(32), void_ptr.as_pointer()])
+                    dispatch_ty = ir.FunctionType(ir.IntType(32), [void_ptr, ir.IntType(32), ir.IntType(32), void_ptr.as_pointer()])
                     ir.Function(self.module, dispatch_ty, name="__nexa_gpu_dispatch")
                 dispatch_fn = self.module.globals["__nexa_gpu_dispatch"]
                 k_name_const = self._get_or_create_string(kernel_name)
@@ -1971,7 +2014,6 @@ class CodeGen:
         if isinstance(callee_func_name, str) and callee_func_name in self.module.globals:
             callee_func = self.module.globals[callee_func_name]
             processed_args = [self.visit(arg) for arg in node.args]
-            # ... simple cast ...
             for i in range(min(len(processed_args), len(callee_func.function_type.args))):
                 if processed_args[i].type != callee_func.function_type.args[i]:
                     processed_args[i] = self.builder.bitcast(processed_args[i], callee_func.function_type.args[i])
@@ -1986,10 +2028,6 @@ class CodeGen:
             ret_val = self.visit(node.value)
 
         # Unwind scopes: Drop everything in current function scopes (LIFO)
-        # Note: self.scopes[0] is Global scope? No, self.scopes tracks local scopes.
-        # But we don't want to drop globals here?
-        # Actually in _declare_function we might set up scopes.
-        # Let's assume self.scopes contains all local scopes.
         for scope in reversed(self.scopes):
             self.emit_scope_drops(scope)
 
@@ -1999,15 +2037,11 @@ class CodeGen:
                 for scope in reversed(self.scopes):
                     if '$async_state' in scope:
                         state = scope['$async_state']
-                        # done = true
                         done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
                         self.builder.store(ir.Constant(ir.IntType(1), 1), done_ptr)
-                        # result
                         if ret_val:
                             res_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
                             self.builder.store(ret_val, res_ptr)
-                        
-                        # Return state pointer as handle
                         void_ptr = ir.IntType(8).as_pointer()
                         h = self.builder.bitcast(state, void_ptr)
                         self.builder.ret(h)

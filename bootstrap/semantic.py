@@ -213,25 +213,50 @@ class SemanticAnalyzer:
 
         # 1. Exact match (strongest)
         for cand in candidates:
-            if len(cand.params) != len(arg_types): continue
+            # Handle vararg
+            if getattr(cand, 'is_vararg', False):
+                if len(arg_types) < len(cand.params): continue
+            elif len(cand.params) != len(arg_types): 
+                continue
+                
             match = True
-            for (pname, ptype), atype in zip(cand.params, arg_types):
-                if ptype != atype:
-                    match = False; break
+            for i, atype in enumerate(arg_types):
+                if i < len(cand.params):
+                    ptype = cand.params[i][1]
+                    if ptype != atype:
+                        match = False; break
+                else:
+                    # Vararg part
+                    break
             if match:
-                mangled = self.get_mangled_name(base_name, cand.params)
+                if getattr(cand, 'is_extern', False):
+                    mangled = base_name # Don't mangle extern functions
+                else:
+                    mangled = self.get_mangled_name(base_name, cand.params)
                 cand.mangled_name = mangled
                 return cand, mangled
 
         # 2. Match with compatibility/coercion
         for cand in candidates:
-            if len(cand.params) != len(arg_types): continue
+            if getattr(cand, 'is_vararg', False):
+                if len(arg_types) < len(cand.params): continue
+            elif len(cand.params) != len(arg_types): 
+                continue
+                
             match = True
-            for (pname, ptype), atype in zip(cand.params, arg_types):
-                if not self.check_type_compatibility(ptype, atype, node):
-                    match = False; break
+            for i, atype in enumerate(arg_types):
+                if i < len(cand.params):
+                    ptype = cand.params[i][1]
+                    if not self.check_type_compatibility(ptype, atype, node):
+                        match = False; break
+                else:
+                    # Vararg part - assume compatible for now in bootstrap
+                    break
             if match:
-                mangled = self.get_mangled_name(base_name, cand.params)
+                if getattr(cand, 'is_extern', False):
+                    mangled = base_name # Don't mangle extern functions
+                else:
+                    mangled = self.get_mangled_name(base_name, cand.params)
                 cand.mangled_name = mangled
                 return cand, mangled
 
@@ -367,7 +392,7 @@ class SemanticAnalyzer:
         # Register built-ins in function_defs for overload resolution
         for bf in self.functions:
             if bf not in self.function_defs:
-                # Create a dummy FunctionDef for built-ins
+                # Create a list with a dummy FunctionDef for built-ins
                 self.function_defs[bf] = [FunctionDef(bf, [], 'void', None)]
 
         # 0. Process Derives
@@ -420,13 +445,14 @@ class SemanticAnalyzer:
                         self.function_defs[node.name] = []
                     self.function_defs[node.name].append(node)
             elif name == 'ExternBlock':
-                 for func in node.functions:
-                      func.module = getattr(node, 'module', '')
-                      self.canonicalize_type_refs(func)
-                      if func.name not in self.function_defs:
-                          self.function_defs[func.name] = []
-                      self.function_defs[func.name].append(func)
-                      self.functions.add(func.name)
+             for func in node.functions:
+                  func.module = getattr(node, 'module', '')
+                  func.is_extern = True # Mark as extern
+                  self.canonicalize_type_refs(func)
+                  if func.name not in self.function_defs:
+                      self.function_defs[func.name] = []
+                  self.function_defs[func.name].append(func)
+                  self.functions.add(func.name)
             elif name == 'ImplDef':
                  self.register_impl_methods(node)
         
@@ -502,7 +528,9 @@ class SemanticAnalyzer:
              for func in node.functions:
                   func.module = prefix
                   self.canonicalize_type_refs(func)
-                  self.function_defs[func.name] = func
+                  if func.name not in self.function_defs:
+                      self.function_defs[func.name] = []
+                  self.function_defs[func.name].append(func)
                   self.functions.add(func.name)
         elif name == 'ImplDef':
              for method in node.methods:
