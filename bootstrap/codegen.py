@@ -948,8 +948,7 @@ class CodeGen:
             else:
                 ptr = self.builder.gep(temp_ptr, [index_val])
         except Exception as e:
-            print(f"DEBUG GEP FAILED: type={obj_val.type} agg={isinstance(obj_val.type, (ir.ArrayType, ir.LiteralStructType, ir.StructureType))}")
-            raise e
+            raise Exception(f"GEP failed for index access: type={obj_val.type}, operand={type(node.object).__name__}") from e
         return self.builder.load(ptr)
 
         func = ir.Function(self.module, func_ty, name=node.name)
