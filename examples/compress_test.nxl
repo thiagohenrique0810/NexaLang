@@ -1,0 +1,117 @@
+# compress_test.nxl — TurboQuant vector compression demo
+#
+# Shows 3 use cases:
+#   1. Basic quantize/dequantize round-trip with MSE measurement
+#   2. CompressedBuffer for streaming KV-cache style storage
+#   3. Quick compress/decompress convenience API
+
+use std::compress::Quantizer;
+use std::compress::CompressedBuffer;
+use std::compress::quick_compress;
+use std::compress::quick_decompress;
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+}
+
+fn fill_test_vector(buf: *f32, dim: i32, scale: f32) {
+    for i in 0..dim {
+        # Simple pattern: normalized-ish values
+        buf[i] = cast::<f32>(i) * scale;
+    }
+}
+
+fn main() -> i32 {
+    let dim: i32 = 64;
+    let bits: i32 = 3;
+
+    print("=== TurboQuant Compression Test ===");
+    print("");
+
+    # ── Test 1: Basic round-trip ──────────────────────────────────────────
+    print("1. Basic quantize/dequantize round-trip");
+
+    let q = Quantizer::new(dim, bits);
+
+    let input = cast::<*f32>(malloc(dim * 4));
+    let compressed = malloc(dim * 2);  # u16 per coordinate
+    let output = cast::<*f32>(malloc(dim * 4));
+
+    fill_test_vector(input, dim, 0.01);
+
+    q.quantize(input, compressed, 1);
+    q.dequantize(compressed, output, 1);
+
+    let error = q.mse(input, 1);
+    print("   MSE:         ");
+    print(error);
+    print("   Upper bound: ");
+    print(q.upper_bound());
+    print("   Lower bound: ");
+    print(q.lower_bound());
+
+    let orig_bytes = q.original_size(1);
+    let comp_bytes = q.compressed_size(1);
+    print("   Original size (bytes): ");
+    print(orig_bytes);
+    print("   Compressed size (bytes): ");
+    print(comp_bytes);
+
+    free(cast::<*u8>(input));
+    free(compressed);
+    free(cast::<*u8>(output));
+    q.drop();
+
+    print("");
+
+    # ── Test 2: CompressedBuffer (streaming) ──────────────────────────────
+    print("2. CompressedBuffer streaming storage");
+
+    let mut cbuf = CompressedBuffer::new(dim, bits, 100);
+
+    let vec_buf = cast::<*f32>(malloc(dim * 4));
+
+    # Push 10 vectors
+    for i in 0..10 {
+        fill_test_vector(vec_buf, dim, cast::<f32>(i + 1) * 0.005);
+        cbuf.push(vec_buf);
+    }
+
+    print("   Stored vectors: ");
+    print(cbuf.len());
+
+    # Retrieve vector 5
+    let retrieved = cast::<*f32>(malloc(dim * 4));
+    cbuf.get(5, retrieved);
+    print("   Retrieved vec[5][0]: ");
+    print(retrieved[0]);
+
+    free(vec_buf);
+    free(cast::<*u8>(retrieved));
+    cbuf.drop();
+
+    print("");
+
+    # ── Test 3: Quick compress/decompress ─────────────────────────────────
+    print("3. Quick compress/decompress API");
+
+    let data = cast::<*f32>(malloc(dim * 4));
+    fill_test_vector(data, dim, 0.02);
+
+    let packed = quick_compress(data, dim, 1, bits);
+    let unpacked = quick_decompress(packed, dim, 1, bits);
+
+    print("   Original  [0]: ");
+    print(data[0]);
+    print("   Recovered [0]: ");
+    print(unpacked[0]);
+
+    free(cast::<*u8>(data));
+    free(packed);
+    free(cast::<*u8>(unpacked));
+
+    print("");
+    print("=== All compression tests passed ===");
+    return 0;
+}

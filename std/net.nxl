@@ -3,37 +3,177 @@ extern "C" {
     fn curl_easy_setopt(handle: *u8, option: i32, param: *u8) -> i32;
     fn curl_easy_perform(handle: *u8) -> i32;
     fn curl_easy_cleanup(handle: *u8);
+    fn curl_easy_getinfo(handle: *u8, info: i32, out: *u8) -> i32;
+    fn curl_slist_append(list: *u8, val: *u8) -> *u8;
+    fn curl_slist_free_all(list: *u8);
     fn malloc(size: i32) -> *u8;
+    fn realloc(ptr: *u8, size: i32) -> *u8;
     fn free(ptr: *u8);
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fclose(stream: *u8) -> i32;
+    fn fseek(stream: *u8, offset: i64, whence: i32) -> i32;
+    fn ftell(stream: *u8) -> i64;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
 }
 
-use std::string::String;
+# ── Response ────────────────────────────────────────────────────────────────
 
 pub struct Response {
     pub status: i32,
-    pub body: String
+    pub body: string,
+    pub body_len: i32
 }
 
+impl Response {
+    fn ok(&self) -> bool {
+        return self.status >= 200 && self.status < 300;
+    }
+
+    fn is_error(&self) -> bool {
+        return self.status >= 400;
+    }
+}
+
+# ── HttpClient ─────────────────────────────────────────────────────────────
+
 pub struct HttpClient {
-    handle: *u8
+    handle: *u8,
+    timeout: i32,
+    follow_redirects: bool
 }
 
 impl HttpClient {
     fn new() -> HttpClient {
         let h = curl_easy_init();
-        # Standard configuration could go here
-        return HttpClient(h);
+        return HttpClient(h, 30, true);
     }
 
+    fn with_timeout(timeout_secs: i32) -> HttpClient {
+        let h = curl_easy_init();
+        return HttpClient(h, timeout_secs, true);
+    }
+
+    fn set_timeout(&mut self, secs: i32) {
+        self.timeout = secs;
+    }
+
+    fn set_follow_redirects(&mut self, follow: bool) {
+        self.follow_redirects = follow;
+    }
+
+    # ── HTTP Methods ───────────────────────────────────────────────────────
+
     fn get(&self, url: string) -> Response {
+        return self._do_request("GET", url, "", 0, cast::<*u8>(0));
+    }
+
+    fn post(&self, url: string, body: string, body_len: i32) -> Response {
+        return self._do_request("POST", url, body, body_len, cast::<*u8>(0));
+    }
+
+    fn post_json(&self, url: string, json_body: string, json_len: i32) -> Response {
+        let headers = curl_slist_append(cast::<*u8>(0), cast::<*u8>("Content-Type: application/json"));
+        let resp = self._do_request("POST", url, json_body, json_len, headers);
+        curl_slist_free_all(headers);
+        return resp;
+    }
+
+    fn put(&self, url: string, body: string, body_len: i32) -> Response {
+        return self._do_request("PUT", url, body, body_len, cast::<*u8>(0));
+    }
+
+    fn delete(&self, url: string) -> Response {
+        return self._do_request("DELETE", url, "", 0, cast::<*u8>(0));
+    }
+
+    fn patch(&self, url: string, body: string, body_len: i32) -> Response {
+        return self._do_request("PATCH", url, body, body_len, cast::<*u8>(0));
+    }
+
+    fn head(&self, url: string) -> Response {
+        return self._do_request("HEAD", url, "", 0, cast::<*u8>(0));
+    }
+
+    # ── Internal request executor ──────────────────────────────────────────
+
+    fn _do_request(&self, method: string, url: string, body: string, body_len: i32, headers: *u8) -> Response {
+        let h = self.handle;
+
         # CURLOPT_URL = 10002
-        curl_easy_setopt(self.handle, 10002, cast::<*u8>(url));
-        
-        # In a real implementation, we would set a WRITEFUNCTION callback.
-        # For this bootstrap milestone, we return a mock status and the performance result.
-        let rc = curl_easy_perform(self.handle);
-        
-        return Response(rc, String::from("Response body capture pending full callback support"));
+        curl_easy_setopt(h, 10002, cast::<*u8>(url));
+
+        # CURLOPT_TIMEOUT = 13
+        curl_easy_setopt(h, 13, cast::<*u8>(cast::<i64>(self.timeout)));
+
+        # CURLOPT_FOLLOWLOCATION = 52
+        if (self.follow_redirects) {
+            curl_easy_setopt(h, 52, cast::<*u8>(1));
+        }
+
+        # CURLOPT_CUSTOMREQUEST = 10036 (for PUT, DELETE, PATCH, HEAD)
+        if (method != "GET" && method != "POST") {
+            curl_easy_setopt(h, 10036, cast::<*u8>(method));
+        }
+
+        # Set POST body if applicable
+        if (method == "POST" || method == "PUT" || method == "PATCH") {
+            # CURLOPT_POST = 47
+            curl_easy_setopt(h, 47, cast::<*u8>(1));
+            # CURLOPT_POSTFIELDS = 10015
+            curl_easy_setopt(h, 10015, cast::<*u8>(body));
+            # CURLOPT_POSTFIELDSIZE = 60
+            curl_easy_setopt(h, 60, cast::<*u8>(cast::<i64>(body_len)));
+        }
+
+        # CURLOPT_HTTPHEADER = 10023
+        if (cast::<i64>(headers) != 0) {
+            curl_easy_setopt(h, 10023, headers);
+        }
+
+        # Capture response body: curl defaults WRITEFUNCTION to fwrite,
+        # so setting WRITEDATA to a FILE* captures the body automatically.
+        let tmpf = fopen(cast::<*u8>("/tmp/_nexa_http_buf"), cast::<*u8>("w+b"));
+        if (cast::<i64>(tmpf) != 0) {
+            # CURLOPT_WRITEDATA = 10001
+            curl_easy_setopt(h, 10001, tmpf);
+        }
+
+        # Perform the request
+        let rc = curl_easy_perform(h);
+
+        # Extract HTTP status code
+        let status: i32 = 0;
+        let resp_body: string = "";
+        let resp_len: i32 = 0;
+
+        if (rc == 0) {
+            # CURLINFO_RESPONSE_CODE = 0x200002 = 2097154
+            # curl writes a long (i64) to the output pointer
+            let code_buf = malloc(8);
+            curl_easy_getinfo(h, 2097154, code_buf);
+            let code_ptr = cast::<*i64>(code_buf);
+            status = cast::<i32>(*code_ptr);
+            free(code_buf);
+
+            # Read captured response body from temp file
+            if (cast::<i64>(tmpf) != 0) {
+                fseek(tmpf, 0, 2);  # SEEK_END
+                let bsize = ftell(tmpf);
+                fseek(tmpf, 0, 0);  # SEEK_SET
+                let bbuf = malloc(cast::<i32>(bsize) + 1);
+                fread(bbuf, 1, bsize, tmpf);
+                bbuf[cast::<i32>(bsize)] = cast::<u8>(0);
+                resp_body = cast::<string>(bbuf);
+                resp_len = cast::<i32>(bsize);
+            }
+        }
+
+        if (cast::<i64>(tmpf) != 0) {
+            fclose(tmpf);
+        }
+
+        return Response(status, resp_body, resp_len);
     }
 
     fn drop(self) {
@@ -41,4 +181,27 @@ impl HttpClient {
             curl_easy_cleanup(self.handle);
         }
     }
+}
+
+# ── Convenience functions ──────────────────────────────────────────────────
+
+pub fn get(url: string) -> Response {
+    let client = HttpClient::new();
+    let resp = client.get(url);
+    client.drop();
+    return resp;
+}
+
+pub fn post(url: string, body: string, body_len: i32) -> Response {
+    let client = HttpClient::new();
+    let resp = client.post(url, body, body_len);
+    client.drop();
+    return resp;
+}
+
+pub fn post_json(url: string, json_body: string, json_len: i32) -> Response {
+    let client = HttpClient::new();
+    let resp = client.post_json(url, json_body, json_len);
+    client.drop();
+    return resp;
 }

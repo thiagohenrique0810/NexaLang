@@ -10,12 +10,14 @@ class SemanticAnalyzer:
         self.scopes = [{}] 
         self.warnings = [] # list of (msg, line, col)
         self.borrow_cleanup_stack = [] # Stack of lists of (borrowed_var_name, is_mut)
+        self.active_borrows = []  # [(borrow_name, source_var, role, scope_depth, node)]
+        self.lifetime_errors = []  # Detected lifetime violations
         self.current_function = None
         self.struct_methods = {}  # {struct_name: {method_name: FunctionDef}}
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_stack = [] # list of labels (None if no label)
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert', 'compress::create', 'compress::destroy', 'compress::quantize', 'compress::dequantize', 'compress::mse'])
         self.function_defs = {} # name -> list of FunctionDef
         self.structs = {} # name -> {field: type}
         self.struct_defs = {} # name -> StructDef (for privacy check)
@@ -33,7 +35,6 @@ class SemanticAnalyzer:
         self.tests = [] # list of test function names
         self.lambda_base_scopes = [] # Stack of len(self.scopes) when lambda started
         self.lambda_capture_stack = [] # Stack of dicts: {name: type}
-        self.lambda_count = 0
 
 
     def get_suggestion(self, name, possibilities):
@@ -849,14 +850,26 @@ class SemanticAnalyzer:
             if isinstance(node.operand, VariableExpr):
                 var = self.lookup(node.operand.name)
                 if not var: raise Exception(f"Undefined var '{node.operand.name}'")
+                if var.get('moved'):
+                    self.error(f"Borrow Error: Cannot borrow moved variable '{node.operand.name}'", node)
                 if node.op == '&mut':
-                    if var['writer'] or var['readers'] > 0: raise Exception("Borrow Error")
+                    if var['writer']: 
+                        self.error(f"Borrow Error: Cannot borrow '{node.operand.name}' as mutable more than once", node, error_code="E0006")
+                    if var['readers'] > 0: 
+                        self.error(f"Borrow Error: Cannot borrow '{node.operand.name}' as mutable while immutably borrowed", node, error_code="E0006")
                     var['writer'] = True
                 else:
-                    if var['writer']: raise Exception("Borrow Error")
+                    if var['writer']: 
+                        self.error(f"Borrow Error: Cannot borrow '{node.operand.name}' as immutable while mutably borrowed", node, error_code="E0006")
                     var['readers'] += 1
                 if 'active_borrows' not in self.scopes[-1]: self.scopes[-1]['active_borrows'] = []
-                self.scopes[-1]['active_borrows'].append((node.operand.name, 'writer' if node.op == '&mut' else 'reader'))
+                role = 'writer' if node.op == '&mut' else 'reader'
+                self.scopes[-1]['active_borrows'].append((node.operand.name, role))
+                # Track borrow with scope depth for lifetime analysis
+                self.active_borrows.append((
+                    f"&{node.operand.name}", node.operand.name, role, 
+                    len(self.scopes) - 1, node
+                ))
             node.type_name = f"{t}*"
             return node.type_name
         elif node.op == '!':
@@ -1170,10 +1183,13 @@ class SemanticAnalyzer:
         if isinstance(node.target, VariableExpr):
              v = self.lookup(node.target.name)
              if not v: raise Exception("Undefined var")
-             if v['readers'] > 0: raise Exception("Variable is borrowed")
+             if v['writer']:
+                  self.error(f"Borrow Error: Cannot assign to '{node.target.name}' while it is mutably borrowed", node, error_code="E0006")
+             if v['readers'] > 0:
+                  self.error(f"Borrow Error: Cannot assign to '{node.target.name}' while it is borrowed", node, error_code="E0006")
              if val_t != v['type'] and not self.check_type_compatibility(v['type'], val_t, node):
                   self.error("Type mismatch in assignment", node, error_code="E0002")
-             v['moved'] = False
+             v['moved'] = False  # Re-assignment restores ownership
         else:
              target_t = self.visit(node.target)
              if target_t != val_t and not self.check_type_compatibility(target_t, val_t, node):
@@ -1305,126 +1321,42 @@ class SemanticAnalyzer:
             callee = self.aliases[callee]
             node.callee = callee
         
-        # Handle built-in intrinsics and special internal functions
-        if callee in ('print', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'memcpy', '__nexa_panic', '__nexa_assert', 'gpu::dispatch', 'gpu::global_id'):
-            if callee == 'gpu::dispatch':
-                # O primeiro argumento de gpu::dispatch é um nome de função (kernel), não uma variável
-                if len(node.args) > 0:
-                    # Skip visit para o primeiro arg se for o nome do kernel
-                    for i in range(1, len(node.args)):
-                        self.visit(node.args[i])
-                return 'void'
-            
-            for a in node.args: self.visit(a)
-            if callee == 'fs::read_file': 
-                self.instantiate_generic_type('Buffer<u8>')
-                node.type_name = 'Buffer<u8>'
-                return 'Buffer<u8>'
-            if callee in ('malloc', 'realloc'): return 'u8*'
-            if callee == 'gpu::global_id': return 'i32'
-            return 'void'
+        # 1. Built-in intrinsics
+        result = self._visit_call_intrinsic(callee, node)
+        if result is not None:
+            return result
 
-        # Double Colon Logic (also handles resolved aliases from glob imports)
+        # 2. Double-colon calls (Type::method, Enum::Variant)
         generics_mapping = {}
-        # Double Colon Logic (also handles resolved aliases from glob imports)
         if isinstance(callee, str) and '::' in callee:
-            parts = callee.rsplit('::', 1); prefix = self.resolve_type_name(parts[0]); suffix = parts[1]
-            callee = f"{prefix}::{suffix}"
-            node.callee = callee
-            if '<' in prefix: 
-                 self.instantiate_generic_type(prefix)
-                 # Capture Generics Mapping for Static Methods
-                 base = prefix.split('<')[0]
-                 if base in self.generic_structs:
-                      struct_def = self.generic_structs[base]
-                      args_str = prefix[prefix.find('<')+1:-1]
-                      args = self.split_generic_args(args_str)
-                      for (gname, bound, is_const), gval in zip(struct_def.generics, args):
-                           generics_mapping[gname] = gval
+            result = self._visit_call_qualified(callee, node, generics_mapping)
+            if result is not None:
+                return result
+            callee = node.callee  # May have been updated
 
-            if prefix in self.enums:
-                variants = self.enums[prefix]
-                if suffix not in variants: raise Exception("Variant not found")
-                payloads = variants[suffix]
-                if len(node.args) != len(payloads): raise Exception("Arg mismatch")
-                self.enter_scope()
-                for i, arg in enumerate(node.args):
-                    if self.visit(arg) != payloads[i]: raise Exception("Type mismatch")
-                    if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]): self.move_var(arg.name)
-                self.exit_scope(); return prefix
-            
-            # Support variants of non-concrete generic enums
-            base_prefix = prefix.split('<')[0]
-            if base_prefix in self.generic_enums:
-                 # We can't type-check the payload thoroughly without instantiation,
-                 # but for now we accept it and return the prefix.
-                 for arg in node.args: self.visit(arg)
-                 return prefix
-            
-            # Check for mangled function or struct
-            mangled_base = f"{prefix}_{suffix}"
-            if mangled_base not in self.function_defs and '<' in prefix:
-                 # Check if this is a generic method we haven't monomorphized yet
-                 base_prefix = prefix.split('<')[0]
-                 if base_prefix in self.generic_structs or base_prefix in self.generic_enums:
-                      self.instantiate_generic_function(mangled_base)
-            
-            if mangled_base not in self.function_defs and '<' in prefix:
-                 # Fallback to base name mangling if monomorphized function doesn't exist
-                 mangled_base = f"{prefix.split('<')[0]}_{suffix}"
-            
-            if mangled_base in self.function_defs:
-                 arg_types = [self.visit(arg) for arg in node.args]
-                 func_def, mangled_full = self.resolve_overload(mangled_base, arg_types, node)
-                 node.callee = mangled_full
-                 func_def.used = True
-                 
-                 ret = func_def.return_type
-                 if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
-                 return ret
-            
-            if mangled_base in self.structs or mangled_base in self.generic_structs:
-                 callee = mangled_base; node.callee = mangled_base
+        # 3. Repeat intrinsic check after alias/module resolution
+        result = self._visit_call_intrinsic(callee, node)
+        if result is not None:
+            return result
 
-        if callee == 'print':
-            for a in node.args: self.visit(a)
-            return 'void'
-        if callee in ('fs::read_file', 'fs::write_file', 'fs::append_file', 'malloc', 'free', 'realloc', 'panic', 'assert', 'memcpy'):
-            # Simplified intrinsics check
-            if callee in self.function_defs:
-                 self.function_defs[callee].used = True
-            for a in node.args: self.visit(a)
-            if callee == 'fs::read_file': 
-                self.instantiate_generic_type('Buffer<u8>')
-                node.type_name = 'Buffer<u8>'
-                return 'Buffer<u8>'
-            if callee in ('malloc', 'realloc'): return 'u8*'
-            return 'void'
-        if callee == 'gpu::global_id': return 'i32'
-        if callee == 'gpu::dispatch':
-             if len(node.args) >= 1:
-                  self.visit(node.args[0])
-                  if len(node.args) == 2: self.visit(node.args[1])
-             return 'void'
-        if isinstance(callee, str) and callee.startswith('cast<'): self.visit(node.args[0]); return callee[5:-1]
-        if isinstance(callee, str) and callee.startswith('sizeof<'): return 'i32'
+        # 4. Cast/sizeof builtins
+        if isinstance(callee, str) and callee.startswith('cast<'):
+            self.visit(node.args[0])
+            return callee[5:-1]
+        if isinstance(callee, str) and callee.startswith('sizeof<'):
+            return 'i32'
 
-        # Try local module lookup if not found
-        if callee not in self.functions and callee not in self.structs and '<' not in callee:
-             if self.current_module:
-                  local = f"{self.current_module.replace('::', '_')}_{callee}"
-                  if local in self.functions or local in self.structs or local in self.generic_functions or local in self.generic_structs:
-                       callee = local
-                       node.callee = local
-        
-        # If still not found, try to find a suggestion
+        # 5. Local module lookup
+        callee = self._resolve_local_module(callee, node)
+
+        # 6. Error if unknown
         if callee not in self.functions and callee not in self.structs and callee not in self.generic_functions and callee not in self.generic_structs and '<' not in callee:
              possibilities = list(self.functions) + list(self.structs.keys()) + list(self.generic_functions.keys()) + list(self.generic_structs.keys())
              suggestion = self.get_suggestion(callee, possibilities)
              hint = f"did you mean '{suggestion}'?" if suggestion else None
              self.error(f"Unknown function or struct: '{callee}'", node, hint=hint, error_code="E0004")
 
-        # Generic Struct Instantiation (e.g. Wrapper<T>)
+        # 7. Generic struct instantiation
         if '<' in callee:
              base = callee.split('<')[0]
              resolved_base = self.resolve_type_name(base)
@@ -1433,81 +1365,224 @@ class SemanticAnalyzer:
                   node.callee = callee
                   self.instantiate_generic_struct(callee)
 
-        if callee in self.structs or (callee in self.generic_structs) or ('<' in callee and callee.split('<')[0] in self.generic_structs):
-            # Constructor call
-            struct_name = callee
-            if '<' in struct_name:
-                 base = struct_name.split('<')[0]
-                 if base in self.generic_structs:
-                      self.instantiate_generic_struct(struct_name)
-            
-            if struct_name not in self.structs:
-                 # Check if base exists but not instantiated
-                 base = struct_name.split('<')[0] if '<' in struct_name else struct_name
-                 if base in self.generic_structs:
-                      # Still not instantiated? maybe args are not concrete
-                      # We return the generic type name
-                      for a in node.args: self.visit(a)
-                      return struct_name
-                 raise Exception(f"Semantic Error: Unknown struct '{struct_name}'")
+        # 8. Struct constructor
+        result = self._visit_call_struct_constructor(callee, node)
+        if result is not None:
+            return result
 
-            # Mark struct as used
-            base_struct = struct_name.split('<')[0]
-            if base_struct in self.struct_used: self.struct_used[base_struct] = True
-            
-            fields = self.structs[struct_name]
-            # ... rest of constructor logic (unchanged)
-            if len(node.args) != len(fields): raise Exception(f"Arg mismatch for '{struct_name}' constructor")
-            self.enter_scope()
-            for i, (fname, ftype) in enumerate(fields.items()):
-                arg_t = self.visit(node.args[i])
-                if arg_t != ftype: 
-                    raise Exception(f"Type mismatch field '{fname}': expected {ftype}, got {arg_t}")
-            self.exit_scope()
-            return struct_name
-            
+        # 9. Generic function instantiation
         if '<' in callee:
             base = callee.split('<')[0]
             if base in self.generic_functions:
                  self.instantiate_generic_function(callee)
 
+        # 10. Regular function call
         if callee in self.functions:
-            arg_types = [self.visit(arg) for arg in node.args]
-            func_def, mangled_name = self.resolve_overload(callee, arg_types, node)
-            
-            node.callee = mangled_name
-            func_def.used = True
-            
-            # Re-visit args in scope if needed? No, already visited.
-            # But we should check for moves if not copy.
-            for i, arg in enumerate(node.args):
-                 if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_types[i]):
-                      self.move_var(arg.name)
-
-            ret = func_def.return_type
-            if generics_mapping: ret = self.apply_submap(ret, generics_mapping)
-            
-            if func_def.is_async:
-                # Wrap in Task<T>
-                task_type = f"Task<{ret}>"
-                self.instantiate_generic_type(task_type)
-                return task_type
-                
-            return ret
+            return self._visit_call_regular(callee, node, generics_mapping)
 
         raise Exception(f"Semantic Error: Unknown function or struct definition '{callee}'")
+
+    # ── CallExpr helpers ─────────────────────────────────────────────────────
+
+    def _visit_call_intrinsic(self, callee, node):
+        """Handle built-in intrinsics. Returns type string or None if not intrinsic."""
+        INTRINSICS = ('print', 'panic', 'assert', 'slice_from_array',
+                      'fs::read_file', 'fs::write_file', 'fs::append_file',
+                      'malloc', 'free', 'realloc', 'memcpy',
+                      '__nexa_panic', '__nexa_assert', 'gpu::dispatch', 'gpu::global_id',
+                      'compress::create', 'compress::destroy', 'compress::quantize',
+                      'compress::dequantize', 'compress::mse')
+        
+        if callee not in INTRINSICS:
+            return None
+
+        if callee == 'gpu::dispatch':
+            if len(node.args) > 0:
+                for i in range(1, len(node.args)):
+                    self.visit(node.args[i])
+            return 'void'
+        
+        if callee == 'gpu::global_id':
+            return 'i32'
+
+        if callee == 'compress::create':
+            for a in node.args: self.visit(a)
+            return '*u8'
+        if callee == 'compress::destroy':
+            for a in node.args: self.visit(a)
+            return 'void'
+        if callee in ('compress::quantize', 'compress::dequantize'):
+            for a in node.args: self.visit(a)
+            return 'void'
+        if callee == 'compress::mse':
+            for a in node.args: self.visit(a)
+            return 'f32'
+
+        for a in node.args:
+            self.visit(a)
+        
+        if callee == 'fs::read_file': 
+            self.instantiate_generic_type('Buffer<u8>')
+            node.type_name = 'Buffer<u8>'
+            return 'Buffer<u8>'
+        if callee in ('malloc', 'realloc'):
+            return 'u8*'
+        return 'void'
+
+    def _visit_call_qualified(self, callee, node, generics_mapping):
+        """Handle Type::method and Enum::Variant calls. Returns type or None."""
+        parts = callee.rsplit('::', 1)
+        prefix = self.resolve_type_name(parts[0])
+        suffix = parts[1]
+        callee = f"{prefix}::{suffix}"
+        node.callee = callee
+        
+        if '<' in prefix: 
+             self.instantiate_generic_type(prefix)
+             base = prefix.split('<')[0]
+             if base in self.generic_structs:
+                  struct_def = self.generic_structs[base]
+                  args_str = prefix[prefix.find('<')+1:-1]
+                  args = self.split_generic_args(args_str)
+                  for (gname, bound, is_const), gval in zip(struct_def.generics, args):
+                       generics_mapping[gname] = gval
+
+        # Enum variant construction
+        if prefix in self.enums:
+            variants = self.enums[prefix]
+            if suffix not in variants:
+                raise Exception("Variant not found")
+            payloads = variants[suffix]
+            if len(node.args) != len(payloads):
+                raise Exception("Arg mismatch")
+            self.enter_scope()
+            for i, arg in enumerate(node.args):
+                if self.visit(arg) != payloads[i]:
+                    raise Exception("Type mismatch")
+                if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
+                    self.move_var(arg.name)
+            self.exit_scope()
+            return prefix
+        
+        # Non-concrete generic enum variant
+        base_prefix = prefix.split('<')[0]
+        if base_prefix in self.generic_enums:
+             for arg in node.args:
+                 self.visit(arg)
+             return prefix
+        
+        # Static method call (mangled)
+        mangled_base = f"{prefix}_{suffix}"
+        if mangled_base not in self.function_defs and '<' in prefix:
+             base_prefix = prefix.split('<')[0]
+             if base_prefix in self.generic_structs or base_prefix in self.generic_enums:
+                  self.instantiate_generic_function(mangled_base)
+        
+        if mangled_base not in self.function_defs and '<' in prefix:
+             mangled_base = f"{prefix.split('<')[0]}_{suffix}"
+        
+        if mangled_base in self.function_defs:
+             arg_types = [self.visit(arg) for arg in node.args]
+             func_def, mangled_full = self.resolve_overload(mangled_base, arg_types, node)
+             node.callee = mangled_full
+             func_def.used = True
+             ret = func_def.return_type
+             if generics_mapping:
+                 ret = self.apply_submap(ret, generics_mapping)
+             return ret
+        
+        if mangled_base in self.structs or mangled_base in self.generic_structs:
+             node.callee = mangled_base
+        
+        return None  # Not fully resolved here, continue in main method
+
+    def _resolve_local_module(self, callee, node):
+        """Try to resolve callee via local module prefix."""
+        if callee not in self.functions and callee not in self.structs and '<' not in callee:
+             if self.current_module:
+                  local = f"{self.current_module.replace('::', '_')}_{callee}"
+                  if local in self.functions or local in self.structs or local in self.generic_functions or local in self.generic_structs:
+                       node.callee = local
+                       return local
+        return callee
+
+    def _visit_call_struct_constructor(self, callee, node):
+        """Handle struct constructor calls. Returns type or None."""
+        is_struct = (callee in self.structs or callee in self.generic_structs or
+                     ('<' in callee and callee.split('<')[0] in self.generic_structs))
+        if not is_struct:
+            return None
+
+        struct_name = callee
+        if '<' in struct_name:
+             base = struct_name.split('<')[0]
+             if base in self.generic_structs:
+                  self.instantiate_generic_struct(struct_name)
+        
+        if struct_name not in self.structs:
+             base = struct_name.split('<')[0] if '<' in struct_name else struct_name
+             if base in self.generic_structs:
+                  for a in node.args:
+                      self.visit(a)
+                  return struct_name
+             raise Exception(f"Semantic Error: Unknown struct '{struct_name}'")
+
+        base_struct = struct_name.split('<')[0]
+        if base_struct in self.struct_used:
+            self.struct_used[base_struct] = True
+        
+        fields = self.structs[struct_name]
+        if len(node.args) != len(fields):
+            raise Exception(f"Arg mismatch for '{struct_name}' constructor")
+        self.enter_scope()
+        for i, (fname, ftype) in enumerate(fields.items()):
+            arg_t = self.visit(node.args[i])
+            if arg_t != ftype: 
+                raise Exception(f"Type mismatch field '{fname}': expected {ftype}, got {arg_t}")
+        self.exit_scope()
+        return struct_name
+
+    def _visit_call_regular(self, callee, node, generics_mapping):
+        """Handle regular function calls with overload resolution."""
+        arg_types = [self.visit(arg) for arg in node.args]
+        func_def, mangled_name = self.resolve_overload(callee, arg_types, node)
+        
+        node.callee = mangled_name
+        func_def.used = True
+        
+        for i, arg in enumerate(node.args):
+             if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_types[i]):
+                  self.move_var(arg.name)
+
+        ret = func_def.return_type
+        if generics_mapping:
+            ret = self.apply_submap(ret, generics_mapping)
+        
+        if func_def.is_async:
+            task_type = f"Task<{ret}>"
+            self.instantiate_generic_type(task_type)
+            return task_type
+            
+        return ret
 
     def enter_scope(self):
         self.scopes.append({})
 
     def exit_scope(self):
         current_scope = self.scopes[-1]
+        current_depth = len(self.scopes) - 1
+        
         if 'active_borrows' in current_scope:
             for var_name, role in current_scope['active_borrows']:
                 var_info = self.lookup(var_name)
                 if var_info:
                     if role == 'reader': var_info['readers'] -= 1
                     elif role == 'writer': var_info['writer'] = False
+        
+        # Clean up lifetime tracking for borrows in this scope
+        self.active_borrows = [
+            b for b in self.active_borrows if b[3] < current_depth
+        ]
         
         # Check for unused variables
         for name, info in current_scope.items():
@@ -1548,6 +1623,17 @@ class SemanticAnalyzer:
     def visit_ReturnStmt(self, node):
         if node.value:
             t = self.visit(node.value)
+            # Check for returning a reference to a local variable (dangling reference)
+            if isinstance(node.value, UnaryExpr) and node.value.op in ('&', '&mut'):
+                if isinstance(node.value.operand, VariableExpr):
+                    var_name = node.value.operand.name
+                    _, depth = self.lookup_with_depth(var_name)
+                    if depth is not None and depth > 0:
+                        self.error(
+                            f"Lifetime Error: Cannot return reference to local variable '{var_name}'",
+                            node, hint="local variables are dropped when the function returns",
+                            error_code="E0007"
+                        )
             if isinstance(node.value, VariableExpr) and not self.is_copy_type(t):
                  if '::' not in node.value.name:
                       self.move_var(node.value.name)

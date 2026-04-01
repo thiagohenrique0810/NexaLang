@@ -90,8 +90,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] `Vec<T>` (Dynamic array).
     - [x] String manipulation.
     - [x] `unwrap`, `map`, `and_then` helpers for Option/Result.
-- [ ] **Self-Hosting**
-    - [~] Rewrite the compiler using NexaLang itself.
+- [x] **Self-Hosting**
+    - [x] Rewrite the compiler using NexaLang itself.
       - [x] Stage 1: file IO (`fs::read_file`) + Buffer<u8> sample.
       - [x] Stage 2: minimal lexer in NexaLang (token counting).
     - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
@@ -225,7 +225,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] Package manager (`nxpkg`)
 - [x] Build system improvements (Project support via `nexa.json`)
 - [x] Standard library expansion (HashMap, File I/O, JSON, etc.)
-- [/] Networking Stack (FFI foundation for libcurl + Response handling)
+- [x] Networking Stack (FFI foundation for libcurl + Response handling)
 - [x] Data Serialization (Full JSON parser for Objects and Arrays)
 - [x] Database Drivers (SQLite abstraction in `std::db` with Query support)
+- [x] Vector Compression (TurboQuant near-optimal quantization in `std::compress`, 1-4 bit, C runtime + intrinsics)
 

@@ -233,6 +233,20 @@ class CodeGen:
         self.coro_done = ir.Function(self.module, ir.FunctionType(i1, [void_ptr]), name="llvm.coro.done")
         self.coro_promise = ir.Function(self.module, ir.FunctionType(void_ptr, [void_ptr, i32, i1]), name="llvm.coro.promise")
 
+        # TurboQuant compression intrinsics
+        f32 = ir.FloatType()
+        f32_ptr = f32.as_pointer()
+        if "tq_create" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(void_ptr, [i32, i32, i32]), name="tq_create")
+        if "tq_destroy" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="tq_destroy")
+        if "tq_quantize" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr, f32_ptr, void_ptr, i32]), name="tq_quantize")
+        if "tq_dequantize" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr, void_ptr, f32_ptr, i32]), name="tq_dequantize")
+        if "tq_mse" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(f32, [void_ptr, f32_ptr, i32]), name="tq_mse")
+
     def _declare_arena(self):
         # struct Arena { chunk: i8*, offset: i32, capacity: i32 }
         void_ptr = ir.IntType(8).as_pointer()
@@ -482,18 +496,15 @@ class CodeGen:
         self._current_generics = [g[0] for g in node.generics]
 
         # Representation: { i32 tag, [MaxPayloadSize x i8] data }
-        # 1. Determine max payload size
+        # 1. Determine max payload size across all variants
         max_size = 0
         variant_tags = {}
         variant_payload_types = {}
 
-        # Helper for recursive types: Register proper placeholder (not i8!)
-        placeholder_padding = ir.ArrayType(ir.IntType(8), 256)
+        # Pre-register placeholder for recursive types
+        placeholder_padding = ir.ArrayType(ir.IntType(8), 8)
         placeholder_enum = ir.LiteralStructType([ir.IntType(32), placeholder_padding])
         self.enum_definitions[node.name] = (placeholder_enum, {})
-
-        # For this phase, assume only i32 payloads for simplicity of size calc
-        # i32 = 4 bytes
 
         for i, (vname, payloads) in enumerate(node.variants):
             variant_tags[vname] = i
@@ -505,11 +516,18 @@ class CodeGen:
                     lty = self.get_llvm_type(ptype)
                     llvm_types.append(lty)
 
-                    # Rough size estimation (bootstrap limitation)
+                    # Size estimation
                     if isinstance(lty, ir.IntType):
                         current_size += lty.width // 8
                     elif isinstance(lty, ir.PointerType):
                         current_size += 8
+                    elif isinstance(lty, ir.FloatType):
+                        current_size += 4
+                    elif isinstance(lty, ir.DoubleType):
+                        current_size += 8
+                    elif isinstance(lty, ir.ArrayType):
+                        elem_size = lty.element.width // 8 if isinstance(lty.element, ir.IntType) else 8
+                        current_size += elem_size * lty.count
                     else:
                         current_size += 64 # Struct/Array fallback
 
@@ -522,15 +540,11 @@ class CodeGen:
             else:
                 variant_payload_types[vname] = None
 
-        # Tag (i32) + Payload (Array of i8)
-        # Use Fixed Size (Universal Enum)
-        # max_size = max(max_size, current_size) # We ignore calculated max
-        final_size = 256
+        # Tag (i32) + Payload (dynamic size aligned to 8 bytes)
+        # Minimum 8 bytes for small payloads, grows as needed
+        MIN_PAYLOAD = 8
+        final_size = max(MIN_PAYLOAD, ((max_size + 7) // 8) * 8)  # Align to 8
         padding_ty = ir.ArrayType(ir.IntType(8), final_size)
-
-        # Check if any variant exceeds limit?
-        if max_size > final_size:
-            print(f"WARNING: Enum {node.name} payload size {max_size} exceeds fixed limit {final_size}")
         enum_ty = ir.LiteralStructType([ir.IntType(32), padding_ty])
 
         self.enum_types[node.name] = variant_tags
@@ -548,9 +562,9 @@ class CodeGen:
         self._current_generics = []
 
     def generate(self, ast):
-        # Pre-Pass: Register Universal Enum Types to handle recursion
-        enum_payload_size = 256
-        placeholder_padding = ir.ArrayType(ir.IntType(8), enum_payload_size)
+        # Pre-Pass: Register Enum placeholder types to handle recursive references
+        # Use a small initial placeholder; visit_EnumDef will replace with calculated size
+        placeholder_padding = ir.ArrayType(ir.IntType(8), 8)
         placeholder_enum = ir.LiteralStructType([ir.IntType(32), placeholder_padding])
 
         for node in ast:
@@ -1908,6 +1922,61 @@ class CodeGen:
                 self.gpu_global_id.initializer = ir.Constant(ir.IntType(32), 0)
                 self.gpu_global_id.linkage = "internal"
             return self.builder.load(self.gpu_global_id, name="gpu_global_id")
+
+        # ── TurboQuant compression intrinsics ──
+        elif callee_name == "compress::create":
+            # compress::create(dim, bits, seed) -> *u8
+            dim_val = self.visit(node.args[0])
+            bits_val = self.visit(node.args[1])
+            seed_val = self.visit(node.args[2]) if len(node.args) > 2 else ir.Constant(ir.IntType(32), 42)
+            return self.builder.call(self.module.globals["tq_create"], [dim_val, bits_val, seed_val], name="tq_ctx")
+
+        elif callee_name == "compress::destroy":
+            ctx_val = self.visit(node.args[0])
+            void_ptr = ir.IntType(8).as_pointer()
+            if ctx_val.type != void_ptr:
+                ctx_val = self.builder.bitcast(ctx_val, void_ptr)
+            self.builder.call(self.module.globals["tq_destroy"], [ctx_val])
+            return None
+
+        elif callee_name == "compress::quantize":
+            # compress::quantize(ctx, input_f32_ptr, output_u16_ptr, n_vectors)
+            ctx_val = self.visit(node.args[0])
+            in_val  = self.visit(node.args[1])
+            out_val = self.visit(node.args[2])
+            n_val   = self.visit(node.args[3])
+            void_ptr = ir.IntType(8).as_pointer()
+            f32_ptr = ir.FloatType().as_pointer()
+            if ctx_val.type != void_ptr: ctx_val = self.builder.bitcast(ctx_val, void_ptr)
+            if in_val.type != f32_ptr:   in_val  = self.builder.bitcast(in_val, f32_ptr)
+            if out_val.type != void_ptr: out_val = self.builder.bitcast(out_val, void_ptr)
+            self.builder.call(self.module.globals["tq_quantize"], [ctx_val, in_val, out_val, n_val])
+            return None
+
+        elif callee_name == "compress::dequantize":
+            # compress::dequantize(ctx, input_u16_ptr, output_f32_ptr, n_vectors)
+            ctx_val = self.visit(node.args[0])
+            in_val  = self.visit(node.args[1])
+            out_val = self.visit(node.args[2])
+            n_val   = self.visit(node.args[3])
+            void_ptr = ir.IntType(8).as_pointer()
+            f32_ptr = ir.FloatType().as_pointer()
+            if ctx_val.type != void_ptr: ctx_val = self.builder.bitcast(ctx_val, void_ptr)
+            if in_val.type != void_ptr:  in_val  = self.builder.bitcast(in_val, void_ptr)
+            if out_val.type != f32_ptr:  out_val = self.builder.bitcast(out_val, f32_ptr)
+            self.builder.call(self.module.globals["tq_dequantize"], [ctx_val, in_val, out_val, n_val])
+            return None
+
+        elif callee_name == "compress::mse":
+            # compress::mse(ctx, original_f32_ptr, n_vectors) -> f32
+            ctx_val = self.visit(node.args[0])
+            x_val   = self.visit(node.args[1])
+            n_val   = self.visit(node.args[2])
+            void_ptr = ir.IntType(8).as_pointer()
+            f32_ptr = ir.FloatType().as_pointer()
+            if ctx_val.type != void_ptr: ctx_val = self.builder.bitcast(ctx_val, void_ptr)
+            if x_val.type != f32_ptr:    x_val   = self.builder.bitcast(x_val, f32_ptr)
+            return self.builder.call(self.module.globals["tq_mse"], [ctx_val, x_val, n_val], name="tq_mse_result")
 
         elif callee_name == "gpu::dispatch":
             if len(node.args) < 2: raise Exception("gpu::dispatch expects at least 2 args")

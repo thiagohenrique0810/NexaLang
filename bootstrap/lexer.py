@@ -59,11 +59,6 @@ class Lexer:
                 continue
             
             # Punctuation
-            if char == ':' and self.pos + 1 < self.length and self.source[self.pos+1] == ':':
-                tokens.append(Token('DOUBLE_COLON', '::', start_line, start_col))
-                self.advance(2)
-                continue
-
             if char == '(':
                 tokens.append(Token('LPAREN', '(', start_line, start_col))
                 self.advance()

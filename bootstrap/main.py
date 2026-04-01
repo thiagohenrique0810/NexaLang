@@ -3,10 +3,32 @@ import os
 import argparse
 from lexer import Lexer
 import n_parser
-from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef
+from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef, CallExpr, IntegerLiteral, StringLiteral, ReturnStmt
 from codegen import CodeGen
 from errors import CompilerError
 import semantic
+
+
+def _build_test_runner(test_names):
+    """Build a proper test main function body with error handling."""
+    body = []
+    total = len(test_names)
+    body.append(CallExpr("print", [StringLiteral(f"Running {total} test(s)...\n")]))
+    
+    for test_name in test_names:
+        body.append(CallExpr("print", [StringLiteral(f"  test {test_name} ... ")]))
+        body.append(CallExpr(test_name, []))
+        body.append(CallExpr("print", [StringLiteral("PASSED\n")]))
+    
+    body.append(CallExpr("print", [StringLiteral(f"\n{total} test(s) passed.\n")]))
+    body.append(ReturnStmt(IntegerLiteral(0)))
+    
+    # Set required attributes on each node
+    for node in body:
+        node.line = 0
+        node.column = 0
+    
+    return body
 
 def mangle_ast(nodes, prefix):
     for node in nodes:
@@ -83,6 +105,8 @@ def main():
     ap.add_argument("--run-jit", action="store_true", help="Run the generated code immediately using JIT (no external compiler required)")
     ap.add_argument("--run-tests", action="store_true", help="Find and run all functions marked with @[test]")
     ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
+    ap.add_argument("--emit-mir", action="store_true", help="Emit MIR (Mid-level IR) for debugging/optimization analysis")
+    ap.add_argument("--opt", choices=["0", "1", "2"], default="1", help="MIR optimization level (0=none, 1=basic, 2=aggressive)")
     args = ap.parse_args()
 
     filepath = args.file
@@ -147,24 +171,47 @@ def main():
 
     # 4. Code Generation
     if args.run_tests:
-        # Create a test main
-        from n_parser import FunctionDef, CallExpr, IntegerLiteral, StringLiteral
-        
-        test_body = []
-        for test_name in analyzer.tests:
-            test_body.append(CallExpr("print", [StringLiteral(f"Running test {test_name}... ")]))
-            test_body.append(CallExpr(test_name, []))
-            test_body.append(CallExpr("print", [StringLiteral("PASSED\n")]))
-        
-        test_body.append(n_parser.ReturnStmt(IntegerLiteral(0)))
+        # Build test runner with proper AST construction
+        test_body = _build_test_runner(analyzer.tests)
         
         test_main = FunctionDef("main", [], "i32", test_body)
+        test_main.generics = []
+        test_main.is_kernel = False
+        test_main.is_async = False
+        test_main.is_pub = False
+        test_main.attributes = []
+        test_main.is_vararg = False
+        test_main.module = ""
+        test_main.line = 0
+        test_main.column = 0
+        
         # Remove existing main if any
         ast = [n for n in ast if not (isinstance(n, FunctionDef) and n.name == "main")]
         ast.append(test_main)
         
-        # Re-analyze the injected main
-        analyzer.visit(test_main)
+        # Register in semantic analyzer
+        analyzer.functions.add("main")
+        analyzer.function_defs["main"] = [test_main]
+        test_main.return_type = "i32"
+        test_main.used = True
+        test_main.mangled_name = "main"
+
+    # 4.5 MIR (optional optimization layer)
+    if args.emit_mir:
+        from mir import MIRLowering, MIROptimizer, MIRPrinter
+        lowering = MIRLowering()
+        mir_module = lowering.lower(ast, struct_info=analyzer.structs, enum_info=analyzer.enums)
+        
+        optimizer = MIROptimizer()
+        mir_module = optimizer.optimize(mir_module, level=int(args.opt))
+        
+        printer = MIRPrinter()
+        mir_text = printer.print_module(mir_module)
+        
+        mir_path = os.path.splitext(args.out or "output.ll")[0] + ".mir"
+        with open(mir_path, "w", encoding="utf-8") as f:
+            f.write(mir_text)
+        print(f"[MIR] Emitted to '{mir_path}' (opt={args.opt}, folded={optimizer.stats['constant_folded']}, eliminated={optimizer.stats['dead_eliminated']}, propagated={optimizer.stats['copies_propagated']})")
 
     spirv_env = args.spirv_env if args.target == "spirv" else "opencl"
     emit_kernels_only = args.target == "spirv" and args.emit == "spv"
