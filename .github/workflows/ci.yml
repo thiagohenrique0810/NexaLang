@@ -1,0 +1,77 @@
+name: NexaLang CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build TurboQuant runtime
+        run: |
+          cd runtime
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            gcc -O2 -shared -fPIC -o libturboquant.so turboquant.c -lm
+          else
+            gcc -O2 -shared -fPIC -o libturboquant.dylib turboquant.c -lm
+          fi
+
+      - name: Run tests
+        run: python tests/run_tests.py
+
+      - name: Lint bootstrap compiler
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, 'bootstrap')
+          from lexer import Lexer
+          from n_parser import Parser
+          from semantic import SemanticAnalyzer
+
+          # Compile all examples that should succeed
+          import os
+          skip = ['associated_types_fail.nxl']
+          examples_dir = 'examples'
+          passed = 0
+          failed = 0
+          for f in sorted(os.listdir(examples_dir)):
+              if not f.endswith('.nxl') or f in skip:
+                  continue
+              path = os.path.join(examples_dir, f)
+              try:
+                  src = open(path).read()
+                  tokens = Lexer(src).tokenize()
+                  ast = Parser(tokens).parse()
+                  sa = SemanticAnalyzer()
+                  sa.analyze(ast)
+                  passed += 1
+              except Exception as e:
+                  # Some examples intentionally test error paths
+                  if 'error' in f.lower() or 'fail' in f.lower() or 'dead_code' in f:
+                      passed += 1
+                  else:
+                      print(f'WARN: {f}: {e}')
+                      failed += 1
+          print(f'Examples: {passed} parsed, {failed} unexpected failures')
+          if failed > 0:
+              sys.exit(1)
+          "

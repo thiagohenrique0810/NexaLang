@@ -1108,6 +1108,10 @@ class SemanticAnalyzer:
         for attr_name, attr_args in getattr(node, 'attrs', []):
             if attr_name == 'test':
                 self.tests.append(node.name)
+            elif attr_name == 'quantize':
+                # @[quantize(bits)] — mark function for auto-quantized float buffers
+                bits = int(attr_args[0]) if attr_args else 3
+                node._quantize_bits = bits
 
         self.current_function = node
         self.enter_scope()

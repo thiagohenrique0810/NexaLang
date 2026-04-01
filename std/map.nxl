@@ -46,7 +46,46 @@ impl<K: Hash, V> HashMap<K, V> {
         return HashMap(entries, 0);
     }
 
+    fn with_capacity(cap: i32) -> HashMap<K, V> {
+        let mut entries = Vec::<Entry<K, V>>::new();
+        for i in 0..cap {
+            entries.push(Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+        }
+        return HashMap(entries, 0);
+    }
+
+    fn _maybe_resize(&mut self) {
+        let cap = self.entries.len();
+        # Resize at 75% load factor
+        if (self.count * 4 < cap * 3) { return; }
+        
+        let new_cap = cap * 2;
+        let mut new_entries = Vec::<Entry<K, V>>::new();
+        for i in 0..new_cap {
+            new_entries.push(Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+        }
+        
+        # Rehash all existing entries
+        for i in 0..cap {
+            let old = self.entries.get(i).unwrap();
+            if (old.occupied) {
+                let h = old.key.hash();
+                let mut idx = cast::<i32>(h % cast::<u64>(new_cap));
+                while (true) {
+                    let slot = new_entries.get(idx).unwrap();
+                    if (!slot.occupied) {
+                        new_entries.set(idx, Entry::<K, V>(old.key, old.value, true));
+                        break;
+                    }
+                    idx = (idx + 1) % new_cap;
+                }
+            }
+        }
+        self.entries = new_entries;
+    }
+
     fn insert(&mut self, key: K, value: V) {
+        self._maybe_resize();
         let h = key.hash();
         let cap = self.entries.len();
         let mut idx = cast::<i32>(h % cast::<u64>(cap));
@@ -89,6 +128,39 @@ impl<K: Hash, V> HashMap<K, V> {
 
     fn len(&self) -> i32 {
         return self.count;
+    }
+
+    fn is_empty(&self) -> bool {
+        return self.count == 0;
+    }
+
+    fn remove(&mut self, key: K) -> Option<V> {
+        let h = key.hash();
+        let cap = self.entries.len();
+        let mut idx = cast::<i32>(h % cast::<u64>(cap));
+        let start_idx = idx;
+        
+        while (true) {
+            let entry = self.entries.get(idx).unwrap();
+            if (!entry.occupied) { return Option::<V>::None; }
+            if (entry.key == key) {
+                let val = entry.value;
+                self.entries.set(idx, Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+                self.count = self.count - 1;
+                return Option::<V>::Some(val);
+            }
+            idx = (idx + 1) % cap;
+            if (idx == start_idx) { break; }
+        }
+        return Option::<V>::None;
+    }
+
+    fn clear(&mut self) {
+        let cap = self.entries.len();
+        for i in 0..cap {
+            self.entries.set(i, Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+        }
+        self.count = 0;
     }
 
     fn iter(&self) -> HashMapIterator<K, V> {

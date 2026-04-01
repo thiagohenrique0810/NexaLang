@@ -795,7 +795,7 @@ class MIROptimizer:
         self.stats = {'constant_folded': 0, 'dead_eliminated': 0, 'copies_propagated': 0}
 
     def optimize(self, module: MIRModule, level: int = 1) -> MIRModule:
-        """Run optimization passes. level: 0=none, 1=basic, 2=aggressive."""
+        """Run optimization passes. level: 0=none, 1=basic, 2=aggressive, 3=full."""
         if level == 0:
             return module
 
@@ -805,8 +805,27 @@ class MIROptimizer:
             self.constant_fold(func)
             self.copy_propagation(func)
             self.dead_code_elimination(func)
+            self.simplify_branches(func)
+            self.remove_unreachable_blocks(func)
             if level >= 2:
+                self.strength_reduction(func)
                 self.constant_fold(func)  # Second pass after propagation
+                self.dead_code_elimination(func)
+                self.remove_unreachable_blocks(func)
+            if level >= 3:
+                self.common_subexpression_elimination(func)
+                self.constant_fold(func)
+                self.copy_propagation(func)
+                self.dead_code_elimination(func)
+
+        # Cross-function: inline small functions
+        if level >= 2:
+            self.inline_small_functions(module)
+            # Re-optimize after inlining
+            for func in module.functions:
+                if func.is_extern:
+                    continue
+                self.constant_fold(func)
                 self.dead_code_elimination(func)
 
         return module
@@ -979,6 +998,221 @@ class MIROptimizer:
         elif isinstance(term, MIRRet):
             if isinstance(term.value, MIRTemp) and term.value.id in copies:
                 term.value = copies[term.value.id]
+
+    # ── Strength Reduction ────────────────────────────────────────────────
+
+    def strength_reduction(self, func: MIRFunction):
+        """Replace expensive ops with cheaper equivalents."""
+        for block in func.blocks:
+            new_insts = []
+            for inst in block.instructions:
+                if isinstance(inst, MIRBinOp):
+                    replaced = self._try_strength_reduce(inst)
+                    if replaced is not None:
+                        new_insts.append(replaced)
+                        self.stats['constant_folded'] += 1
+                        continue
+                new_insts.append(inst)
+            block.instructions = new_insts
+
+    def _try_strength_reduce(self, inst: MIRBinOp):
+        """Try to replace mul/div with shifts, eliminate identity ops."""
+        left, right, op = inst.left, inst.right, inst.op
+
+        # Multiply by power of 2 → shift left
+        if op == 'mul' and isinstance(right, MIRConst) and isinstance(right.value, int) and right.value > 0:
+            shift = self._log2(right.value)
+            if shift is not None:
+                return MIRBinOp(dest=inst.dest, op='shl', left=left,
+                                right=MIRConst(shift, MIRType("i32")))
+        # Divide by power of 2 → shift right
+        if op == 'div' and isinstance(right, MIRConst) and isinstance(right.value, int) and right.value > 0:
+            shift = self._log2(right.value)
+            if shift is not None:
+                return MIRBinOp(dest=inst.dest, op='shr', left=left,
+                                right=MIRConst(shift, MIRType("i32")))
+
+        # Identity: x + 0 = x, x - 0 = x, x * 1 = x, x / 1 = x
+        if op == 'add' and isinstance(right, MIRConst) and right.value == 0:
+            return MIRAssign(dest=inst.dest, value=left)
+        if op == 'sub' and isinstance(right, MIRConst) and right.value == 0:
+            return MIRAssign(dest=inst.dest, value=left)
+        if op == 'mul' and isinstance(right, MIRConst) and right.value == 1:
+            return MIRAssign(dest=inst.dest, value=left)
+        if op == 'div' and isinstance(right, MIRConst) and right.value == 1:
+            return MIRAssign(dest=inst.dest, value=left)
+
+        # Zero: x * 0 = 0
+        if op == 'mul' and isinstance(right, MIRConst) and right.value == 0:
+            return MIRAssign(dest=inst.dest, value=MIRConst(0, inst.dest.ty))
+
+        return None
+
+    def _log2(self, n: int):
+        """Return log2(n) if n is a power of 2, else None."""
+        if n <= 0 or (n & (n - 1)) != 0:
+            return None
+        shift = 0
+        while n > 1:
+            n >>= 1
+            shift += 1
+        return shift
+
+    # ── Branch Simplification ─────────────────────────────────────────────
+
+    def simplify_branches(self, func: MIRFunction):
+        """Simplify constant-condition branches and remove empty blocks."""
+        for block in func.blocks:
+            term = block.terminator
+            if not term:
+                continue
+
+            # Constant condition: cbranch(true, A, B) → branch(A)
+            if isinstance(term, MIRCondBranch) and isinstance(term.cond, MIRConst):
+                if term.cond.value:
+                    block.terminator = MIRBranch(target=term.true_block)
+                else:
+                    block.terminator = MIRBranch(target=term.false_block)
+
+            # Chain: if block has no instructions and just jumps, can be simplified later
+            # by remove_unreachable_blocks
+
+    # ── Unreachable Block Elimination ─────────────────────────────────────
+
+    def remove_unreachable_blocks(self, func: MIRFunction):
+        """Remove blocks not reachable from entry."""
+        if not func.blocks:
+            return
+
+        reachable = set()
+        worklist = [func.blocks[0].label]
+
+        while worklist:
+            label = worklist.pop()
+            if label in reachable:
+                continue
+            reachable.add(label)
+
+            block_map = func.block_map()
+            block = block_map.get(label)
+            if not block or not block.terminator:
+                continue
+
+            term = block.terminator
+            if isinstance(term, MIRBranch):
+                worklist.append(term.target)
+            elif isinstance(term, MIRCondBranch):
+                worklist.append(term.true_block)
+                worklist.append(term.false_block)
+            elif isinstance(term, MIRMatch):
+                for _, target in term.arms:
+                    worklist.append(target)
+                if term.default_block:
+                    worklist.append(term.default_block)
+
+        before = len(func.blocks)
+        func.blocks = [b for b in func.blocks if b.label in reachable]
+        self.stats['dead_eliminated'] += (before - len(func.blocks))
+
+    # ── Common Subexpression Elimination ──────────────────────────────────
+
+    def common_subexpression_elimination(self, func: MIRFunction):
+        """Eliminate duplicate computations within a block."""
+        for block in func.blocks:
+            seen = {}  # (op, left_repr, right_repr) -> MIRTemp
+            new_insts = []
+            for inst in block.instructions:
+                if isinstance(inst, MIRBinOp):
+                    key = (inst.op, repr(inst.left), repr(inst.right))
+                    if key in seen:
+                        # Replace with copy
+                        new_insts.append(MIRAssign(dest=inst.dest, value=seen[key]))
+                        self.stats['copies_propagated'] += 1
+                        continue
+                    else:
+                        seen[key] = inst.dest
+                new_insts.append(inst)
+            block.instructions = new_insts
+
+    # ── Function Inlining ─────────────────────────────────────────────────
+
+    def inline_small_functions(self, module: MIRModule, max_insts: int = 8):
+        """Inline functions with few instructions into call sites."""
+        # Find candidates for inlining
+        candidates = {}
+        for func in module.functions:
+            if func.is_extern or func.is_kernel or func.is_async:
+                continue
+            total_insts = sum(len(b.instructions) for b in func.blocks)
+            if total_insts <= max_insts and len(func.blocks) == 1:
+                candidates[func.name] = func
+
+        if not candidates:
+            return
+
+        # Inline call sites
+        for func in module.functions:
+            if func.name in candidates:
+                continue  # Don't inline into itself
+            for block in func.blocks:
+                new_insts = []
+                for inst in block.instructions:
+                    if isinstance(inst, MIRCall) and inst.callee in candidates:
+                        target = candidates[inst.callee]
+                        inlined = self._inline_call(inst, target)
+                        new_insts.extend(inlined)
+                        self.stats['constant_folded'] += 1  # Reusing stat
+                    else:
+                        new_insts.append(inst)
+                block.instructions = new_insts
+
+    def _inline_call(self, call: MIRCall, target: MIRFunction) -> List[MIRInst]:
+        """Inline a single-block function's instructions at a call site."""
+        if not target.blocks:
+            return [call]
+
+        block = target.blocks[0]
+        result = []
+
+        # Build param → arg mapping
+        param_map = {}
+        for i, (pname, _) in enumerate(target.params):
+            if i < len(call.args):
+                param_map[pname] = call.args[i]
+
+        # Copy instructions, substituting params
+        for inst in block.instructions:
+            copied = self._copy_inst_with_params(inst, param_map)
+            if copied:
+                result.append(copied)
+
+        # If there's a return value, map it to the call dest
+        if call.dest and block.terminator and isinstance(block.terminator, MIRRet):
+            if block.terminator.value:
+                val = block.terminator.value
+                if isinstance(val, MIRVar) and val.name in param_map:
+                    val = param_map[val.name]
+                result.append(MIRAssign(dest=call.dest, value=val))
+
+        return result if result else [call]
+
+    def _copy_inst_with_params(self, inst, param_map):
+        """Deep copy an instruction, substituting parameter references."""
+        import copy as copy_mod
+        new_inst = copy_mod.deepcopy(inst)
+
+        for attr_name in ('value', 'left', 'right', 'operand', 'ptr', 'base'):
+            val = getattr(new_inst, attr_name, None)
+            if isinstance(val, MIRVar) and val.name in param_map:
+                setattr(new_inst, attr_name, param_map[val.name])
+
+        args = getattr(new_inst, 'args', None)
+        if args:
+            for i, a in enumerate(args):
+                if isinstance(a, MIRVar) and a.name in param_map:
+                    args[i] = param_map[a.name]
+
+        return new_inst
 
 
 # ── MIR Pretty Printer ──────────────────────────────────────────────────────

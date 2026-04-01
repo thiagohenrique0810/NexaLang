@@ -1113,6 +1113,205 @@ fn emit_stmt(s: Stmt, ctx: *Context) {
     }
 }
 
+# --- Semantic Analysis ---
+
+struct SemaError {
+    message: string,
+    line: i32
+}
+
+struct SliceSemaError {
+    ptr: *SemaError,
+    len: i32
+}
+
+struct SemaContext {
+    # Known variables: name -> type (use parallel arrays)
+    var_names: *string,
+    var_types: *string,
+    var_count: i32,
+    # Known functions
+    fn_names: *string,
+    fn_count: i32,
+    # Known structs
+    struct_names: *string,
+    struct_count: i32,
+    # Errors
+    errors: *SemaError,
+    error_count: i32,
+    arena: *Arena
+}
+
+fn sema_init(a: *Arena) -> SemaContext {
+    let names: *string = cast::<*string>(arena_alloc(a, 256 * 8));
+    let types: *string = cast::<*string>(arena_alloc(a, 256 * 8));
+    let fns: *string = cast::<*string>(arena_alloc(a, 128 * 8));
+    let snames: *string = cast::<*string>(arena_alloc(a, 64 * 8));
+    let errs: *SemaError = cast::<*SemaError>(arena_alloc(a, 64 * 16));
+    return SemaContext(names, types, 0, fns, 0, snames, 0, errs, 0, a);
+}
+
+fn sema_add_var(ctx: *SemaContext, name: string, ty: string) {
+    let i: i32 = (*ctx).var_count;
+    (*ctx).var_names[i] = name;
+    (*ctx).var_types[i] = ty;
+    (*ctx).var_count = i + 1;
+}
+
+fn sema_has_var(ctx: *SemaContext, name: string) -> bool {
+    let i: i32 = 0;
+    while (i < (*ctx).var_count) {
+        if (streq(cast::<*u8>((*ctx).var_names[i]), cast::<*u8>(name))) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn sema_add_fn(ctx: *SemaContext, name: string) {
+    let i: i32 = (*ctx).fn_count;
+    (*ctx).fn_names[i] = name;
+    (*ctx).fn_count = i + 1;
+}
+
+fn sema_has_fn(ctx: *SemaContext, name: string) -> bool {
+    let i: i32 = 0;
+    while (i < (*ctx).fn_count) {
+        if (streq(cast::<*u8>((*ctx).fn_names[i]), cast::<*u8>(name))) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn sema_add_struct(ctx: *SemaContext, name: string) {
+    let i: i32 = (*ctx).struct_count;
+    (*ctx).struct_names[i] = name;
+    (*ctx).struct_count = i + 1;
+}
+
+fn sema_error(ctx: *SemaContext, msg: string) {
+    let i: i32 = (*ctx).error_count;
+    (*ctx).errors[i] = SemaError(msg, 0);
+    (*ctx).error_count = i + 1;
+}
+
+fn sema_check_expr(e: Expr, ctx: *SemaContext) {
+    match (e) {
+        Int(n) => {}
+        Str(s) => {}
+        Var(name) => {
+            if (!sema_has_var(ctx, name)) {
+                sema_error(ctx, name);
+            }
+        }
+        Binary(op, left, right) => {
+            sema_check_expr(*left, ctx);
+            sema_check_expr(*right, ctx);
+        }
+        Cast(ty, val) => {
+            sema_check_expr(*val, ctx);
+        }
+        Sizeof(ty) => {}
+        Member(obj, mem) => {
+            if (!sema_has_var(ctx, obj)) {
+                sema_error(ctx, obj);
+            }
+        }
+        Call(fname, args) => {
+            if (!sema_has_fn(ctx, fname)) {
+                # Allow built-in functions
+                if (!streq(cast::<*u8>(fname), cast::<*u8>("print"))) {
+                    sema_error(ctx, fname);
+                }
+            }
+            let i: i32 = 0;
+            while (i < args.len) {
+                sema_check_expr(args.ptr[i], ctx);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn sema_check_stmt(s: Stmt, ctx: *SemaContext) {
+    match (s) {
+        Return(e) => { sema_check_expr(e, ctx); }
+        Print(e) => { sema_check_expr(e, ctx); }
+        Let(name, ty, init) => {
+            sema_check_expr(init, ctx);
+            sema_add_var(ctx, name, ty);
+        }
+        Assign(name, val) => {
+            if (!sema_has_var(ctx, name)) {
+                sema_error(ctx, name);
+            }
+            sema_check_expr(val, ctx);
+        }
+        If(cond, body) => {
+            sema_check_expr(cond, ctx);
+            let i: i32 = 0;
+            while (i < body.len) {
+                sema_check_stmt(body.ptr[i], ctx);
+                i = i + 1;
+            }
+        }
+        While(cond, body) => {
+            sema_check_expr(cond, ctx);
+            let i: i32 = 0;
+            while (i < body.len) {
+                sema_check_stmt(body.ptr[i], ctx);
+                i = i + 1;
+            }
+        }
+        Match(v, arms) => {
+            sema_check_expr(v, ctx);
+        }
+        For(var_name, start, end, body) => {
+            sema_check_expr(start, ctx);
+            sema_check_expr(end, ctx);
+            sema_add_var(ctx, var_name, "i32");
+            let i: i32 = 0;
+            while (i < body.len) {
+                sema_check_stmt(body.ptr[i], ctx);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn sema_analyze(prog: Program, a: *Arena) -> SemaContext {
+    let mut ctx: SemaContext = sema_init(a);
+    
+    # Register all structs
+    let k: i32 = 0;
+    while (k < prog.structs.len) {
+        sema_add_struct(&ctx, prog.structs.ptr[k].name);
+        k = k + 1;
+    }
+    
+    # Register all functions (before checking bodies — allows forward refs)
+    let i: i32 = 0;
+    while (i < prog.functions.len) {
+        let f: Function = prog.functions.ptr[i];
+        # Extract function name from source
+        sema_add_fn(&ctx, "main"); # Simplified: only main for now
+        i = i + 1;
+    }
+    
+    # Check function bodies
+    let j: i32 = 0;
+    while (j < prog.functions.len) {
+        let f: Function = prog.functions.ptr[j];
+        let k: i32 = 0;
+        while (k < f.body.len) {
+            sema_check_stmt(f.body.ptr[k], &ctx);
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    
+    return ctx;
+}
+
 fn emit_ll(prog: Program) {
     let out: string = "dev/artifacts/output.ll";
     fs::write_file(out, "; ModuleID = 'selfhost'\n", 24);
@@ -1210,7 +1409,21 @@ fn main(argc: i32, argv: u8**) -> i32 {
     let prog: Program = parse_prog(&parser);
     print("Parsed AST.");
     
-    # 4. CodeGen
+    # 4. Semantic Analysis
+    let sema_arena: Arena = arena_init(256 * 1024); # 256KB
+    let sema: SemaContext = sema_analyze(prog, &sema_arena);
+    if (sema.error_count > 0) {
+        print("Semantic errors found:");
+        let e: i32 = 0;
+        while (e < sema.error_count) {
+            print(sema.errors[e].message);
+            e = e + 1;
+        }
+        return 1;
+    }
+    print("Semantic analysis passed.");
+    
+    # 5. CodeGen
     print("Generating LLVM IR...");
     emit_ll(prog);
     print("Done.");

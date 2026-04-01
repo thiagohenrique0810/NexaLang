@@ -392,6 +392,8 @@ class Parser:
                         args.append(self.consume('IDENTIFIER').value)
                     elif self.peek().type == 'STRING':
                         args.append(self.consume('STRING').value)
+                    elif self.peek().type == 'NUMBER':
+                        args.append(int(self.consume('NUMBER').value))
                     if self.peek().type == 'COMMA': self.consume('COMMA')
                 self.consume('RPAREN')
             

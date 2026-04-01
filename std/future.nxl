@@ -1,5 +1,9 @@
 use std::option::Option;
 
+extern "C" {
+    fn sched_yield() -> i32;
+}
+
 pub trait Future<T> {
     fn poll(&mut self) -> Option<T>;
 }
@@ -21,6 +25,59 @@ impl<T> Future<T> for Ready<T> {
         self.done = true;
         return Option::<T>::Some(self.val);
     }
+}
+
+# A future that maps the result through a function
+pub struct MapFuture<T, U> {
+    inner: *u8,     # Pointer to inner Future<T>
+    f: fn(T) -> U,
+    done: bool
+}
+
+impl<T, U> Future<U> for MapFuture<T, U> {
+    fn poll(&mut self) -> Option<U> {
+        if (self.done) { return Option::<U>::None; }
+        let inner_ref = cast::<*Ready<T>>(self.inner);
+        let result = inner_ref.poll();
+        match (result) {
+            Some(val) => {
+                self.done = true;
+                return Option::<U>::Some((self.f)(val));
+            }
+            None => { return Option::<U>::None; }
+        }
+    }
+}
+
+# A future that chains two async operations
+pub struct ThenFuture<T, U> {
+    first: *u8,       # Pointer to Future<T>
+    f: fn(T) -> *u8,  # Returns pointer to Future<U>
+    second: *u8,      # Lazy-created second future
+    phase: i32        # 0=polling first, 1=polling second
+}
+
+# Block on a future until it resolves (polling loop with yield)
+pub fn block_on_future<T>(fut: &mut Future<T>) -> T {
+    while (true) {
+        let result = fut.poll();
+        match (result) {
+            Some(val) => { return val; }
+            None => { sched_yield(); }
+        }
+    }
+    # Unreachable, but needed for type checker
+    let dummy: T = cast::<T>(0);
+    return dummy;
+}
+
+# Join two futures — poll both, return when both complete
+pub struct Join2<A, B> {
+    a: *u8,
+    b: *u8,
+    result_a: Option<A>,
+    result_b: Option<B>,
+    done: bool
 }
 
 pub fn block_on<T, F: Future<T>>(mut f: F) -> T {

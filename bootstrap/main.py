@@ -107,6 +107,7 @@ def main():
     ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
     ap.add_argument("--emit-mir", action="store_true", help="Emit MIR (Mid-level IR) for debugging/optimization analysis")
     ap.add_argument("--opt", choices=["0", "1", "2"], default="1", help="MIR optimization level (0=none, 1=basic, 2=aggressive)")
+    ap.add_argument("--quantize-gpu", type=int, default=0, choices=[0, 1, 2, 3, 4], help="Auto-quantize GPU float buffers with TurboQuant (0=off, 1-4=bits)")
     args = ap.parse_args()
 
     filepath = args.file
@@ -220,6 +221,7 @@ def main():
         emit_kernels_only=emit_kernels_only,
         spirv_env=spirv_env,
         spirv_local_size=args.spirv_local_size,
+        quantize_gpu=args.quantize_gpu,
     )
     llvm_ir = codegen.generate(ast)
 

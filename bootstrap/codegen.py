@@ -8,12 +8,14 @@ class CodeGen:
         emit_kernels_only: bool = False,
         spirv_env: str = "opencl",
         spirv_local_size: str = "1,1,1",
+        quantize_gpu: int = 0,
     ):
         self.module = ir.Module(name="nexalang_module")
         self.target = target
         self.emit_kernels_only = emit_kernels_only
         self.spirv_env = spirv_env
         self.spirv_local_size = spirv_local_size
+        self.quantize_gpu = quantize_gpu  # 0=off, 1-4=auto-quantize gpu buffer bits
         self._kernel_function_names = set()
         self._vulkan_kernel_arg_globals = {}  # (kernel_name, arg_name) -> ir.GlobalVariable
         self._vulkan_buffer_args = {}  # (kernel_name, arg_name) -> (data_gv, len_gv)
@@ -44,6 +46,7 @@ class CodeGen:
         self.struct_types = {} # name -> ir.LiteralStructType
         self.struct_fields = {}
         self._current_generics = [] # name -> {field_name: index}
+        self._generic_type_map = {} # maps generic param names to concrete types during monomorphization
         self.enum_types = {} # name -> {variant: tag_id}
         self.enum_payloads = {} # name -> {variant: payload_type}
         self.enum_definitions = {} # name -> (ir_struct_type, payload_size)
@@ -404,9 +407,12 @@ class CodeGen:
         elif type_name in self.struct_types:
             return self.struct_types[type_name]
 
-        # Handle generic parameters as placeholders (e.g. 'T')
+        # Handle generic parameters — try to resolve via monomorphization map first
         if type_name in self._current_generics:
-             return ir.IntType(8) # Placeholder
+            if type_name in self._generic_type_map:
+                return self.get_llvm_type(self._generic_type_map[type_name])
+            # Unresolved generic: use opaque pointer (i8*) for type-erased dispatch
+            return ir.IntType(8).as_pointer()
 
         if "<" in type_name:
             base = type_name.split("<")[0]
@@ -415,7 +421,12 @@ class CodeGen:
             if base in self.enum_definitions:
                 enum_ty, _ = self.enum_definitions[base]
                 return enum_ty
-            print(f"DEBUG ERASURE: {type_name} -> i8")
+            # Try to resolve the full generic name (e.g. Vec<i32> registered as concrete struct)
+            if type_name in self.struct_types:
+                return self.struct_types[type_name]
+            if type_name in self.enum_definitions:
+                enum_ty, _ = self.enum_definitions[type_name]
+                return enum_ty
                 
         if type_name.startswith('fn('):
             # Parse fn(i32, bool)->void
@@ -552,7 +563,11 @@ class CodeGen:
         self.enum_definitions[node.name] = (enum_ty, max_size)
 
     def visit_TraitDef(self, node):
-        pass # Traits are compile-time only for now (static dispatch)
+        # Build vtable layout for potential dyn dispatch
+        method_names = [m.name for m in node.methods]
+        if method_names:
+            self._trait_vtable_layout = getattr(self, '_trait_vtable_layout', {})
+            self._trait_vtable_layout[node.name] = method_names
 
     def visit_ImplDef(self, node):
         if getattr(node, 'generics', None): return
@@ -632,7 +647,7 @@ class CodeGen:
         # 1. Evaluate the expression (returns handle/pointer to state)
         h = self.visit(node.value)
         
-        # 2. Polling Loop
+        # 2. Polling Loop with resume
         res_type_name = getattr(node, 'type_name', 'void')
         res_ty = self.get_llvm_type(res_type_name)
         # struct { i1 done, T result }
@@ -651,7 +666,17 @@ class CodeGen:
         self.builder.cbranch(done, cont_bb, body_bb)
         
         self.builder.position_at_end(body_bb)
-        # Here we could yield to executor. For bootstrap, we just loop (busy wait).
+        # Resume: call the runtime resume function if available, otherwise yield via sched_yield
+        if "__nexa_resume" in self.module.globals:
+            opaque_h = self.builder.bitcast(h, ir.IntType(8).as_pointer())
+            self.builder.call(self.module.globals["__nexa_resume"], [opaque_h])
+        elif "sched_yield" in self.module.globals:
+            self.builder.call(self.module.globals["sched_yield"], [])
+        else:
+            # Declare sched_yield for cooperative yielding
+            yield_ty = ir.FunctionType(ir.IntType(32), [])
+            yield_fn = ir.Function(self.module, yield_ty, name="sched_yield")
+            self.builder.call(yield_fn, [])
         self.builder.branch(cond_bb)
         
         self.builder.position_at_end(cont_bb)
@@ -664,18 +689,41 @@ class CodeGen:
 
     def visit_UnaryExpr(self, node):
         if node.op == '&':
-            # Address Of: We need the address of the operand.
-            # visit(operand) usually returns a value (load).
-            # We need a method to get address.
-            # HACK: If operand is VariableExpr, look up alloca.
+            # Address-of: return pointer to the lvalue
             if isinstance(node.operand, VariableExpr):
                 for scope in reversed(self.scopes):
-                        if node.operand.name in scope:
-                            ptr, _ = scope[node.operand.name]
-                            return ptr
+                    if node.operand.name in scope:
+                        entry = scope[node.operand.name]
+                        ptr = entry[0] if isinstance(entry, tuple) else entry
+                        return ptr
                 raise Exception(f"Undefined variable for address of: {node.operand.name}")
+            elif isinstance(node.operand, MemberAccess):
+                # &obj.field → GEP to field
+                base_val = self.visit(node.operand.object)
+                struct_type_name = getattr(node.operand, 'struct_type', '')
+                if struct_type_name in self.struct_fields:
+                    fields = self.struct_fields[struct_type_name]
+                    field_idx = list(fields.keys()).index(node.operand.member)
+                    return self.builder.gep(base_val, [
+                        ir.Constant(ir.IntType(32), 0),
+                        ir.Constant(ir.IntType(32), field_idx)
+                    ], name=f"addr_{node.operand.member}")
+                # Fallback: evaluate and store to temp
+                val = self.visit(node.operand)
+                tmp = self.builder.alloca(val.type, name="addr_tmp")
+                self.builder.store(val, tmp)
+                return tmp
+            elif isinstance(node.operand, IndexAccess):
+                # &arr[i] → GEP to element
+                base = self.visit(node.operand.object)
+                idx = self.visit(node.operand.index)
+                return self.builder.gep(base, [idx], name="addr_elem")
             else:
-                raise Exception("Address of (&) only supported for variables currently")
+                # General fallback: evaluate, store to temp, return address
+                val = self.visit(node.operand)
+                tmp = self.builder.alloca(val.type, name="addr_tmp")
+                self.builder.store(val, tmp)
+                return tmp
 
         elif node.op == '*':
             # Dereference
@@ -794,31 +842,14 @@ class CodeGen:
 
         args = [receiver_arg] + [self.visit(arg) for arg in node.args]
         
-        # Auto-cast arguments to match function signature (for type erasure)
+        # Coerce arguments to match function signature types
         for i in range(len(args)):
+            if i >= len(func.function_type.args):
+                break
             expected_type = func.function_type.args[i]
             actual_val = args[i]
             if actual_val.type != expected_type:
-                if isinstance(actual_val.type, ir.PointerType) and isinstance(expected_type, ir.PointerType):
-                    args[i] = self.builder.bitcast(actual_val, expected_type)
-                elif isinstance(actual_val.type, ir.IntType) and isinstance(expected_type, ir.IntType):
-                    if actual_val.type.width > expected_type.width:
-                        args[i] = self.builder.trunc(actual_val, expected_type)
-                    else:
-                        args[i] = self.builder.zext(actual_val, expected_type)
-                elif isinstance(actual_val.type, ir.LiteralStructType) and isinstance(expected_type, ir.LiteralStructType):
-                    # We can't bitcast aggregate values directly. 
-                    # Same hack as visit_VarDecl: store to temp, bitcast pointer, load.
-                    tmp = self.builder.alloca(actual_val.type)
-                    self.builder.store(actual_val, tmp)
-                    tmp_cast = self.builder.bitcast(tmp, expected_type.as_pointer())
-                    args[i] = self.builder.load(tmp_cast)
-                else:
-                    # Fallback bitcast
-                    try:
-                        args[i] = self.builder.bitcast(actual_val, expected_type)
-                    except:
-                        pass # Let it fail in call() if it must
+                args[i] = self._coerce_value(actual_val, expected_type)
 
         return self.builder.call(func, args)
 
@@ -1242,22 +1273,11 @@ class CodeGen:
 
         # Alloca
         ptr = self.builder.alloca(llvm_type, name=node.name)
-        # No debug print
+        # Coerce value type if needed (e.g. generic monomorphization, struct layout differences)
         if init_val.type != llvm_type:
-            # Struct erasure bitcast hack for bootstrap
-            if isinstance(init_val.type, ir.LiteralStructType) and isinstance(llvm_type, ir.LiteralStructType):
-                if len(init_val.type.elements) == len(llvm_type.elements):
-                    # For aggregate values, we can't bitcast directly in LLVM without a pointer.
-                    # We store to a temp and load as target type.
-                    tmp = self.builder.alloca(init_val.type)
-                    # Auto-bitcast for type erasure
-                    if init_val.type != tmp.type.pointee:
-                        tmp = self.builder.bitcast(tmp, init_val.type.as_pointer())
-                    self.builder.store(init_val, tmp)
-                    tmp_cast = self.builder.bitcast(tmp, llvm_type.as_pointer())
-                    init_val = self.builder.load(tmp_cast)
+            init_val = self._coerce_value(init_val, llvm_type)
         
-        # Auto-bitcast for type erasure
+        # Auto-coerce pointer alloca type if value type still differs
         if init_val.type != ptr.type.pointee:
             ptr = self.builder.bitcast(ptr, init_val.type.as_pointer())
         
@@ -1619,6 +1639,33 @@ class CodeGen:
         self.emit_scope_drops(self.scopes[-1])
 
         self.scopes.pop()
+
+    def _coerce_value(self, val, target_type):
+        """Coerce an LLVM value to a target type, handling int/ptr/struct mismatches."""
+        if val.type == target_type:
+            return val
+        if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
+            return self.builder.bitcast(val, target_type)
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
+            if val.type.width > target_type.width:
+                return self.builder.trunc(val, target_type)
+            else:
+                return self.builder.zext(val, target_type)
+        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.FloatType):
+            return self.builder.sitofp(val, target_type)
+        if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.IntType):
+            return self.builder.fptosi(val, target_type)
+        if isinstance(val.type, ir.LiteralStructType) and isinstance(target_type, ir.LiteralStructType):
+            # Aggregate reinterpretation via memory
+            tmp = self.builder.alloca(val.type)
+            self.builder.store(val, tmp)
+            tmp_cast = self.builder.bitcast(tmp, target_type.as_pointer())
+            return self.builder.load(tmp_cast)
+        # Fallback: try bitcast
+        try:
+            return self.builder.bitcast(val, target_type)
+        except Exception:
+            return val  # Last resort: let LLVM error on call
 
     def _get_or_create_string(self, string_val, name="str"):
         if not string_val.endswith('\0'):
@@ -1985,6 +2032,10 @@ class CodeGen:
             kernel_name = fn_ref.name
             threads_val = self.visit(node.args[1])
             gpu_args = [self.visit(node.args[i]) for i in range(2, len(node.args))]
+
+            # Determine quantization bits: from @[quantize(N)] attr or --quantize-gpu flag
+            q_bits = getattr(self._current_function_node, '_quantize_bits', 0) or self.quantize_gpu
+
             if self.target == "native":
                 if "__nexa_gpu_dispatch" not in self.module.globals:
                     void_ptr = ir.IntType(8).as_pointer()
@@ -1993,15 +2044,76 @@ class CodeGen:
                 dispatch_fn = self.module.globals["__nexa_gpu_dispatch"]
                 k_name_const = self._get_or_create_string(kernel_name)
                 i32 = ir.IntType(32)
-                arg_count = len(gpu_args)
+                void_ptr = ir.IntType(8).as_pointer()
+                f32_ptr = ir.FloatType().as_pointer()
+
+                # Auto-quantize float pointer args if q_bits > 0
+                tq_ctx = None
+                quantized_cleanup = []  # [(original_arg_idx, compressed_ptr, decompressed_ptr)]
+                final_args = list(gpu_args)
+
+                if q_bits > 0:
+                    for idx, arg in enumerate(gpu_args):
+                        # Check if arg is a float pointer (Buffer<f32>.ptr or *f32)
+                        if isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.FloatType):
+                            if tq_ctx is None:
+                                # Lazily create TurboQuant context: dim = threads, bits = q_bits
+                                tq_create = self.module.globals["tq_create"]
+                                tq_ctx = self.builder.call(tq_create, [
+                                    threads_val,
+                                    ir.Constant(i32, q_bits),
+                                    ir.Constant(i32, 42)
+                                ], name="tq_gpu_ctx")
+
+                            # Allocate compressed buffer (u16 per element = 2 bytes per coord)
+                            comp_size = self.builder.mul(threads_val, ir.Constant(i32, 2), name="comp_sz")
+                            comp_buf = self.builder.call(self.malloc, [comp_size], name="comp_buf")
+
+                            # Quantize: tq_quantize(ctx, float_ptr, comp_ptr, 1_vector_of_dim_threads)
+                            tq_quantize = self.module.globals["tq_quantize"]
+                            self.builder.call(tq_quantize, [
+                                tq_ctx,
+                                self.builder.bitcast(arg, f32_ptr),
+                                comp_buf,
+                                ir.Constant(i32, 1)
+                            ])
+
+                            # Allocate decompressed buffer for GPU to use
+                            decomp_size = self.builder.mul(threads_val, ir.Constant(i32, 4), name="decomp_sz")
+                            decomp_buf = self.builder.call(self.malloc, [decomp_size], name="decomp_buf")
+                            decomp_f32 = self.builder.bitcast(decomp_buf, f32_ptr)
+
+                            # Dequantize into clean buffer
+                            tq_dequantize = self.module.globals["tq_dequantize"]
+                            self.builder.call(tq_dequantize, [
+                                tq_ctx,
+                                comp_buf,
+                                decomp_f32,
+                                ir.Constant(i32, 1)
+                            ])
+
+                            # Replace arg with decompressed buffer
+                            final_args[idx] = decomp_f32
+                            quantized_cleanup.append((comp_buf, decomp_buf))
+
+                arg_count = len(final_args)
                 args_array = self.builder.alloca(ir.IntType(8).as_pointer(), size=ir.Constant(i32, max(1, arg_count)), name="gpu_args_array")
-                for i, arg in enumerate(gpu_args):
+                for i, arg in enumerate(final_args):
                     arg_ptr = self.builder.alloca(arg.type)
                     self.builder.store(arg, arg_ptr)
                     void_arg = self.builder.bitcast(arg_ptr, ir.IntType(8).as_pointer())
                     ptr_to_slot = self.builder.gep(args_array, [ir.Constant(i32, i)])
                     self.builder.store(void_arg, ptr_to_slot)
                 self.builder.call(dispatch_fn, [k_name_const, threads_val, ir.Constant(i32, arg_count), args_array])
+
+                # Cleanup quantization buffers
+                for comp_ptr, decomp_ptr in quantized_cleanup:
+                    self.builder.call(self.free, [comp_ptr])
+                    self.builder.call(self.free, [decomp_ptr])
+                if tq_ctx is not None:
+                    tq_destroy = self.module.globals["tq_destroy"]
+                    self.builder.call(tq_destroy, [tq_ctx])
+
             return None
 
         # 4. Struct Instantiation
@@ -2214,7 +2326,9 @@ class CodeGen:
             res_ty = self.get_llvm_type(node.return_type)
             # struct { i1 done, T result }
             state_ty = ir.LiteralStructType([ir.IntType(1), res_ty])
-            state_ptr = self.builder.call(self.malloc, [ir.Constant(ir.IntType(32), 16)]) # Simplified size
+            # Compute actual size for alloc: 1 byte (i1) + padding + result size
+            state_size = 8 + max(4, res_ty.width // 8 if hasattr(res_ty, 'width') else 8)
+            state_ptr = self.builder.call(self.malloc, [ir.Constant(ir.IntType(32), state_size)])
             state = self.builder.bitcast(state_ptr, state_ty.as_pointer())
             
             # Init state: done = false
@@ -2222,6 +2336,8 @@ class CodeGen:
             self.builder.store(ir.Constant(ir.IntType(1), 0), done_ptr)
             
             self.scopes[-1]['$async_state'] = state
+            self.scopes[-1]['$async_state_ty'] = state_ty
+            self.scopes[-1]['$async_res_ty'] = res_ty
 
         # Register arguments in scope
         if self.target == "spirv" and self.spirv_env == "vulkan" and node.is_kernel:
@@ -2271,7 +2387,15 @@ class CodeGen:
 
         # Add return void/undef if missing
         if not self.builder.block.is_terminated:
-            if isinstance(func.function_type.return_type, ir.VoidType):
+            # For async functions: set done=true and return state pointer
+            if is_async and '$async_state' in self.scopes[-1]:
+                state = self.scopes[-1]['$async_state']
+                done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+                self.builder.store(ir.Constant(ir.IntType(1), 1), done_ptr)
+                # Return the state pointer as opaque handle
+                ret_val = self.builder.bitcast(state, func.function_type.return_type)
+                self.builder.ret(ret_val)
+            elif isinstance(func.function_type.return_type, ir.VoidType):
                 self.builder.ret_void()
             elif isinstance(func.function_type.return_type, ir.IntType):
                 self.builder.ret(ir.Constant(func.function_type.return_type, 0))

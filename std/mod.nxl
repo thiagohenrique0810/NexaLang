@@ -10,4 +10,5 @@ pub mod json;
 pub mod net;
 pub mod db;
 pub mod task;
+pub mod future;
 pub mod compress;

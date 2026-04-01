@@ -1,18 +1,38 @@
 use std::vec::Vec;
 use std::option::Option;
 
+extern "C" {
+    fn sched_yield() -> i32;
+}
+
 pub struct Task<T> {
     coro_handle: *u8,
     done: bool
 }
 
+impl<T> Task<T> {
+    fn is_done(&self) -> bool {
+        # The coroutine state struct starts with { i1 done, T result }
+        # Read the done flag from the first byte
+        let state = cast::<*bool>(self.coro_handle);
+        return *state;
+    }
+
+    fn result(&self) -> T {
+        # The result is stored after the done flag
+        let res_ptr = cast::<*T>(ptr_offset::<u8>(self.coro_handle, 8));
+        return *res_ptr;
+    }
+}
+
 pub struct Executor {
-    tasks: Vec<*u8> # Simplified: storing raw handles for now
+    tasks: Vec<*u8>,
+    done_count: i32
 }
 
 impl Executor {
     fn new() -> Executor {
-        return Executor(Vec::<*u8>::new());
+        return Executor(Vec::<*u8>::new(), 0);
     }
 
     fn spawn(&mut self, coro: *u8) {
@@ -20,9 +40,38 @@ impl Executor {
     }
 
     fn run(&mut self) {
-        while (self.tasks.len() > 0) {
-            # In a real implementation, we would iterate and resume.
-            # For bootstrap, we'll keep it simple.
+        let total = self.tasks.len();
+        while (self.done_count < total) {
+            for i in 0..total {
+                let handle = self.tasks.get(i).unwrap();
+                let done_ptr = cast::<*bool>(handle);
+                if (!*done_ptr) {
+                    # Not done yet — yield to let the task progress
+                    sched_yield();
+                    # Check again after yield
+                    if (*done_ptr) {
+                        self.done_count = self.done_count + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_until_complete(&mut self) {
+        self.run();
+    }
+}
+
+# Spawn a single async task and block until it completes
+pub fn block_on<T>(coro: *u8) -> T {
+    # Poll until done
+    let done_ptr = cast::<*bool>(coro);
+    while (!*done_ptr) {
+        sched_yield();
+    }
+    let res_ptr = cast::<*T>(ptr_offset::<u8>(coro, 8));
+    return *res_ptr;
+}
             break;
         }
     }

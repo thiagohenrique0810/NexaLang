@@ -6,26 +6,93 @@ extern "C" {
     fn sqlite3_prepare_v2(db: *u8, sql: *u8, nByte: i32, ppStmt: **u8, pzTail: **u8) -> i32;
     fn sqlite3_step(stmt: *u8) -> i32;
     fn sqlite3_finalize(stmt: *u8) -> i32;
+    fn sqlite3_reset(stmt: *u8) -> i32;
     
     fn sqlite3_column_text(stmt: *u8, iCol: i32) -> *u8;
     fn sqlite3_column_int(stmt: *u8, iCol: i32) -> i32;
+    fn sqlite3_column_double(stmt: *u8, iCol: i32) -> f64;
+    fn sqlite3_column_count(stmt: *u8) -> i32;
+    fn sqlite3_column_type(stmt: *u8, iCol: i32) -> i32;
+    
+    fn sqlite3_bind_int(stmt: *u8, idx: i32, val: i32) -> i32;
+    fn sqlite3_bind_text(stmt: *u8, idx: i32, val: *u8, n: i32, destructor: *u8) -> i32;
+    fn sqlite3_bind_double(stmt: *u8, idx: i32, val: f64) -> i32;
+    fn sqlite3_bind_null(stmt: *u8, idx: i32) -> i32;
+    
+    fn sqlite3_errmsg(db: *u8) -> *u8;
+    fn sqlite3_changes(db: *u8) -> i32;
+    fn sqlite3_last_insert_rowid(db: *u8) -> i64;
 }
 
 use std::result::Result;
 use std::option::Option;
 use std::string::String;
+use std::vec::Vec;
+
+# SQLITE constants
+# SQLITE_ROW = 100, SQLITE_DONE = 101, SQLITE_OK = 0
 
 pub struct Database {
     handle: *u8
 }
 
 pub struct Statement {
-    handle: *u8
+    handle: *u8,
+    db: *u8
+}
+
+pub struct Row {
+    stmt: *u8,
+    col_count: i32
+}
+
+impl Row {
+    fn get_int(&self, col: i32) -> i32 {
+        return sqlite3_column_int(self.stmt, col);
+    }
+
+    fn get_string(&self, col: i32) -> String {
+        let ptr = sqlite3_column_text(self.stmt, col);
+        return String::from(cast::<string>(ptr));
+    }
+
+    fn get_float(&self, col: i32) -> f64 {
+        return sqlite3_column_double(self.stmt, col);
+    }
+
+    fn column_count(&self) -> i32 {
+        return self.col_count;
+    }
+
+    fn is_null(&self, col: i32) -> bool {
+        # SQLITE_NULL = 5
+        return sqlite3_column_type(self.stmt, col) == 5;
+    }
 }
 
 impl Statement {
     fn step(&self) -> i32 {
         return sqlite3_step(self.handle);
+    }
+
+    fn reset(&self) -> i32 {
+        return sqlite3_reset(self.handle);
+    }
+
+    fn bind_int(&self, idx: i32, val: i32) -> i32 {
+        return sqlite3_bind_int(self.handle, idx, val);
+    }
+
+    fn bind_text(&self, idx: i32, val: string) -> i32 {
+        return sqlite3_bind_text(self.handle, idx, cast::<*u8>(val), -1, cast::<*u8>(0));
+    }
+
+    fn bind_float(&self, idx: i32, val: f64) -> i32 {
+        return sqlite3_bind_double(self.handle, idx, val);
+    }
+
+    fn bind_null(&self, idx: i32) -> i32 {
+        return sqlite3_bind_null(self.handle, idx);
     }
 
     fn get_int(&self, col: i32) -> i32 {
@@ -37,32 +104,70 @@ impl Statement {
         return String::from(cast::<string>(ptr));
     }
 
+    fn get_float(&self, col: i32) -> f64 {
+        return sqlite3_column_double(self.handle, col);
+    }
+
+    fn current_row(&self) -> Row {
+        return Row(self.handle, sqlite3_column_count(self.handle));
+    }
+
+    fn query(&self) -> Vec<Row> {
+        let mut rows = Vec::<Row>::new();
+        while (self.step() == 100) { # SQLITE_ROW
+            rows.push(self.current_row());
+        }
+        return rows;
+    }
+
     fn finalize(self) -> i32 {
         return sqlite3_finalize(self.handle);
     }
 }
 
 impl Database {
-    fn open(filename: string) -> Result<Database, i32> {
+    fn open(filename: string) -> Result<Database, String> {
         let mut h: *u8 = cast::<*u8>(0);
         let rc = sqlite3_open(cast::<*u8>(filename), &h);
         if (rc == 0) {
-            return Result::<Database, i32>::Ok(Database(h));
+            return Result::<Database, String>::Ok(Database(h));
         }
-        return Result::<Database, i32>::Err(rc);
+        let msg = String::from(cast::<string>(sqlite3_errmsg(h)));
+        return Result::<Database, String>::Err(msg);
     }
 
-    fn execute(&self, sql: string) -> i32 {
-        return sqlite3_exec(self.handle, cast::<*u8>(sql), cast::<*u8>(0), cast::<*u8>(0), cast::<**u8>(0));
+    fn execute(&self, sql: string) -> Result<i32, String> {
+        let mut errmsg: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_exec(self.handle, cast::<*u8>(sql), cast::<*u8>(0), cast::<*u8>(0), &errmsg);
+        if (rc == 0) {
+            return Result::<i32, String>::Ok(sqlite3_changes(self.handle));
+        }
+        let msg = String::from(cast::<string>(errmsg));
+        return Result::<i32, String>::Err(msg);
     }
 
-    fn prepare(&self, sql: string) -> Result<Statement, i32> {
+    fn prepare(&self, sql: string) -> Result<Statement, String> {
         let mut stmt_handle: *u8 = cast::<*u8>(0);
         let rc = sqlite3_prepare_v2(self.handle, cast::<*u8>(sql), -1, &stmt_handle, cast::<**u8>(0));
         if (rc == 0) {
-            return Result::<Statement, i32>::Ok(Statement(stmt_handle));
+            return Result::<Statement, String>::Ok(Statement(stmt_handle, self.handle));
         }
-        return Result::<Statement, i32>::Err(rc);
+        let msg = String::from(cast::<string>(sqlite3_errmsg(self.handle)));
+        return Result::<Statement, String>::Err(msg);
+    }
+
+    fn last_insert_id(&self) -> i64 {
+        return sqlite3_last_insert_rowid(self.handle);
+    }
+
+    fn changes(&self) -> i32 {
+        return sqlite3_changes(self.handle);
+    }
+
+    fn close(self) -> i32 {
+        return sqlite3_close(self.handle);
+    }
+}
     }
 
     fn close(self) -> i32 {
