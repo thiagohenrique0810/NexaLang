@@ -41,6 +41,21 @@ NexaLang comes with a growing modular standard library:
 - `std::string::String`: Managed string type with full manipulation support.
 - `std::fs`: Object-oriented file I/O.
 - `std::option` & `std::result`: Modern error handling.
+- `std::compress`: Near-optimal vector compression powered by **TurboQuant** (1–4 bit quantization, ~2.7× of Shannon's distortion-rate limit).
+
+### 🗜️ TurboQuant Compression
+NexaLang integrates a C port of the [TurboQuant](https://arxiv.org/abs/2504.19874) algorithm (Zandieh et al. 2025) for ultra-low-bitwidth vector quantization. Use cases include KV-cache compression for transformer inference, vector database compaction, and GPU buffer optimization.
+
+```nexalang
+use std::compress::Quantizer;
+
+let q = Quantizer::new(128, 3);      # 3-bit, ~10.7× compression vs f32
+q.quantize(input, compressed, 1);
+q.dequantize(compressed, output, 1);
+q.drop();
+```
+
+The runtime library (`runtime/libturboquant`) is data-oblivious — no calibration data or codebook training required.
 
 ---
 
