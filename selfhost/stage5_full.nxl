@@ -28,7 +28,7 @@ fn is_space(c: u8) -> bool {
 }
 
 fn strlen(s: string) -> i32 {
-    let p: u8* = cast::<u8*>(s);
+    let p: *u8 = cast::<*u8>(s);
     let i: i32 = 0;
     while (true) {
         let c: u8 = p[i];
@@ -41,8 +41,8 @@ fn strlen(s: string) -> i32 {
 
 
 fn streq(a: string, b: string) -> bool {
-    let pa: u8* = cast::<u8*>(a);
-    let pb: u8* = cast::<u8*>(b);
+    let pa: *u8 = cast::<*u8>(a);
+    let pb: *u8 = cast::<*u8>(b);
     let i: i32 = 0;
     while (true) {
         let ca: u8 = pa[i];
@@ -75,13 +75,13 @@ struct Buffer<T> {
 # --- Arena Allocator ---
 
 struct Arena {
-    chunk: u8*,
+    chunk: *u8,
     offset: i32,
     capacity: i32
 }
 
 fn arena_init(size: i32) -> Arena {
-    let chunk: u8* = malloc(size);
+    let chunk: *u8 = malloc(size);
     return Arena(chunk, 0, size);
 }
 
@@ -89,12 +89,12 @@ fn arena_with_new_offset(old: Arena, new_offset: i32) -> Arena {
     return Arena(old.chunk, new_offset, old.capacity);
 }
 
-fn arena_alloc(a: *Arena, size: i32) -> u8* {
+fn arena_alloc(a: *Arena, size: i32) -> *u8 {
     let off: i32 = (*a).offset;
     if (off + size > (*a).capacity) {
         panic("Arena out of memory");
     }
-    let ptr: u8* = ptr_offset::<u8>((*a).chunk, off);
+    let ptr: *u8 = ptr_offset::<u8>((*a).chunk, off);
     # Instead of (*a).offset = off + size, we recreate the Arena
     let new_arena: Arena = arena_with_new_offset(*a, off + size);
     *a = new_arena;
@@ -143,7 +143,8 @@ enum Stmt {
     If(Expr, SliceStmt),         # cond, body (simple if)
     While(Expr, SliceStmt),      # cond, body
     Match(Expr, SliceMatchArm),  # val, arms
-    For(string, Expr, Expr, SliceStmt) # var, start, end, body
+    For(string, Expr, Expr, SliceStmt), # var, start, end, body
+    ExprStmt(Expr)               # standalone expression (function call)
 }
 
 # --- Specialized Slices ---
@@ -181,9 +182,24 @@ struct SliceStruct {
     len: i32
 }
 
+# --- Extern FFI Declarations ---
+
+struct ExternFnDecl {
+    name: string,
+    param_types: *string,
+    param_count: i32,
+    ret_type: string
+}
+
+struct SliceExternFnDecl {
+    ptr: *ExternFnDecl,
+    len: i32
+}
+
 struct Program {
     structs: SliceStruct,
-    functions: SliceFunction
+    functions: SliceFunction,
+    externs: SliceExternFnDecl
 }
 
 # --- Lexer ---
@@ -292,7 +308,7 @@ fn itoa(val: i32) -> string {
         len = len + 1; 
     }
     
-    let buf: u8* = malloc(len + 1);
+    let buf: *u8 = malloc(len + 1);
     buf[len] = cast::<u8>(0); # null terminator
     
     let i: i32 = len - 1;
@@ -334,7 +350,7 @@ fn token_to_string(p: *Parser, tok: Token) -> string {
         l = l - 2;
     }
     
-    let buf: u8* = malloc(l + 1);
+    let buf: *u8 = malloc(l + 1);
     let i: i32 = 0;
     while (i < l) {
         let c: u8 = ptr_offset::<u8>((*p).src, s + i)[0];
@@ -343,6 +359,25 @@ fn token_to_string(p: *Parser, tok: Token) -> string {
     }
     buf[l] = cast::<u8>(0);
     return cast::<string>(buf);
+}
+
+# --- Type Parser Helper ---
+
+fn parse_type_str(p: *Parser) -> string {
+    let tok: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+    let c: u8 = ptr_offset::<u8>((*p).src, (*tok).start)[0];
+
+    # Pointer type: *type
+    if (cast::<i32>(c) == 42) {
+        consume(p, 5);
+        let inner_tok: Token = consume(p, 1);
+        let inner: string = token_to_string(p, inner_tok);
+        return str_cat((*p).arena, "*", inner);
+    }
+
+    # Simple type name
+    let type_tok: Token = consume(p, 1);
+    return token_to_string(p, type_tok);
 }
 
 # --- Parser ---
@@ -577,8 +612,7 @@ fn parse_stmt(p: *Parser) -> Stmt {
             let name: string = token_to_string(p, name_tok);
             
             consume(p, 5); # :
-            let type_tok: Token = consume(p, 1); # type
-            let ty: string = token_to_string(p, type_tok);
+            let ty: string = parse_type_str(p);
             
             # Check =
             let eq_tok: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
@@ -701,9 +735,30 @@ fn parse_stmt(p: *Parser) -> Stmt {
                  if ((*next_t).kind == 5) { consume(p, 5); }
                  return Stmt::Assign(name, val);
              }
+             # Check for function call: name(
+             if (cast::<i32>(op_c) == 40) { # (
+                 consume(p, 5);  # (
+                 let args_ptr: *Expr = cast::<*Expr>(arena_alloc((*p).arena, 10 * sizeof::<Expr>()));
+                 let args_cnt: i32 = 0;
+                 while (true) {
+                     let cur_t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                     let cur_c: u8 = ptr_offset::<u8>((*p).src, (*cur_t).start)[0];
+                     if (cast::<i32>(cur_c) == 41) { break; }
+                     args_ptr[args_cnt] = parse_expr(p);
+                     args_cnt = args_cnt + 1;
+                     let nxt_t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                     let nxt_c: u8 = ptr_offset::<u8>((*p).src, (*nxt_t).start)[0];
+                     if (cast::<i32>(nxt_c) == 44) { consume(p, 5); }
+                 }
+                 consume(p, 5);  # )
+                 # Semicolon
+                 let next_t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+                 if ((*next_t).kind == 5) { consume(p, 5); }
+                 return Stmt::ExprStmt(Expr::Call(name, SliceExpr(args_ptr, args_cnt)));
+             }
         }
         
-        # If not assignment, maybe function call? Not supported as stmt yet in this stage5.
+        # If not assignment or call, panic
         panic("Unknown statement or assignment");
     }
     
@@ -794,19 +849,86 @@ fn parse_struct(p: *Parser) -> Struct {
     return Struct(name, SliceField(fields_ptr, cnt));
 }
 
+# --- Extern "C" Block Parser ---
+
+fn parse_extern_block(p: *Parser, externs: *ExternFnDecl, ext_cnt: *i32) {
+    consume(p, 1);  # extern
+    consume(p, 3);  # "C"
+    consume(p, 5);  # {
+
+    while (true) {
+        let t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let c: u8 = ptr_offset::<u8>((*p).src, (*t).start)[0];
+        if (cast::<i32>(c) == 125) { break; }  # }
+
+        # Expect: fn name(param1: type1, ...) -> ret_type;
+        consume(p, 1);  # fn
+        let name_tok: Token = consume(p, 1);
+        let name: string = token_to_string(p, name_tok);
+
+        consume(p, 5);  # (
+        let param_types: *string = cast::<*string>(arena_alloc((*p).arena, 10 * 8));
+        let param_cnt: i32 = 0;
+
+        while (true) {
+            let pt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+            let pc: u8 = ptr_offset::<u8>((*p).src, (*pt).start)[0];
+            if (cast::<i32>(pc) == 41) { break; }  # )
+
+            consume(p, 1);  # param name
+            consume(p, 5);  # :
+            let ty: string = parse_type_str(p);
+            param_types[param_cnt] = ty;
+            param_cnt = param_cnt + 1;
+
+            # Optional comma
+            let nt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+            let nc: u8 = ptr_offset::<u8>((*p).src, (*nt).start)[0];
+            if (cast::<i32>(nc) == 44) { consume(p, 5); }
+        }
+        consume(p, 5);  # )
+
+        # Check for return type: -> type
+        let ret_type: string = "void";
+        let rt: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        let rc: u8 = ptr_offset::<u8>((*p).src, (*rt).start)[0];
+        if (cast::<i32>(rc) == 45) {  # -
+            consume(p, 5);  # -
+            consume(p, 5);  # >
+            ret_type = parse_type_str(p);
+        }
+
+        # Semicolon
+        let sc: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
+        if ((*sc).kind == 5) { consume(p, 5); }
+
+        let idx: i32 = *ext_cnt;
+        externs[idx] = ExternFnDecl(name, param_types, param_cnt, ret_type);
+        *ext_cnt = idx + 1;
+    }
+    consume(p, 5);  # }
+}
+
 fn parse_prog(p: *Parser) -> Program {
     let funcs_ptr: *Function = cast::<*Function>(arena_alloc((*p).arena, 20 * sizeof::<Function>()));
     let f_cnt: i32 = 0;
     
     let structs_ptr: *Struct = cast::<*Struct>(arena_alloc((*p).arena, 20 * sizeof::<Struct>()));
     let s_cnt: i32 = 0;
+
+    let externs_ptr: *ExternFnDecl = cast::<*ExternFnDecl>(arena_alloc((*p).arena, 20 * sizeof::<ExternFnDecl>()));
+    let ext_cnt: i32 = 0;
     
     while ((*p).pos < (*p).count - 1) { # -1 for EOF check
         let t: *Token = ptr_offset::<Token>((*p).tokens, (*p).pos);
         let s_start: i32 = (*t).start;
         let c: u8 = ptr_offset::<u8>((*p).src, s_start)[0];
         let c2: u8 = ptr_offset::<u8>((*p).src, s_start + 1)[0];
-        
+
+        # 'e' for extern (101)
+        if (cast::<i32>(c) == 101 and cast::<i32>(c2) == 120) {
+            parse_extern_block(p, externs_ptr, &ext_cnt);
+        } else {
         # 'f' for fn (102)
         if (cast::<i32>(c) == 102 and cast::<i32>(c2) == 110) {
             funcs_ptr[f_cnt] = parse_fn(p);
@@ -821,16 +943,18 @@ fn parse_prog(p: *Parser) -> Program {
                 consume(p, (*t).kind);
             }
         }
+        }
     }
     
-    return Program(SliceStruct(structs_ptr, s_cnt), SliceFunction(funcs_ptr, f_cnt));
+    return Program(SliceStruct(structs_ptr, s_cnt), SliceFunction(funcs_ptr, f_cnt), SliceExternFnDecl(externs_ptr, ext_cnt));
 }
 
 # --- CodeGen Utils ---
 
 struct Symbol {
     name: string,
-    reg: string
+    reg: string,
+    ty: string
 }
 
 struct SymTable {
@@ -841,7 +965,10 @@ struct SymTable {
 struct Context {
     out: string,
     syms: *SymTable,
-    arena: *Arena
+    arena: *Arena,
+    ext_ptr: *ExternFnDecl,
+    ext_count: i32,
+    tmp_cnt: i32
 }
 
 fn streq(a: string, b: string) -> bool {
@@ -868,16 +995,26 @@ fn st_find(st: *SymTable, name: string) -> string {
     return "";
 }
 
-fn st_insert(st: *SymTable, name: string, reg: string) {
+fn st_insert(st: *SymTable, name: string, reg: string, ty: string) {
     let idx: i32 = st.count;
-    st.syms[idx] = Symbol(name, reg);
+    st.syms[idx] = Symbol(name, reg, ty);
     st.count = idx + 1;
+}
+
+fn st_find_type(st: *SymTable, name: string) -> string {
+    let i: i32 = 0;
+    while (i < st.count) {
+        let s: Symbol = st.syms[i];
+        if (streq(s.name, name)) { return s.ty; }
+        i = i + 1;
+    }
+    return "i32";
 }
 
 fn str_cat(arena: *Arena, a: string, b: string) -> string {
     let la: i32 = strlen(a);
     let lb: i32 = strlen(b);
-    let s: u8* = arena_alloc(arena, la + lb + 1);
+    let s: *u8 = arena_alloc(arena, la + lb + 1);
     let i: i32 = 0;
     while (i < la) {
         ptr_offset::<u8>(s, i)[0] = ptr_offset::<u8>(a, i)[0];
@@ -893,9 +1030,33 @@ fn str_cat(arena: *Arena, a: string, b: string) -> string {
 }
 
 fn next_reg(ctx: *Context) -> string {
-    # Without tmp_count tracking, just return a generic temporary
-    # This is a limitation but allows bootstrap to work
-    return "tmp";
+    let id: i32 = ctx.tmp_cnt;
+    ctx.tmp_cnt = id + 1;
+    return str_cat(ctx.arena, "t", itoa(id));
+}
+
+# --- Type Mapping ---
+
+fn type_to_llvm(ty: string) -> string {
+    if (streq(ty, "i32")) { return "i32"; }
+    if (streq(ty, "f32")) { return "float"; }
+    if (streq(ty, "u8")) { return "i8"; }
+    if (streq(ty, "bool")) { return "i1"; }
+    if (streq(ty, "string")) { return "i8*"; }
+    if (streq(ty, "*u8")) { return "i8*"; }
+    if (streq(ty, "*f32")) { return "float*"; }
+    if (streq(ty, "*i32")) { return "i32*"; }
+    if (streq(ty, "void")) { return "void"; }
+    return "i32";
+}
+
+fn find_extern_idx(ctx: *Context, name: string) -> i32 {
+    let i: i32 = 0;
+    while (i < ctx.ext_count) {
+        if (streq(ctx.ext_ptr[i].name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
 }
 
 fn emit_expr(e: Expr, ctx: *Context) -> string {
@@ -905,13 +1066,20 @@ fn emit_expr(e: Expr, ctx: *Context) -> string {
         Var(name) => {
             let reg: string = st_find(ctx.syms, name);
             if (streq(reg, "")) { return "0"; }
+
+            let ty: string = st_find_type(ctx.syms, name);
+            let llvm_ty: string = type_to_llvm(ty);
             
             let out_reg_id: string = next_reg(ctx);
             let out_reg: string = str_cat(ctx.arena, "%", out_reg_id);
             
             fs::append_file(ctx.out, "  ", 2);
             fs::append_file(ctx.out, out_reg, strlen(out_reg));
-            fs::append_file(ctx.out, " = load i32, i32* %", 19);
+            fs::append_file(ctx.out, " = load ", 8);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, ", ", 2);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, "* %", 3);
             fs::append_file(ctx.out, reg, strlen(reg));
             fs::append_file(ctx.out, "\n", 1);
             
@@ -940,10 +1108,60 @@ fn emit_expr(e: Expr, ctx: *Context) -> string {
              fs::append_file(ctx.out, "\n", 1);
              return out_reg;
         }
-        Cast(t, v) => { return "0"; }
+        Cast(t, v) => { return emit_expr(*v, ctx); }
         Sizeof(t) => { return "0"; }
         Member(o, m) => { return "0"; }
-        Call(n, a) => { return "0"; }
+        Call(n, a) => {
+            # Find extern function declaration to get types
+            let ext_idx: i32 = find_extern_idx(ctx, n);
+            let ret_ty_str: string = "i32";
+            if (ext_idx >= 0) {
+                ret_ty_str = type_to_llvm(ctx.ext_ptr[ext_idx].ret_type);
+            }
+
+            # Evaluate all arguments first
+            let arg_vals: *string = cast::<*string>(arena_alloc(ctx.arena, 10 * 8));
+            let j: i32 = 0;
+            while (j < a.len) {
+                arg_vals[j] = emit_expr(a.ptr[j], ctx);
+                j = j + 1;
+            }
+
+            # Emit call instruction
+            let out_reg_id: string = next_reg(ctx);
+            let out_reg: string = str_cat(ctx.arena, "%", out_reg_id);
+
+            fs::append_file(ctx.out, "  ", 2);
+            if (streq(ret_ty_str, "void")) {
+                fs::append_file(ctx.out, "call void @", 11);
+            } else {
+                fs::append_file(ctx.out, out_reg, strlen(out_reg));
+                fs::append_file(ctx.out, " = call ", 8);
+                fs::append_file(ctx.out, ret_ty_str, strlen(ret_ty_str));
+                fs::append_file(ctx.out, " @", 2);
+            }
+            fs::append_file(ctx.out, n, strlen(n));
+            fs::append_file(ctx.out, "(", 1);
+
+            let k: i32 = 0;
+            while (k < a.len) {
+                if (k > 0) { fs::append_file(ctx.out, ", ", 2); }
+                let arg_ty_str: string = "i32";
+                if (ext_idx >= 0) {
+                    if (k < ctx.ext_ptr[ext_idx].param_count) {
+                        arg_ty_str = type_to_llvm(ctx.ext_ptr[ext_idx].param_types[k]);
+                    }
+                }
+                fs::append_file(ctx.out, arg_ty_str, strlen(arg_ty_str));
+                fs::append_file(ctx.out, " ", 1);
+                fs::append_file(ctx.out, arg_vals[k], strlen(arg_vals[k]));
+                k = k + 1;
+            }
+            fs::append_file(ctx.out, ")\n", 2);
+
+            if (streq(ret_ty_str, "void")) { return "0"; }
+            return out_reg;
+        }
     }
     return "0";
 }
@@ -996,26 +1214,40 @@ fn emit_stmt(s: Stmt, ctx: *Context) {
             fs::append_file(ctx.out, "\n", 1);
         }
         Let(name, ty, init) => {
+            let llvm_ty: string = type_to_llvm(ty);
+
             fs::append_file(ctx.out, "  %", 3);
             fs::append_file(ctx.out, name, strlen(name));
-            fs::append_file(ctx.out, " = alloca i32\n", 14); # Assume i32
+            fs::append_file(ctx.out, " = alloca ", 10);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, "\n", 1);
             
-            st_insert(ctx.syms, name, name);
+            st_insert(ctx.syms, name, name, ty);
             
             let val: string = emit_expr(init, ctx);
-            fs::append_file(ctx.out, "  store i32 ", 12);
+            fs::append_file(ctx.out, "  store ", 8);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, " ", 1);
             fs::append_file(ctx.out, val, strlen(val));
-            fs::append_file(ctx.out, ", i32* %", 8);
+            fs::append_file(ctx.out, ", ", 2);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, "* %", 3);
             fs::append_file(ctx.out, name, strlen(name));
             fs::append_file(ctx.out, "\n", 1);
         }
         Assign(name, val) => {
             let reg: string = st_find(ctx.syms, name);
             if (streq(reg, "")) { return; }
+            let ty: string = st_find_type(ctx.syms, name);
+            let llvm_ty: string = type_to_llvm(ty);
             let v: string = emit_expr(val, ctx);
-            fs::append_file(ctx.out, "  store i32 ", 12);
+            fs::append_file(ctx.out, "  store ", 8);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, " ", 1);
             fs::append_file(ctx.out, v, strlen(v));
-            fs::append_file(ctx.out, ", i32* %", 8);
+            fs::append_file(ctx.out, ", ", 2);
+            fs::append_file(ctx.out, llvm_ty, strlen(llvm_ty));
+            fs::append_file(ctx.out, "* %", 3);
             fs::append_file(ctx.out, reg, strlen(reg));
             fs::append_file(ctx.out, "\n", 1);
         }
@@ -1110,6 +1342,9 @@ fn emit_stmt(s: Stmt, ctx: *Context) {
         }
         Match(v, a) => {}
         For(v, s, e, b) => {}
+        ExprStmt(e) => {
+            emit_expr(e, ctx);
+        }
     }
 }
 
@@ -1275,23 +1510,33 @@ fn sema_check_stmt(s: Stmt, ctx: *SemaContext) {
                 i = i + 1;
             }
         }
+        ExprStmt(e) => {
+            sema_check_expr(e, ctx);
+        }
     }
 }
 
-fn sema_analyze(prog: Program, a: *Arena) -> SemaContext {
+fn sema_analyze(prog: *Program, a: *Arena) -> SemaContext {
     let mut ctx: SemaContext = sema_init(a);
     
     # Register all structs
     let k: i32 = 0;
-    while (k < prog.structs.len) {
-        sema_add_struct(&ctx, prog.structs.ptr[k].name);
+    while (k < (*prog).structs.len) {
+        sema_add_struct(&ctx, (*prog).structs.ptr[k].name);
         k = k + 1;
+    }
+
+    # Register extern functions
+    let e: i32 = 0;
+    while (e < (*prog).externs.len) {
+        sema_add_fn(&ctx, (*prog).externs.ptr[e].name);
+        e = e + 1;
     }
     
     # Register all functions (before checking bodies — allows forward refs)
     let i: i32 = 0;
-    while (i < prog.functions.len) {
-        let f: Function = prog.functions.ptr[i];
+    while (i < (*prog).functions.len) {
+        let f: Function = (*prog).functions.ptr[i];
         # Extract function name from source
         sema_add_fn(&ctx, "main"); # Simplified: only main for now
         i = i + 1;
@@ -1299,8 +1544,8 @@ fn sema_analyze(prog: Program, a: *Arena) -> SemaContext {
     
     # Check function bodies
     let j: i32 = 0;
-    while (j < prog.functions.len) {
-        let f: Function = prog.functions.ptr[j];
+    while (j < (*prog).functions.len) {
+        let f: Function = (*prog).functions.ptr[j];
         let k: i32 = 0;
         while (k < f.body.len) {
             sema_check_stmt(f.body.ptr[k], &ctx);
@@ -1312,17 +1557,38 @@ fn sema_analyze(prog: Program, a: *Arena) -> SemaContext {
     return ctx;
 }
 
-fn emit_ll(prog: Program) {
+fn emit_ll(prog: *Program) {
     let out: string = "dev/artifacts/output.ll";
     fs::write_file(out, "; ModuleID = 'selfhost'\n", 24);
     fs::append_file(out, "declare i32 @printf(i8*, ...)\n", 30);
     fs::append_file(out, "@fmt_int = private constant [4 x i8] c\"%d\\0A\\00\"\n", 47);
     fs::append_file(out, "@fmt_str = private constant [4 x i8] c\"%s\\0A\\00\"\n", 47);
-    
+
+    # Emit extern function declarations
+    let e: i32 = 0;
+    while (e < (*prog).externs.len) {
+        let ext: ExternFnDecl = (*prog).externs.ptr[e];
+        fs::append_file(out, "declare ", 8);
+        let llvm_ret: string = type_to_llvm(ext.ret_type);
+        fs::append_file(out, llvm_ret, strlen(llvm_ret));
+        fs::append_file(out, " @", 2);
+        fs::append_file(out, ext.name, strlen(ext.name));
+        fs::append_file(out, "(", 1);
+        let ej: i32 = 0;
+        while (ej < ext.param_count) {
+            if (ej > 0) { fs::append_file(out, ", ", 2); }
+            let llvm_pty: string = type_to_llvm(ext.param_types[ej]);
+            fs::append_file(out, llvm_pty, strlen(llvm_pty));
+            ej = ej + 1;
+        }
+        fs::append_file(out, ")\n", 2);
+        e = e + 1;
+    }
+
     # Emit Structs
     let k: i32 = 0;
-    while (k < prog.structs.len) {
-        let s = prog.structs.ptr[k];
+    while (k < (*prog).structs.len) {
+        let s = (*prog).structs.ptr[k];
         fs::append_file(out, "%", 1);
         fs::append_file(out, s.name, strlen(cast::<*u8>(s.name)));
         fs::append_file(out, " = type { ", 10);
@@ -1341,15 +1607,15 @@ fn emit_ll(prog: Program) {
     let cg_mem: Arena = arena_init(1024 * 1024);
     
     let i: i32 = 0;
-    while (i < prog.functions.len) {
-        let f: Function = prog.functions.ptr[i];
+    while (i < (*prog).functions.len) {
+        let f: Function = (*prog).functions.ptr[i];
         
         # Init Symbol Table for each function
         let syms_ptr: *Symbol = cast::<*Symbol>(arena_alloc(&cg_mem, 1024 * 16)); 
         let st: *SymTable = cast::<*SymTable>(arena_alloc(&cg_mem, sizeof::<SymTable>()));
         *st = SymTable(syms_ptr, 0);
         
-        let ctx: Context = Context(out, st, &cg_mem);
+        let ctx: Context = Context(out, st, &cg_mem, (*prog).externs.ptr, (*prog).externs.len, 0);
         
         fs::append_file(out, "define i32 @main() {\nentry:\n", 28);
         
@@ -1368,13 +1634,13 @@ fn emit_ll(prog: Program) {
 }
 # --- FFI for CLI Arguments ---
 extern "C" {
-    fn malloc(size: i32) -> u8*;
-    fn free(ptr: u8*);
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
 }
 
 # --- Main ---
 
-fn main(argc: i32, argv: u8**) -> i32 {
+fn main(argc: i32, argv: **u8) -> i32 {
     if (argc < 2) {
         print("Usage: nxc <input_file>");
         return 1;
@@ -1411,7 +1677,7 @@ fn main(argc: i32, argv: u8**) -> i32 {
     
     # 4. Semantic Analysis
     let sema_arena: Arena = arena_init(256 * 1024); # 256KB
-    let sema: SemaContext = sema_analyze(prog, &sema_arena);
+    let sema: SemaContext = sema_analyze(&prog, &sema_arena);
     if (sema.error_count > 0) {
         print("Semantic errors found:");
         let e: i32 = 0;
@@ -1425,7 +1691,7 @@ fn main(argc: i32, argv: u8**) -> i32 {
     
     # 5. CodeGen
     print("Generating LLVM IR...");
-    emit_ll(prog);
+    emit_ll(&prog);
     print("Done.");
     
     return 0;

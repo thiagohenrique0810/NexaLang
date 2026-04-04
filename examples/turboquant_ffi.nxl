@@ -1,0 +1,47 @@
+# TurboQuant FFI Test — Direct C function calls (no struct methods)
+# Compile with self-hosted compiler, then link with libturboquant:
+#   nxc build examples/turboquant_ffi.nxl   (uses bootstrap)
+#   -- or after self-hosted compile --
+#   clang dev/artifacts/output.ll -Lruntime -lturboquant -lm -o tq_test
+
+extern "C" {
+    fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
+    fn tq_destroy(ctx: *u8);
+    fn tq_quantize(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
+    fn tq_dequantize(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn tq_mse(ctx: *u8, original: *f32, n_vectors: i32) -> f32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+}
+
+fn main() -> i32 {
+    let dim: i32 = 4;
+    let bits: i32 = 2;
+
+    # Create quantizer context
+    let ctx: *u8 = tq_create(dim, bits, 42);
+
+    # Allocate input buffer (4 floats = 16 bytes)
+    let input: *f32 = cast::<*f32>(malloc(16));
+
+    # Allocate compressed output buffer (4 x u16 = 8 bytes)
+    let compressed: *u8 = malloc(8);
+
+    # Allocate decompressed output buffer (4 floats = 16 bytes)
+    let output: *f32 = cast::<*f32>(malloc(16));
+
+    # Quantize 1 vector
+    tq_quantize(ctx, input, compressed, 1);
+
+    # Dequantize back
+    tq_dequantize(ctx, compressed, output, 1);
+
+    # Cleanup
+    tq_destroy(ctx);
+    free(cast::<*u8>(input));
+    free(compressed);
+    free(cast::<*u8>(output));
+
+    print(0);
+    return 0;
+}

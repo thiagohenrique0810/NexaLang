@@ -590,12 +590,13 @@ class CodeGen:
                      # Use IdentifiedStructType to support recursive/out-of-order types
                      self.struct_types[node.name] = self.module.context.get_identified_type(node.name)
 
-        # Pass 1: Types (Structs, Enums)
+        # Pass 1: Types - Enums first (so structs that reference enum types get correct sizes)
         for node in ast:
-            # No debug print
-            if isinstance(node, (StructDef, EnumDef)):
+            if isinstance(node, EnumDef):
                 self.visit(node)
-        # No debug print
+        for node in ast:
+            if isinstance(node, StructDef):
+                self.visit(node)
 
         # Pass 2: Function Headers
         for node in ast:
@@ -1313,7 +1314,11 @@ class CodeGen:
             self.builder.store(val, ptr)
 
         elif isinstance(node.target, MemberAccess):
-            struct_val = self.visit(node.target.object)
+            # For (*ptr).field = val, get the pointer directly instead of loading
+            if isinstance(node.target.object, UnaryExpr) and node.target.object.op == '*':
+                struct_val = self.visit(node.target.object.operand)
+            else:
+                struct_val = self.visit(node.target.object)
             # print(f"DEBUG ASSIGN MEMBER: {struct_val.type}")
             # if not hasattr(node.target, 'struct_type'): raise Exception('Missing struct_type')
             if not isinstance(struct_val.type, ir.PointerType):
@@ -1591,6 +1596,108 @@ class CodeGen:
             self.builder.branch(merge_bb)
 
         # Continue
+        self.builder.position_at_end(merge_bb)
+
+    def visit_MatchExpr(self, node):
+        # Evaluate the match value (should be an enum: {i32 tag, [N x i8] data})
+        match_val = self.visit(node.value)
+
+        # If match_val is a pointer, load it
+        if isinstance(match_val.type, ir.PointerType):
+            match_val = self.builder.load(match_val)
+
+        # Extract the tag (index 0)
+        tag_val = self.builder.extract_value(match_val, 0, name="match_tag")
+
+        # Determine the enum type name from semantic info
+        enum_name = None
+        value_type = getattr(node.value, 'type_name', None)
+        if value_type and value_type in self.enum_types:
+            enum_name = value_type
+        else:
+            # Try to find from enum_types by checking variant names
+            for ename, vtags in self.enum_types.items():
+                for arm in node.cases:
+                    if arm.variant_name in vtags:
+                        enum_name = ename
+                        break
+                if enum_name:
+                    break
+
+        merge_bb = self.builder.append_basic_block(name="match_end")
+        default_bb = self.builder.append_basic_block(name="match_default")
+
+        # Build switch
+        switch = self.builder.switch(tag_val, default_bb)
+
+        for arm in node.cases:
+            arm_bb = self.builder.append_basic_block(name=f"match_{arm.variant_name}")
+
+            if enum_name and arm.variant_name in self.enum_types.get(enum_name, {}):
+                tag_id = self.enum_types[enum_name][arm.variant_name]
+                switch.add_case(ir.Constant(ir.IntType(32), tag_id), arm_bb)
+            else:
+                # Fallback: try as default
+                pass
+
+            self.builder.position_at_end(arm_bb)
+            self.scopes.append({})
+
+            # Bind payload variables if any
+            if arm.var_names and enum_name:
+                payload_type = self.enum_payloads.get(enum_name, {}).get(arm.variant_name)
+                if payload_type is not None:
+                    # Alloca the enum, store it, GEP to data field, bitcast, load
+                    enum_ptr = self.builder.alloca(match_val.type, name="match_tmp")
+                    self.builder.store(match_val, enum_ptr)
+                    zero = ir.Constant(ir.IntType(32), 0)
+                    one = ir.Constant(ir.IntType(32), 1)
+                    data_ptr = self.builder.gep(enum_ptr, [zero, one])
+                    payload_ptr = self.builder.bitcast(data_ptr, payload_type.as_pointer())
+                    payload_val = self.builder.load(payload_ptr, name="payload")
+
+                    if len(arm.var_names) == 1:
+                        var_alloca = self.builder.alloca(payload_type, name=arm.var_names[0])
+                        self.builder.store(payload_val, var_alloca)
+                        # Determine type name for the bound variable
+                        ptype_name = 'i32'  # fallback
+                        if isinstance(payload_type, ir.PointerType):
+                            ptype_name = 'u8*'
+                        elif isinstance(payload_type, ir.IntType):
+                            ptype_name = f'i{payload_type.width}'
+                        elif isinstance(payload_type, ir.FloatType):
+                            ptype_name = 'f32'
+                        elif isinstance(payload_type, ir.DoubleType):
+                            ptype_name = 'f64'
+                        self.scopes[-1][arm.var_names[0]] = (var_alloca, ptype_name)
+                    elif isinstance(payload_type, ir.LiteralStructType):
+                        for idx, vname in enumerate(arm.var_names):
+                            field_val = self.builder.extract_value(payload_val, idx, name=vname)
+                            field_alloca = self.builder.alloca(field_val.type, name=vname)
+                            self.builder.store(field_val, field_alloca)
+                            ptype_name = 'i32'
+                            if isinstance(field_val.type, ir.PointerType):
+                                ptype_name = 'u8*'
+                            elif isinstance(field_val.type, ir.IntType):
+                                ptype_name = f'i{field_val.type.width}'
+                            self.scopes[-1][vname] = (field_alloca, ptype_name)
+
+            # Visit body
+            if isinstance(arm.body, list):
+                for stmt in arm.body:
+                    self.visit(stmt)
+            else:
+                self.visit(arm.body)
+
+            self.scopes.pop()
+
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_bb)
+
+        # Default block: just branch to merge (no-op)
+        self.builder.position_at_end(default_bb)
+        self.builder.branch(merge_bb)
+
         self.builder.position_at_end(merge_bb)
 
     def visit_WhileStmt(self, node):
@@ -1935,6 +2042,19 @@ class CodeGen:
                 if isinstance(val.type, ir.PointerType): val_arg = self.builder.bitcast(val, voidptr_ty)
                 else: val_arg = val
                 self.builder.call(self.printf, [fmt_arg, val_arg])
+            return None
+
+        elif callee_name == "panic":
+            val = self.visit(node.args[0])
+            voidptr_ty = ir.IntType(8).as_pointer()
+            fmt_str = self.visit_StringLiteral(None, name="fmt_panic", value_override="panic: %s\n\0")
+            fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
+            if isinstance(val.type, ir.PointerType):
+                val_arg = self.builder.bitcast(val, voidptr_ty)
+            else:
+                val_arg = val
+            self.builder.call(self.printf, [fmt_arg, val_arg])
+            self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
             return None
 
         elif callee_name == "fprintf":

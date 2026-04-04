@@ -1436,7 +1436,7 @@ class SemanticAnalyzer:
                 self.visit(a)
             # Returns pointer to the element type
             elem_type = callee[11:-1]  # extract T from ptr_offset<T>
-            return f'*{elem_type}'
+            return f'{elem_type}*'
 
         # 5. Local module lookup
         callee = self._resolve_local_module(callee, node)
