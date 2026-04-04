@@ -14,6 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+
+/* SIMD: ARM NEON on Apple Silicon / aarch64 */
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define TQ_HAS_NEON 1
+#elif defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define TQ_HAS_SSE 1
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -68,10 +78,11 @@ struct tq_ctx {
     int dim;
     int bits;
     int n_levels;       /* 2^bits */
-    float* rotation;    /* dim x dim, row-major */
-    float* rot_inv;     /* dim x dim, transposed rotation (= inverse for orthogonal) */
+    float* signs;       /* dim random ±1 signs for SRHT */
     float* centroids;   /* n_levels centroids from Lloyd-Max */
-    float* buf;         /* scratch buffer for rotation, dim floats */
+    float* boundaries;  /* n_levels-1 decision boundaries (midpoints) */
+    float* buf;         /* scratch buffer, dim floats */
+    int log2_dim;       /* log2(dim) for Hadamard stages */
 };
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -153,46 +164,113 @@ static void lloyd_max(int dim, int bits, float* centroids) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────── */
-/*  QR decomposition (Gram-Schmidt) for rotation matrix                    */
+/*  Fast Walsh-Hadamard Transform (in-place, O(d log d))                   */
+/*  Replaces dense O(d²) rotation with Subsampled Randomized Hadamard.     */
 /* ──────────────────────────────────────────────────────────────────────── */
 
-static void generate_rotation(int d, tq_rng* rng, float* Q) {
-    /* Fill d x d matrix with standard normal entries */
-    float* A = (float*)malloc(d * d * sizeof(float));
-    for (int i = 0; i < d * d; i++) {
-        A[i] = tq_randn(rng);
-    }
+static int tq_log2i(int n) {
+    int r = 0;
+    while ((1 << r) < n) r++;
+    return r;
+}
 
-    /* Modified Gram-Schmidt QR */
-    for (int j = 0; j < d; j++) {
-        /* Copy column j of A into column j of Q */
-        for (int i = 0; i < d; i++) {
-            Q[i * d + j] = A[i * d + j];
-        }
-        /* Orthogonalize against previous columns */
-        for (int k = 0; k < j; k++) {
-            float dot = 0.0f;
-            for (int i = 0; i < d; i++) {
-                dot += Q[i * d + k] * Q[i * d + j];
-            }
-            for (int i = 0; i < d; i++) {
-                Q[i * d + j] -= dot * Q[i * d + k];
-            }
-        }
-        /* Normalize */
-        float norm = 0.0f;
-        for (int i = 0; i < d; i++) {
-            norm += Q[i * d + j] * Q[i * d + j];
-        }
-        norm = sqrtf(norm);
-        if (norm > 1e-12f) {
-            for (int i = 0; i < d; i++) {
-                Q[i * d + j] /= norm;
+/* In-place unnormalized Walsh-Hadamard transform.  d must be power of 2. */
+static void fwht_inplace(float* x, int d) {
+    for (int half = 1; half < d; half <<= 1) {
+        for (int i = 0; i < d; i += half << 1) {
+            for (int j = i; j < i + half; j++) {
+                float a = x[j];
+                float b = x[j + half];
+                x[j]        = a + b;
+                x[j + half]  = a - b;
             }
         }
     }
+}
 
-    free(A);
+#if TQ_HAS_NEON
+/* NEON-accelerated FWHT for half >= 4 */
+static void fwht_inplace_neon(float* x, int d) {
+    /* Small stages: scalar */
+    for (int half = 1; half < 4; half <<= 1) {
+        for (int i = 0; i < d; i += half << 1) {
+            for (int j = i; j < i + half; j++) {
+                float a = x[j], b = x[j + half];
+                x[j] = a + b;
+                x[j + half] = a - b;
+            }
+        }
+    }
+    /* Larger stages: NEON */
+    for (int half = 4; half < d; half <<= 1) {
+        for (int i = 0; i < d; i += half << 1) {
+            for (int j = i; j < i + half; j += 4) {
+                float32x4_t a = vld1q_f32(&x[j]);
+                float32x4_t b = vld1q_f32(&x[j + half]);
+                vst1q_f32(&x[j],        vaddq_f32(a, b));
+                vst1q_f32(&x[j + half], vsubq_f32(a, b));
+            }
+        }
+    }
+}
+#define FWHT(x, d) fwht_inplace_neon(x, d)
+#else
+#define FWHT(x, d) fwht_inplace(x, d)
+#endif
+
+/* Apply random sign flip + FWHT + normalize = randomized Hadamard rotation */
+static void srht_forward(const float* restrict signs, float* restrict buf, int d, int log2d) {
+    /* Step 1: multiply by random diagonal D (±1) */
+    #if TQ_HAS_NEON
+    for (int i = 0; i + 4 <= d; i += 4) {
+        float32x4_t b = vld1q_f32(&buf[i]);
+        float32x4_t s = vld1q_f32(&signs[i]);
+        vst1q_f32(&buf[i], vmulq_f32(b, s));
+    }
+    #else
+    for (int i = 0; i < d; i++) buf[i] *= signs[i];
+    #endif
+
+    /* Step 2: Walsh-Hadamard transform */
+    FWHT(buf, d);
+
+    /* Step 3: normalize by 1/sqrt(d) */
+    float inv_sqrt_d = 1.0f / sqrtf((float)d);
+    #if TQ_HAS_NEON
+    float32x4_t norm = vdupq_n_f32(inv_sqrt_d);
+    for (int i = 0; i + 4 <= d; i += 4) {
+        float32x4_t b = vld1q_f32(&buf[i]);
+        vst1q_f32(&buf[i], vmulq_f32(b, norm));
+    }
+    #else
+    for (int i = 0; i < d; i++) buf[i] *= inv_sqrt_d;
+    #endif
+}
+
+/* Inverse = same operation (Hadamard is self-inverse, D² = I) */
+static void srht_inverse(const float* restrict signs, float* restrict buf, int d, int log2d) {
+    float inv_sqrt_d = 1.0f / sqrtf((float)d);
+    #if TQ_HAS_NEON
+    float32x4_t norm = vdupq_n_f32(inv_sqrt_d);
+    for (int i = 0; i + 4 <= d; i += 4) {
+        float32x4_t b = vld1q_f32(&buf[i]);
+        vst1q_f32(&buf[i], vmulq_f32(b, norm));
+    }
+    #else
+    for (int i = 0; i < d; i++) buf[i] *= inv_sqrt_d;
+    #endif
+
+    FWHT(buf, d);
+
+    #if TQ_HAS_NEON
+    for (int i = 0; i + 4 <= d; i += 4) {
+        float32x4_t b = vld1q_f32(&buf[i]);
+        float32x4_t s = vld1q_f32(&signs[i]);
+        vst1q_f32(&buf[i], vmulq_f32(b, s));
+    }
+    #else
+    for (int i = 0; i < d; i++) buf[i] *= signs[i];
+    #endif
 }
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -204,24 +282,25 @@ tq_ctx* tq_create(int dim, int bits, int seed) {
     ctx->dim = dim;
     ctx->bits = bits;
     ctx->n_levels = 1 << bits;
+    ctx->log2_dim = tq_log2i(dim);
 
-    /* Rotation matrix */
-    ctx->rotation = (float*)malloc(dim * dim * sizeof(float));
-    ctx->rot_inv  = (float*)malloc(dim * dim * sizeof(float));
+    /* Random sign vector for SRHT */
+    ctx->signs = (float*)malloc(dim * sizeof(float));
     tq_rng rng;
     tq_rng_seed(&rng, (uint64_t)seed);
-    generate_rotation(dim, &rng, ctx->rotation);
-
-    /* Transpose = inverse for orthogonal matrix */
     for (int i = 0; i < dim; i++) {
-        for (int j = 0; j < dim; j++) {
-            ctx->rot_inv[i * dim + j] = ctx->rotation[j * dim + i];
-        }
+        ctx->signs[i] = (tq_rng_next(&rng) & 1) ? 1.0f : -1.0f;
     }
 
     /* Lloyd-Max codebook */
     ctx->centroids = (float*)malloc(ctx->n_levels * sizeof(float));
     lloyd_max(dim, bits, ctx->centroids);
+
+    /* Pre-compute decision boundaries (midpoints between centroids) */
+    ctx->boundaries = (float*)malloc((ctx->n_levels - 1) * sizeof(float));
+    for (int i = 0; i < ctx->n_levels - 1; i++) {
+        ctx->boundaries[i] = 0.5f * (ctx->centroids[i] + ctx->centroids[i + 1]);
+    }
 
     ctx->buf = (float*)malloc(dim * sizeof(float));
     return ctx;
@@ -229,77 +308,68 @@ tq_ctx* tq_create(int dim, int bits, int seed) {
 
 void tq_destroy(tq_ctx* ctx) {
     if (!ctx) return;
-    free(ctx->rotation);
-    free(ctx->rot_inv);
+    free(ctx->signs);
     free(ctx->centroids);
+    free(ctx->boundaries);
     free(ctx->buf);
     free(ctx);
 }
 
-void tq_quantize(tq_ctx* ctx, const float* in, uint16_t* out, int n_vectors) {
-    int d = ctx->dim;
-    int nl = ctx->n_levels;
-    const float* Rt = ctx->rot_inv;  /* R^T: rotate forward */
-    const float* C = ctx->centroids;
+void tq_quantize(tq_ctx* ctx, const float* restrict in, uint16_t* restrict out, int n_vectors) {
+    const int d = ctx->dim;
+    const int nl = ctx->n_levels;
+    const int nb = nl - 1;
+    const float* restrict signs = ctx->signs;
+    const float* restrict B = ctx->boundaries;
+    const int log2d = ctx->log2_dim;
+
+    float buf[d];
 
     for (int v = 0; v < n_vectors; v++) {
-        const float* x = in + v * d;
-        uint16_t* idx = out + v * d;
+        const float* restrict x = in + v * d;
+        uint16_t* restrict idx = out + v * d;
 
-        /* Rotate: buf = x @ R^T  (buf[j] = sum_k x[k] * R^T[k][j]) */
-        for (int j = 0; j < d; j++) {
-            float s = 0.0f;
-            for (int k = 0; k < d; k++) {
-                s += x[k] * Rt[k * d + j];
-            }
-            ctx->buf[j] = s;
-        }
+        /* Copy input to buf */
+        memcpy(buf, x, d * sizeof(float));
 
-        /* Scalar quantize each coordinate */
+        /* SRHT forward: D·H·x / sqrt(d) */
+        srht_forward(signs, buf, d, log2d);
+
+        /* Quantize: scan boundaries (branchless-friendly for small nl) */
         for (int j = 0; j < d; j++) {
-            float val = ctx->buf[j];
-            int best = 0;
-            float best_dist = fabsf(val - C[0]);
-            for (int c = 1; c < nl; c++) {
-                float dist = fabsf(val - C[c]);
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best = c;
-                }
+            float val = buf[j];
+            int level = 0;
+            for (int b = 0; b < nb; b++) {
+                level += (val > B[b]);
             }
-            idx[j] = (uint16_t)best;
+            idx[j] = (uint16_t)level;
         }
     }
 }
 
-void tq_dequantize(tq_ctx* ctx, const uint16_t* in, float* out, int n_vectors) {
-    int d = ctx->dim;
-    const float* R = ctx->rotation;  /* R: inverse rotate */
-    const float* C = ctx->centroids;
+void tq_dequantize(tq_ctx* ctx, const uint16_t* restrict in, float* restrict out, int n_vectors) {
+    const int d = ctx->dim;
+    const float* restrict signs = ctx->signs;
+    const float* restrict C = ctx->centroids;
+    const int log2d = ctx->log2_dim;
 
     for (int v = 0; v < n_vectors; v++) {
-        const uint16_t* idx = in + v * d;
-        float* xhat = out + v * d;
+        const uint16_t* restrict idx = in + v * d;
+        float* restrict xhat = out + v * d;
 
-        /* Lookup centroids */
+        /* Lookup centroids into output buffer directly */
         for (int j = 0; j < d; j++) {
-            ctx->buf[j] = C[idx[j]];
+            xhat[j] = C[idx[j]];
         }
 
-        /* Inverse rotate: xhat = buf @ R */
-        for (int i = 0; i < d; i++) {
-            float s = 0.0f;
-            for (int k = 0; k < d; k++) {
-                s += ctx->buf[k] * R[k * d + i];
-            }
-            xhat[i] = s;
-        }
+        /* SRHT inverse: H·D·x / sqrt(d) = inverse rotation */
+        srht_inverse(signs, xhat, d, log2d);
     }
 }
 
 float tq_mse(tq_ctx* ctx, const float* x, int n_vectors) {
-    int d = ctx->dim;
-    int total = n_vectors * d;
+    const int d = ctx->dim;
+    const int total = n_vectors * d;
     uint16_t* idx = (uint16_t*)malloc(total * sizeof(uint16_t));
     float*    rec = (float*)malloc(total * sizeof(float));
 
@@ -308,12 +378,31 @@ float tq_mse(tq_ctx* ctx, const float* x, int n_vectors) {
 
     double mse = 0.0;
     for (int v = 0; v < n_vectors; v++) {
+        const float* xv = x + v * d;
+        const float* rv = rec + v * d;
+#if TQ_HAS_NEON
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 4 <= d; j += 4) {
+            float32x4_t a = vld1q_f32(&xv[j]);
+            float32x4_t b = vld1q_f32(&rv[j]);
+            float32x4_t diff = vsubq_f32(a, b);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+        float sq = vaddvq_f32(acc);
+        for (; j < d; j++) {
+            float diff = xv[j] - rv[j];
+            sq += diff * diff;
+        }
+        mse += (double)sq;
+#else
         double sq = 0.0;
         for (int j = 0; j < d; j++) {
-            double diff = (double)x[v * d + j] - (double)rec[v * d + j];
+            double diff = (double)xv[j] - (double)rv[j];
             sq += diff * diff;
         }
         mse += sq;
+#endif
     }
 
     free(idx);
@@ -329,4 +418,145 @@ float tq_upper_bound(tq_ctx* ctx) {
 float tq_lower_bound(tq_ctx* ctx) {
     /* Theorem 3: no quantizer can do better than 4^{-b} */
     return powf(4.0f, -(float)ctx->bits);
+}
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/*  Parallel quantize / dequantize via pthreads                            */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+#define TQ_MAX_THREADS 8
+
+typedef struct {
+    tq_ctx*         ctx;
+    const float*    in_f;
+    const uint16_t* in_u;
+    float*          out_f;
+    uint16_t*       out_u;
+    int             start;
+    int             count;
+} tq_thread_arg;
+
+static void* tq_quantize_worker(void* arg) {
+    tq_thread_arg* a = (tq_thread_arg*)arg;
+    tq_ctx* ctx = a->ctx;
+    const int d = ctx->dim;
+
+    /* Each thread needs its own local context copy for thread-safe buf */
+    const int nl = ctx->n_levels;
+    const int nb = nl - 1;
+    const float* restrict signs = ctx->signs;
+    const float* restrict B = ctx->boundaries;
+    const int log2d = ctx->log2_dim;
+
+    float* buf = (float*)malloc(d * sizeof(float));
+
+    const float* restrict in = a->in_f + a->start * d;
+    uint16_t* restrict out = a->out_u + a->start * d;
+
+    for (int v = 0; v < a->count; v++) {
+        const float* restrict x = in + v * d;
+        uint16_t* restrict idx = out + v * d;
+
+        memcpy(buf, x, d * sizeof(float));
+        srht_forward(signs, buf, d, log2d);
+
+        for (int j = 0; j < d; j++) {
+            float val = buf[j];
+            int level = 0;
+            for (int b = 0; b < nb; b++) {
+                level += (val > B[b]);
+            }
+            idx[j] = (uint16_t)level;
+        }
+    }
+
+    free(buf);
+    return NULL;
+}
+
+static void* tq_dequantize_worker(void* arg) {
+    tq_thread_arg* a = (tq_thread_arg*)arg;
+    tq_ctx* ctx = a->ctx;
+    const int d = ctx->dim;
+    const float* restrict signs = ctx->signs;
+    const float* restrict C = ctx->centroids;
+    const int log2d = ctx->log2_dim;
+
+    const uint16_t* restrict in = a->in_u + a->start * d;
+    float* restrict out = a->out_f + a->start * d;
+
+    for (int v = 0; v < a->count; v++) {
+        const uint16_t* restrict idx = in + v * d;
+        float* restrict xhat = out + v * d;
+
+        for (int j = 0; j < d; j++) {
+            xhat[j] = C[idx[j]];
+        }
+
+        srht_inverse(signs, xhat, d, log2d);
+    }
+
+    return NULL;
+}
+
+void tq_quantize_parallel(tq_ctx* ctx, const float* in, uint16_t* out, int n_vectors) {
+    if (n_vectors < 1000) {
+        tq_quantize(ctx, in, out, n_vectors);
+        return;
+    }
+
+    int n_threads = TQ_MAX_THREADS;
+    if (n_vectors < n_threads * 100) n_threads = 2;
+
+    pthread_t threads[TQ_MAX_THREADS];
+    tq_thread_arg args[TQ_MAX_THREADS];
+
+    int per_thread = n_vectors / n_threads;
+    int remainder  = n_vectors % n_threads;
+
+    int offset = 0;
+    for (int t = 0; t < n_threads; t++) {
+        args[t].ctx   = ctx;
+        args[t].in_f  = in;
+        args[t].out_u = out;
+        args[t].start = offset;
+        args[t].count = per_thread + (t < remainder ? 1 : 0);
+        offset += args[t].count;
+        pthread_create(&threads[t], NULL, tq_quantize_worker, &args[t]);
+    }
+
+    for (int t = 0; t < n_threads; t++) {
+        pthread_join(threads[t], NULL);
+    }
+}
+
+void tq_dequantize_parallel(tq_ctx* ctx, const uint16_t* in, float* out, int n_vectors) {
+    if (n_vectors < 1000) {
+        tq_dequantize(ctx, in, out, n_vectors);
+        return;
+    }
+
+    int n_threads = TQ_MAX_THREADS;
+    if (n_vectors < n_threads * 100) n_threads = 2;
+
+    pthread_t threads[TQ_MAX_THREADS];
+    tq_thread_arg args[TQ_MAX_THREADS];
+
+    int per_thread = n_vectors / n_threads;
+    int remainder  = n_vectors % n_threads;
+
+    int offset = 0;
+    for (int t = 0; t < n_threads; t++) {
+        args[t].ctx   = ctx;
+        args[t].in_u  = in;
+        args[t].out_f = out;
+        args[t].start = offset;
+        args[t].count = per_thread + (t < remainder ? 1 : 0);
+        offset += args[t].count;
+        pthread_create(&threads[t], NULL, tq_dequantize_worker, &args[t]);
+    }
+
+    for (int t = 0; t < n_threads; t++) {
+        pthread_join(threads[t], NULL);
+    }
 }

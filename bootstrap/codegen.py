@@ -1169,8 +1169,10 @@ class CodeGen:
         self.builder.position_at_end(inc_block)
         curr_val_2 = self.builder.load(loop_var_ptr)
         one = ir.Constant(ir.IntType(32), 1)
-        next_val = self.builder.add(curr_val_2, one)
-        self.builder.store(next_val, loop_var_ptr)
+        inc = self.builder.add(curr_val_2, one)
+        inc.flags.append('nsw')  # loop counter never overflows
+        inc.flags.append('nuw')
+        self.builder.store(inc, loop_var_ptr)
         self.builder.branch(cond_block)
         
         # 6. End Block
@@ -1233,6 +1235,15 @@ class CodeGen:
         self.emit_scope_drops(self.scopes[-1])
         self.scopes.pop()
 
+    def _entry_alloca(self, llvm_type, name=""):
+        """Create an alloca at the start of the function entry block (avoids stack growth in loops)."""
+        entry = self.builder.function.entry_basic_block
+        with self.builder.goto_block(entry):
+            if entry.instructions:
+                self.builder.position_before(entry.instructions[0])
+            alloca = self.builder.alloca(llvm_type, name=name)
+        return alloca
+
     def visit_VarDecl(self, node):
         # Determine type
         try:
@@ -1274,8 +1285,8 @@ class CodeGen:
             self.scopes[-1][node.name] = (init_val, node.type_name, "value")
             return
 
-        # Alloca
-        ptr = self.builder.alloca(llvm_type, name=node.name)
+        # Alloca — in entry block to avoid stack growth in loops
+        ptr = self._entry_alloca(llvm_type, name=node.name)
         # Coerce value type if needed (e.g. generic monomorphization, struct layout differences)
         if init_val.type != llvm_type:
             init_val = self._coerce_value(init_val, llvm_type)
@@ -1486,7 +1497,19 @@ class CodeGen:
                 field_ptr = self.builder.bitcast(field_ptr, val.type.as_pointer())
             self.builder.store(val, field_ptr)
 
+    def _fmath(self, result):
+        """Add fast-math flags to a float instruction."""
+        result.flags.append('fast')
+        return result
+
+    def _nsw(self, result):
+        """Add no-signed-wrap flag to an integer instruction."""
+        result.flags.append('nsw')
+        return result
+
     def visit_BinaryExpr(self, node):
+        from n_parser import IntegerLiteral as _IntLit
+
         left = self.visit(node.left)
         right = self.visit(node.right)
 
@@ -1497,27 +1520,35 @@ class CodeGen:
             if isinstance(right.type, ir.PointerType):
                 return self.builder.gep(right, [left], name="ptr_add")
             if left.type == ir.FloatType():
-                return self.builder.fadd(left, right, name="faddtmp")
-            return self.builder.add(left, right, name="addtmp")
+                return self._fmath(self.builder.fadd(left, right, name="faddtmp"))
+            return self._nsw(self.builder.add(left, right, name="addtmp"))
         elif node.op == 'MINUS':
             if isinstance(left.type, ir.PointerType):
                 # pointer - offset: gep with neg offset
                 neg_right = self.builder.neg(right, name="neg_offset")
                 return self.builder.gep(left, [neg_right], name="ptr_sub")
             if left.type == ir.FloatType():
-                return self.builder.fsub(left, right, name="fsubtmp")
-            return self.builder.sub(left, right, name="subtmp")
+                return self._fmath(self.builder.fsub(left, right, name="fsubtmp"))
+            return self._nsw(self.builder.sub(left, right, name="subtmp"))
         elif node.op == 'STAR':
             if left.type == ir.FloatType():
-                return self.builder.fmul(left, right, name="fmultmp")
-            return self.builder.mul(left, right, name="multmp")
+                return self._fmath(self.builder.fmul(left, right, name="fmultmp"))
+            return self._nsw(self.builder.mul(left, right, name="multmp"))
         elif node.op == 'SLASH':
             if left.type == ir.FloatType():
-                return self.builder.fdiv(left, right, name="fdivtmp")
+                return self._fmath(self.builder.fdiv(left, right, name="fdivtmp"))
+            # Strength reduction: x / 2^n => x >> n (for positive power-of-2 constants)
+            if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
+                shift = node.right.value.bit_length() - 1
+                return self.builder.ashr(left, ir.Constant(left.type, shift), name="divsr")
             return self.builder.sdiv(left, right, name="divtmp")
         elif node.op == 'PERCENT':
             if left.type == ir.FloatType():
-                return self.builder.frem(left, right, name="fremtmp")
+                return self._fmath(self.builder.frem(left, right, name="fremtmp"))
+            # Strength reduction: x % 2^n => x & (2^n - 1) (for positive power-of-2 constants)
+            if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
+                mask = node.right.value - 1
+                return self.builder.and_(left, ir.Constant(left.type, mask), name="modsr")
             return self.builder.srem(left, right, name="remtmp")
         elif node.op == 'AND':
             return self.builder.and_(left, right, name="andtmp")
@@ -1980,6 +2011,13 @@ class CodeGen:
                 elif isinstance(val.type, ir.DoubleType) and isinstance(target_ty, ir.FloatType):
                     return self.builder.fptrunc(val, target_ty)
                 return val
+
+            # Int to float
+            if isinstance(val.type, ir.IntType) and isinstance(target_ty, (ir.FloatType, ir.DoubleType)):
+                return self.builder.sitofp(val, target_ty)
+            # Float to int
+            if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(target_ty, ir.IntType):
+                return self.builder.fptosi(val, target_ty)
                 
             return self.builder.bitcast(val, target_ty)
 
@@ -2467,6 +2505,18 @@ class CodeGen:
 
         if node.is_kernel:
             func.calling_convention = 'spir_kernel'
+
+        # Inline hints for small functions (body is not None = has implementation)
+        if node.body is not None and node.name != 'main':
+            body_len = len(node.body) if node.body else 0
+            if body_len <= 5:
+                func.attributes.add('inlinehint')
+            # Mark noalias on pointer parameters for better alias analysis
+            if not getattr(node, 'is_vararg', False):
+                for i, (pname, ptype) in enumerate(node.params):
+                    offset = 1 if getattr(node, 'is_lambda', False) else 0
+                    if isinstance(ptype, str) and ptype.startswith('*'):
+                        func.args[i + offset].add_attribute('noalias')
 
         return func
 

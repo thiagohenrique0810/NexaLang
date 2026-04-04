@@ -106,7 +106,7 @@ def main():
     ap.add_argument("--run-tests", action="store_true", help="Find and run all functions marked with @[test]")
     ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
     ap.add_argument("--emit-mir", action="store_true", help="Emit MIR (Mid-level IR) for debugging/optimization analysis")
-    ap.add_argument("--opt", choices=["0", "1", "2"], default="1", help="MIR optimization level (0=none, 1=basic, 2=aggressive)")
+    ap.add_argument("--opt", choices=["0", "1", "2", "3"], default="1", help="Optimization level (0=none, 1=basic, 2=aggressive, 3=max)")
     ap.add_argument("--quantize-gpu", type=int, default=0, choices=[0, 1, 2, 3, 4], help="Auto-quantize GPU float buffers with TurboQuant (0=off, 1-4=bits)")
     args = ap.parse_args()
 
@@ -204,7 +204,7 @@ def main():
         mir_module = lowering.lower(ast, struct_info=analyzer.structs, enum_info=analyzer.enums)
         
         optimizer = MIROptimizer()
-        mir_module = optimizer.optimize(mir_module, level=int(args.opt))
+        mir_module = optimizer.optimize(mir_module, level=min(int(args.opt), 2))
         
         printer = MIRPrinter()
         mir_text = printer.print_module(mir_module)
@@ -224,6 +224,35 @@ def main():
         quantize_gpu=args.quantize_gpu,
     )
     llvm_ir = codegen.generate(ast)
+
+    # ── LLVM Optimization Passes ──
+    opt_level = int(args.opt)
+    if opt_level >= 2 and args.target == "native":
+        try:
+            import llvmlite.binding as llvm_binding
+            llvm_binding.initialize_native_target()
+            llvm_binding.initialize_native_asmprinter()
+
+            mod = llvm_binding.parse_assembly(str(llvm_ir))
+            mod.verify()
+
+            pto = llvm_binding.PipelineTuningOptions()
+            pto.speed_level = min(opt_level, 3)
+            pto.loop_vectorization = True
+            pto.loop_unrolling = True
+            pto.slp_vectorization = (opt_level >= 3)
+            pto.loop_interleaving = True
+
+            target = llvm_binding.Target.from_default_triple()
+            tm = target.create_target_machine(opt=min(opt_level, 3))
+            pb = llvm_binding.create_pass_builder(tm, pto)
+            mpm = pb.getModulePassManager()
+            mpm.run(mod, pb)
+
+            llvm_ir = str(mod)
+            print(f"[OPT] LLVM O{min(opt_level, 3)} passes applied")
+        except Exception as e:
+            print(f"[OPT WARNING] LLVM passes skipped: {e}")
 
     if args.run_jit and args.target == "native":
         from jit import run_jit

@@ -1,0 +1,442 @@
+# perf_bench.nxl — Performance benchmarks with complex calculations  v3.0
+#
+# Tests:
+#   1. Matrix multiplication (Apple Accelerate BLAS)
+#   2. Mandelbrot set computation
+#   3. Monte Carlo pi estimation
+#   4. TurboQuant vector quantization throughput (parallel)
+#   5. Iterative numerical solver (Newton-Raphson sqrt)
+#   6. FFT-style butterfly operations
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn sinf(x: f32) -> f32;
+    fn cosf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+    fn fabsf(x: f32) -> f32;
+    fn powf(x: f32, y: f32) -> f32;
+    fn gettimeofday(tv: *u8, tz: *u8) -> i32;
+    fn printf(fmt: *u8, ...) -> i32;
+    fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
+    fn tq_destroy(ctx: *u8);
+    fn tq_quantize(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
+    fn tq_dequantize(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn tq_mse(ctx: *u8, original: *f32, n_vectors: i32) -> f32;
+    fn tq_upper_bound(ctx: *u8) -> f32;
+    fn tq_lower_bound(ctx: *u8) -> f32;
+    # Apple Accelerate BLAS
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32, m: i32, n: i32, k: i32, alpha: f32, A: *f32, lda: i32, B: *f32, ldb: i32, beta: f32, C: *f32, ldc: i32);
+    # Parallel TurboQuant
+    fn tq_quantize_parallel(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
+    fn tq_dequantize_parallel(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+}
+
+# ── Inline timing (microsecond precision via gettimeofday) ──────────────
+struct BenchTimer {
+    secs: i64,
+    usecs: i32
+}
+
+fn timer_now() -> BenchTimer {
+    let tv: *u8 = malloc(16);
+    gettimeofday(tv, cast::<*u8>(0));
+    let secs: i64 = *cast::<*i64>(tv);
+    let usecs: i32 = *cast::<*i32>(cast::<*u8>(cast::<i64>(tv) + cast::<i64>(8)));
+    free(tv);
+    return BenchTimer(secs, usecs);
+}
+
+fn elapsed_ms(t1: BenchTimer, t0: BenchTimer) -> i32 {
+    let ds: i32 = cast::<i32>(t1.secs - t0.secs);
+    let du: i32 = t1.usecs - t0.usecs;
+    return ds * 1000 + du / 1000;
+}
+
+fn elapsed_us(t1: BenchTimer, t0: BenchTimer) -> i64 {
+    let ds: i64 = t1.secs - t0.secs;
+    let du: i64 = cast::<i64>(t1.usecs - t0.usecs);
+    return ds * cast::<i64>(1000000) + du;
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. Matrix Multiplication — Apple Accelerate BLAS (cblas_sgemm)
+# ═══════════════════════════════════════════════════════════════════════════
+fn bench_matmul(n: i32) {
+    let size: i32 = n * n;
+    let a = cast::<*f32>(malloc(size * 4));
+    let b = cast::<*f32>(malloc(size * 4));
+    let c = cast::<*f32>(malloc(size * 4));
+
+    # Initialize matrices
+    for i in 0..size {
+        a[i] = cast::<f32>(i % 17) * 0.1;
+        b[i] = cast::<f32>(i % 13) * 0.1;
+        c[i] = 0.0;
+    }
+
+    let t0 = timer_now();
+
+    # CblasRowMajor=101, CblasNoTrans=111
+    # C = 1.0 * A * B + 0.0 * C
+    cblas_sgemm(101, 111, 111, n, n, n, 1.0, a, n, b, n, 0.0, c, n);
+
+    let t1 = timer_now();
+    let us = elapsed_us(t1, t0);
+
+    print("  Matrix Multiplication (Accelerate BLAS):");
+    print("    Size:       ");
+    print(n);
+    print("    Time (us):  ");
+    print(cast::<i32>(us));
+
+    # Verify: print corner element
+    print("    C[0,0]:     ");
+    print(c[0]);
+
+    let flops: i32 = 2 * n * n * n;
+    print("    FLOPs:      ");
+    print(flops);
+
+    # MFLOP/s
+    let mflops: i32 = cast::<i32>(cast::<i64>(flops) * cast::<i64>(1000) / us);
+    print("    MFLOP/s:    ");
+    print(mflops);
+
+    free(cast::<*u8>(a));
+    free(cast::<*u8>(b));
+    free(cast::<*u8>(c));
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. Mandelbrot Set — Escape iteration count
+# ═══════════════════════════════════════════════════════════════════════════
+fn mandelbrot_iter(cr: f32, ci: f32, max_iter: i32) -> i32 {
+    let mut zr: f32 = 0.0;
+    let mut zi: f32 = 0.0;
+    let mut i: i32 = 0;
+    while (i < max_iter) {
+        let zr2: f32 = zr * zr;
+        let zi2: f32 = zi * zi;
+        if (zr2 + zi2 > 4.0) {
+            return i;
+        }
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+        i = i + 1;
+    }
+    return max_iter;
+}
+
+fn bench_mandelbrot(width: i32, height: i32, max_iter: i32) {
+    let t0 = timer_now();
+
+    let mut total_iters: i32 = 0;
+    let mut inside: i32 = 0;
+
+    for py in 0..height {
+        for px in 0..width {
+            let cr: f32 = cast::<f32>(px) / cast::<f32>(width) * 3.5 - 2.5;
+            let ci: f32 = cast::<f32>(py) / cast::<f32>(height) * 2.0 - 1.0;
+            let iters: i32 = mandelbrot_iter(cr, ci, max_iter);
+            total_iters = total_iters + iters;
+            if (iters == max_iter) {
+                inside = inside + 1;
+            }
+        }
+    }
+
+    let t1 = timer_now();
+    let ms = elapsed_ms(t1, t0);
+
+    print("  Mandelbrot Set:");
+    print("    Resolution:   ");
+    print(width);
+    print("    Max iter:     ");
+    print(max_iter);
+    print("    Time (ms):    ");
+    print(ms);
+    print("    Total iters:  ");
+    print(total_iters);
+    print("    Points inside:");
+    print(inside);
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. Monte Carlo Pi Estimation (xorshift32 PRNG)
+# ═══════════════════════════════════════════════════════════════════════════
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+fn bench_monte_carlo_pi(n_samples: i32) {
+    let t0 = timer_now();
+
+    let mut inside: i32 = 0;
+    let mut state: i32 = 123456789;
+
+    for i in 0..n_samples {
+        state = xorshift32(state);
+        let x: f32 = cast::<f32>(state & 2147483647) / cast::<f32>(2147483647);
+        state = xorshift32(state);
+        let y: f32 = cast::<f32>(state & 2147483647) / cast::<f32>(2147483647);
+
+        if (x * x + y * y <= 1.0) {
+            inside = inside + 1;
+        }
+    }
+
+    let t1 = timer_now();
+    let ms = elapsed_ms(t1, t0);
+
+    # pi ≈ 4 * inside / n
+    let pi_est_x1000: i32 = inside / (n_samples / 4000);
+
+    print("  Monte Carlo Pi:");
+    print("    Samples:      ");
+    print(n_samples);
+    print("    Time (ms):    ");
+    print(ms);
+    print("    Pi*1000 est:  ");
+    print(pi_est_x1000);
+    print("    Hits inside:  ");
+    print(inside);
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. TurboQuant Vector Throughput
+# ═══════════════════════════════════════════════════════════════════════════
+fn bench_turboquant(dim: i32, n_vectors: i32, bits: i32) {
+    let ctx: *u8 = tq_create(dim, bits, 42);
+
+    let total_floats: i32 = dim * n_vectors;
+    let input = cast::<*f32>(malloc(total_floats * 4));
+    let compressed = malloc(total_floats * 2);
+    let output = cast::<*f32>(malloc(total_floats * 4));
+
+    # Fill with pseudo-random pattern
+    let mut seed: i64 = cast::<i64>(42);
+    for i in 0..total_floats {
+        seed = (cast::<i64>(1103515245) * seed + cast::<i64>(12345)) & cast::<i64>(2147483647);
+        input[i] = cast::<f32>(cast::<i32>(seed)) / cast::<f32>(2147483647) * 2.0 - 1.0;
+    }
+
+    let n_reps: i32 = 50;
+
+    # Benchmark quantize (parallel)
+    let t0 = timer_now();
+    for rep in 0..n_reps {
+        tq_quantize_parallel(ctx, input, compressed, n_vectors);
+    }
+    let t1 = timer_now();
+    let quant_us = elapsed_us(t1, t0);
+
+    # Benchmark dequantize (parallel)
+    let t2 = timer_now();
+    for rep in 0..n_reps {
+        tq_dequantize_parallel(ctx, compressed, output, n_vectors);
+    }
+    let t3 = timer_now();
+    let dequant_us = elapsed_us(t3, t2);
+
+    # MSE and theoretical bounds
+    let mse: f32 = tq_mse(ctx, input, n_vectors);
+    let upper: f32 = tq_upper_bound(ctx);
+    let lower: f32 = tq_lower_bound(ctx);
+
+    # Throughput: vectors per second = (n_vectors * n_reps) / time_seconds
+    let total_ops: i64 = cast::<i64>(n_vectors) * cast::<i64>(n_reps);
+    let quant_vps: i64 = total_ops * cast::<i64>(1000000) / quant_us;
+    let dequant_vps: i64 = total_ops * cast::<i64>(1000000) / dequant_us;
+
+    # MB/s: total_floats * 4 bytes * n_reps / time_seconds / 1048576
+    let total_bytes: i64 = cast::<i64>(total_floats) * cast::<i64>(4) * cast::<i64>(n_reps);
+    let quant_mbps: i64 = total_bytes * cast::<i64>(1000000) / quant_us / cast::<i64>(1048576);
+    let dequant_mbps: i64 = total_bytes * cast::<i64>(1000000) / dequant_us / cast::<i64>(1048576);
+
+    print("  TurboQuant Throughput:");
+    print("    Dim:            ");
+    print(dim);
+    print("    Vectors:        ");
+    print(n_vectors);
+    print("    Bits:           ");
+    print(bits);
+    print("    Reps:           ");
+    print(n_reps);
+    print("    Quantize (us):  ");
+    print(cast::<i32>(quant_us));
+    print("    Dequantize (us):");
+    print(cast::<i32>(dequant_us));
+    print("    Quant vec/s:    ");
+    print(cast::<i32>(quant_vps));
+    print("    Dequant vec/s:  ");
+    print(cast::<i32>(dequant_vps));
+    print("    Quant MB/s:     ");
+    print(cast::<i32>(quant_mbps));
+    print("    Dequant MB/s:   ");
+    print(cast::<i32>(dequant_mbps));
+    print("    MSE:            ");
+    print(mse);
+    print("    Upper bound:    ");
+    print(upper);
+    print("    Lower bound:    ");
+    print(lower);
+
+    free(cast::<*u8>(input));
+    free(compressed);
+    free(cast::<*u8>(output));
+    tq_destroy(ctx);
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. Newton-Raphson iterative sqrt for N numbers
+# ═══════════════════════════════════════════════════════════════════════════
+fn newton_sqrt(x: f32) -> f32 {
+    if (x <= 0.0) { return 0.0; }
+    let mut guess: f32 = x * 0.5;
+    # 20 iterations for high precision
+    for i in 0..20 {
+        guess = 0.5 * (guess + x / guess);
+    }
+    return guess;
+}
+
+fn bench_newton_sqrt(n: i32) {
+    let data = cast::<*f32>(malloc(n * 4));
+    let results = cast::<*f32>(malloc(n * 4));
+
+    for i in 0..n {
+        data[i] = cast::<f32>(i + 1) * 0.01;
+    }
+
+    let t0 = timer_now();
+    for i in 0..n {
+        results[i] = newton_sqrt(data[i]);
+    }
+    let t1 = timer_now();
+    let ms = elapsed_ms(t1, t0);
+
+    # Verify against libm sqrtf
+    let mut max_err: f32 = 0.0;
+    for i in 0..n {
+        let err: f32 = fabsf(results[i] - sqrtf(data[i]));
+        if (err > max_err) {
+            max_err = err;
+        }
+    }
+
+    print("  Newton-Raphson Sqrt:");
+    print("    Count:        ");
+    print(n);
+    print("    Time (ms):    ");
+    print(ms);
+    print("    Max error:    ");
+    print(max_err);
+
+    free(cast::<*u8>(data));
+    free(cast::<*u8>(results));
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. FFT-style butterfly (trig-heavy, FLOP intensive)
+# ═══════════════════════════════════════════════════════════════════════════
+fn bench_butterfly(n: i32, iterations: i32) {
+    let re = cast::<*f32>(malloc(n * 4));
+    let im = cast::<*f32>(malloc(n * 4));
+
+    for i in 0..n {
+        re[i] = cast::<f32>(i) * 0.001;
+        im[i] = cast::<f32>(n - i) * 0.001;
+    }
+
+    let t0 = timer_now();
+
+    let pi: f32 = 3.14159265;
+
+    for iter in 0..iterations {
+        let half: i32 = n / 2;
+        for i in 0..half {
+            let angle: f32 = 2.0 * pi * cast::<f32>(i) / cast::<f32>(n);
+            let wr: f32 = cosf(angle);
+            let wi: f32 = sinf(angle);
+
+            let j: i32 = i + half;
+            let tr: f32 = wr * re[j] - wi * im[j];
+            let ti: f32 = wr * im[j] + wi * re[j];
+
+            re[j] = re[i] - tr;
+            im[j] = im[i] - ti;
+            re[i] = re[i] + tr;
+            im[i] = im[i] + ti;
+        }
+        # Normalize every 10 iters to prevent float overflow
+        if (iter % 10 == 9) {
+            let inv_n: f32 = 1.0 / cast::<f32>(n);
+            for i in 0..n {
+                re[i] = re[i] * inv_n;
+                im[i] = im[i] * inv_n;
+            }
+        }
+    }
+
+    let t1 = timer_now();
+    let ms = elapsed_ms(t1, t0);
+
+    print("  FFT Butterfly Ops:");
+    print("    Size:         ");
+    print(n);
+    print("    Iterations:   ");
+    print(iterations);
+    print("    Time (ms):    ");
+    print(ms);
+    print("    Re[0]:        ");
+    print(re[0]);
+
+    free(cast::<*u8>(re));
+    free(cast::<*u8>(im));
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main — Run all benchmarks
+# ═══════════════════════════════════════════════════════════════════════════
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════╗");
+    print("║   NexaLang Performance Benchmark Suite v3.0     ║");
+    print("║   (BLAS + Parallel TurboQuant)                  ║");
+    print("╚══════════════════════════════════════════════════╝");
+    print("");
+
+    print("── 1/6 Matrix Multiplication ──────────────────────");
+    bench_matmul(256);
+    print("");
+
+    print("── 2/6 Mandelbrot Set ─────────────────────────────");
+    bench_mandelbrot(512, 512, 1000);
+    print("");
+
+    print("── 3/6 Monte Carlo Pi ─────────────────────────────");
+    bench_monte_carlo_pi(10000000);
+    print("");
+
+    print("── 4/6 TurboQuant Vector Compression ──────────────");
+    bench_turboquant(128, 10000, 4);
+    print("");
+
+    print("── 5/6 Newton-Raphson Sqrt ────────────────────────");
+    bench_newton_sqrt(1000000);
+    print("");
+
+    print("── 6/6 FFT Butterfly Operations ───────────────────");
+    bench_butterfly(8192, 500);
+    print("");
+
+    print("══════════════════════════════════════════════════");
+    print("  All benchmarks complete.");
+    print("══════════════════════════════════════════════════");
+
+    return 0;
+}

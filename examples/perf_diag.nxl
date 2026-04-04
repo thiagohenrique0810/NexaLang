@@ -1,0 +1,66 @@
+# Minimal diagnostic for codegen issues
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn fabsf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+}
+
+fn main() -> i32 {
+    # Test 1: i64 LCG
+    print("=== LCG Test ===");
+    let mut seed: i64 = cast::<i64>(12345);
+    seed = (cast::<i64>(1103515245) * seed + cast::<i64>(12345)) & cast::<i64>(2147483647);
+    let s32: i32 = cast::<i32>(seed);
+    print(s32);
+
+    let f: f32 = cast::<f32>(s32) / cast::<f32>(2147483647);
+    print("Float value (should be ~0.6):");
+    print(f);
+
+    # Test 2: for loop with variable bound
+    print("=== For Loop Test ===");
+    let n: i32 = 10;
+    let mut count: i32 = 0;
+    for i in 0..n {
+        count = count + 1;
+    }
+    print("Count (should be 10):");
+    print(count);
+
+    # Test 3: float comparison
+    print("=== Float Compare ===");
+    let x: f32 = 0.5;
+    let y: f32 = 0.5;
+    let d: f32 = x * x + y * y;
+    print("d (should be 0.5):");
+    print(d);
+    if (d <= 1.0) {
+        print("INSIDE (correct)");
+    }
+
+    # Test 4: Newton sqrt
+    print("=== Newton Sqrt ===");
+    let val: f32 = 2.0;
+    let mut guess: f32 = val * 0.5;
+    for i in 0..20 {
+        guess = 0.5 * (guess + val / guess);
+    }
+    print("sqrt(2) approx (should be ~1.414):");
+    print(guess);
+    let libsqrt: f32 = sqrtf(val);
+    print("sqrtf(2):");
+    print(libsqrt);
+    let err: f32 = fabsf(guess - libsqrt);
+    print("error:");
+    print(err);
+
+    # Test 5: cast f32 to i32
+    print("=== Cast Test ===");
+    let big: f32 = cast::<f32>(2147483647);
+    print("2147483647 as f32:");
+    print(big);
+
+    return 0;
+}

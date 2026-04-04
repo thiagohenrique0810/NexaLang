@@ -67,6 +67,10 @@ float tq_upper_bound(tq_ctx* ctx);
 /* Theoretical lower bound: 4^{-bits} */
 float tq_lower_bound(tq_ctx* ctx);
 
+/* Parallel quantize/dequantize using pthreads (multi-core) */
+void tq_quantize_parallel(tq_ctx* ctx, const float* in, uint16_t* out, int n_vectors);
+void tq_dequantize_parallel(tq_ctx* ctx, const uint16_t* in, float* out, int n_vectors);
+
 #ifdef __cplusplus
 }
 #endif
