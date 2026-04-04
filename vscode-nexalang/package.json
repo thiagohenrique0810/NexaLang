@@ -1,8 +1,8 @@
 {
   "name": "nexalang",
   "displayName": "NexaLang",
-  "description": "Syntax highlighting and official tooling for NexaLang (.nxl)",
-  "version": "0.1.0",
+  "description": "Syntax highlighting, diagnostics, hover, and completion for NexaLang (.nxl)",
+  "version": "0.2.0",
   "publisher": "nexalang",
   "icon": "nexalang-icon.svg",
   "engines": {
@@ -11,6 +11,10 @@
   "categories": [
     "Programming Languages"
   ],
+  "activationEvents": [
+    "onLanguage:nexalang"
+  ],
+  "main": "./extension.js",
   "contributes": {
     "languages": [
       {
@@ -32,7 +36,25 @@
         "language": "nexalang",
         "path": "./snippets/nexalang.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "NexaLang",
+      "properties": {
+        "nexalang.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable NexaLang Language Server for diagnostics, hover, and completion"
+        },
+        "nexalang.lsp.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Path to Python interpreter for the LSP server"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
   }
 }
 

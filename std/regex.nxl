@@ -1,0 +1,236 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# std::regex — POSIX regex via C FFI
+# ─────────────────────────────────────────────────────────────────────────────
+# Wraps POSIX <regex.h> (available on macOS/Linux).
+# Supports ERE (Extended Regular Expressions).
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    # POSIX regex functions
+    # regex_t is ~64 bytes on macOS arm64 — we allocate 128 for safety
+    fn regcomp(preg: *u8, pattern: *u8, cflags: i32) -> i32;
+    fn regexec(preg: *u8, string: *u8, nmatch: i32, pmatch: *u8, eflags: i32) -> i32;
+    fn regfree(preg: *u8);
+    fn regerror(errcode: i32, preg: *u8, errbuf: *u8, errbuf_size: i32) -> i32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn strlen(s: *u8) -> i32;
+}
+
+use std::string::String;
+use std::option::Option;
+use std::vec::Vec;
+
+# POSIX regex flags
+# REG_EXTENDED = 1, REG_ICASE = 2, REG_NEWLINE = 4, REG_NOSUB = 8
+# REG_NOMATCH = 1
+
+# regmatch_t = { rm_so: i32, rm_eo: i32 } — 8 bytes each on macOS (actually i64 pair = 16 bytes)
+# On macOS arm64: regoff_t is i64, so regmatch_t = 16 bytes
+
+# ── Match Result ────────────────────────────────────────────────────────────
+
+pub struct Match {
+    pub start: i32,
+    pub end: i32,
+    pub text: String
+}
+
+# ── Regex ───────────────────────────────────────────────────────────────────
+
+pub struct Regex {
+    preg: *u8,
+    valid: bool
+}
+
+impl Regex {
+    fn new(pattern: string) -> Option<Regex> {
+        let preg = malloc(128);
+        # REG_EXTENDED = 1
+        let rc = regcomp(preg, cast::<*u8>(pattern), 1);
+        if (rc != 0) {
+            free(preg);
+            return Option::<Regex>::None;
+        }
+        return Option::<Regex>::Some(Regex(preg, true));
+    }
+
+    fn new_icase(pattern: string) -> Option<Regex> {
+        let preg = malloc(128);
+        # REG_EXTENDED | REG_ICASE = 3
+        let rc = regcomp(preg, cast::<*u8>(pattern), 3);
+        if (rc != 0) {
+            free(preg);
+            return Option::<Regex>::None;
+        }
+        return Option::<Regex>::Some(Regex(preg, true));
+    }
+
+    fn is_match(&self, s: string) -> bool {
+        if (!self.valid) { return false; }
+        # REG_NOSUB not needed — pass nmatch=0 pmatch=null
+        let rc = regexec(self.preg, cast::<*u8>(s), 0, cast::<*u8>(0), 0);
+        return rc == 0;
+    }
+
+    fn find(&self, s: string) -> Option<Match> {
+        if (!self.valid) { return Option::<Match>::None; }
+        # regmatch_t on macOS arm64: { rm_so: i64, rm_eo: i64 } = 16 bytes
+        let pmatch = malloc(16);
+        let rc = regexec(self.preg, cast::<*u8>(s), 1, pmatch, 0);
+        if (rc != 0) {
+            free(pmatch);
+            return Option::<Match>::None;
+        }
+        # Read rm_so and rm_eo (i64 on macOS arm64)
+        let so_ptr = cast::<*i64>(pmatch);
+        let eo_ptr = cast::<*i64>(cast::<*u8>(cast::<i64>(pmatch) + 8));
+        let start = cast::<i32>(*so_ptr);
+        let end = cast::<i32>(*eo_ptr);
+
+        let match_len = end - start;
+        let buf = malloc(match_len + 1);
+        memcpy(buf, cast::<*u8>(cast::<i64>(cast::<*u8>(s)) + cast::<i64>(start)), match_len);
+        buf[match_len] = cast::<u8>(0);
+        let text = String::from(cast::<string>(buf));
+        free(buf);
+        free(pmatch);
+
+        return Option::<Match>::Some(Match(start, end, text));
+    }
+
+    fn find_all(&self, s: string) -> Vec<Match> {
+        let mut results = Vec::<Match>::new();
+        if (!self.valid) { return results; }
+
+        let s_ptr = cast::<*u8>(s);
+        let s_len = strlen(s_ptr);
+        let mut offset = 0;
+        let pmatch = malloc(16);
+
+        while (offset < s_len) {
+            let search_ptr = cast::<*u8>(cast::<i64>(s_ptr) + cast::<i64>(offset));
+            let rc = regexec(self.preg, search_ptr, 1, pmatch, 0);
+            if (rc != 0) { break; }
+
+            let so_ptr = cast::<*i64>(pmatch);
+            let eo_ptr = cast::<*i64>(cast::<*u8>(cast::<i64>(pmatch) + 8));
+            let rel_start = cast::<i32>(*so_ptr);
+            let rel_end = cast::<i32>(*eo_ptr);
+
+            let abs_start = offset + rel_start;
+            let abs_end = offset + rel_end;
+            let match_len = rel_end - rel_start;
+
+            let buf = malloc(match_len + 1);
+            memcpy(buf, cast::<*u8>(cast::<i64>(s_ptr) + cast::<i64>(abs_start)), match_len);
+            buf[match_len] = cast::<u8>(0);
+            let text = String::from(cast::<string>(buf));
+            free(buf);
+
+            results.push(Match(abs_start, abs_end, text));
+
+            # Advance past this match (at least 1 char to avoid infinite loop)
+            if (rel_end > rel_start) {
+                offset = abs_end;
+            } else {
+                offset = offset + 1;
+            }
+        }
+
+        free(pmatch);
+        return results;
+    }
+
+    fn replace(&self, s: string, replacement: string) -> String {
+        if (!self.valid) { return String::from(s); }
+
+        let s_ptr = cast::<*u8>(s);
+        let s_len = strlen(s_ptr);
+        let r_ptr = cast::<*u8>(replacement);
+        let r_len = strlen(r_ptr);
+
+        # Allocate generous output buffer
+        let out = malloc(s_len * 2 + r_len * 10 + 1);
+        let mut out_pos = 0;
+        let mut offset = 0;
+        let pmatch = malloc(16);
+
+        while (offset < s_len) {
+            let search_ptr = cast::<*u8>(cast::<i64>(s_ptr) + cast::<i64>(offset));
+            let rc = regexec(self.preg, search_ptr, 1, pmatch, 0);
+            if (rc != 0) {
+                # Copy rest of string
+                let remaining = s_len - offset;
+                memcpy(cast::<*u8>(cast::<i64>(out) + cast::<i64>(out_pos)), search_ptr, remaining);
+                out_pos = out_pos + remaining;
+                break;
+            }
+
+            let so_ptr = cast::<*i64>(pmatch);
+            let eo_ptr = cast::<*i64>(cast::<*u8>(cast::<i64>(pmatch) + 8));
+            let rel_start = cast::<i32>(*so_ptr);
+            let rel_end = cast::<i32>(*eo_ptr);
+
+            # Copy text before match
+            if (rel_start > 0) {
+                memcpy(cast::<*u8>(cast::<i64>(out) + cast::<i64>(out_pos)), search_ptr, rel_start);
+                out_pos = out_pos + rel_start;
+            }
+
+            # Copy replacement
+            memcpy(cast::<*u8>(cast::<i64>(out) + cast::<i64>(out_pos)), r_ptr, r_len);
+            out_pos = out_pos + r_len;
+
+            if (rel_end > rel_start) {
+                offset = offset + rel_end;
+            } else {
+                # Copy current char and advance
+                out[out_pos] = s_ptr[offset];
+                out_pos = out_pos + 1;
+                offset = offset + 1;
+            }
+        }
+
+        out[out_pos] = cast::<u8>(0);
+        free(pmatch);
+
+        let result = String::from(cast::<string>(out));
+        free(out);
+        return result;
+    }
+
+    fn drop(self) {
+        if (self.valid) {
+            regfree(self.preg);
+            free(self.preg);
+        }
+    }
+}
+
+# ── Convenience functions ───────────────────────────────────────────────────
+
+pub fn is_match(pattern: string, s: string) -> bool {
+    let re_opt = Regex::new(pattern);
+    match (re_opt) {
+        Some(re) => {
+            let result = re.is_match(s);
+            re.drop();
+            return result;
+        }
+        None => { return false; }
+    }
+}
+
+pub fn replace(pattern: string, s: string, replacement: string) -> String {
+    let re_opt = Regex::new(pattern);
+    match (re_opt) {
+        Some(re) => {
+            let result = re.replace(s, replacement);
+            re.drop();
+            return result;
+        }
+        None => { return String::from(s); }
+    }
+}

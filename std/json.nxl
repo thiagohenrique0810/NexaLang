@@ -2,6 +2,12 @@ use std::vec::Vec;
 use std::map::HashMap;
 use std::string::String;
 
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn snprintf(buf: *u8, size: i32, fmt: *u8) -> i32;
+}
+
 pub enum JsonValue {
     Null,
     Bool(bool),
@@ -134,6 +140,11 @@ impl JsonValue {
                 return String::from("false");
             }
             Number(n) => return String::from_i32(n),
+            Float(f) => {
+                let buf = malloc(64);
+                snprintf(buf, 64, cast::<*u8>("%g"), f);
+                return String::from(cast::<string>(buf));
+            }
             Str(v) => {
                 let res = String::from("\"");
                 let content = res.concat(v.as_ptr()); # Simplificação para o bootstrap
@@ -176,6 +187,71 @@ impl JsonValue {
                 }
                 return res.concat("}");
             }
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        let s = self;
+        match (s) {
+            Null => return true,
+            _ => return false,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        let s = self;
+        match (s) {
+            Bool(b) => return Option::Some(b),
+            _ => return Option::None,
+        }
+    }
+
+    fn as_int(&self) -> Option<i32> {
+        let s = self;
+        match (s) {
+            Number(n) => return Option::Some(n),
+            _ => return Option::None,
+        }
+    }
+
+    fn as_float(&self) -> Option<f64> {
+        let s = self;
+        match (s) {
+            Float(f) => return Option::Some(f),
+            Number(n) => return Option::Some(cast::<f64>(n)),
+            _ => return Option::None,
+        }
+    }
+
+    fn as_string(&self) -> Option<String> {
+        let s = self;
+        match (s) {
+            Str(v) => return Option::Some(v),
+            _ => return Option::None,
+        }
+    }
+
+    fn as_array(&self) -> Option<Vec<JsonValue>> {
+        let s = self;
+        match (s) {
+            Array(arr) => return Option::Some(arr),
+            _ => return Option::None,
+        }
+    }
+
+    fn as_object(&self) -> Option<HashMap<String, JsonValue>> {
+        let s = self;
+        match (s) {
+            Object(obj) => return Option::Some(obj),
+            _ => return Option::None,
+        }
+    }
+
+    fn get(&self, key: string) -> Option<JsonValue> {
+        let s = self;
+        match (s) {
+            Object(obj) => return obj.get(key),
+            _ => return Option::None,
         }
     }
 }

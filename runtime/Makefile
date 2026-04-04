@@ -1,9 +1,9 @@
 # NexaLang Runtime — Build the C extensions
 #
 # Usage:
-#   make              — build libturboquant.so (Linux) or libturboquant.dylib (macOS)
+#   make              — build all runtime libraries
 #   make clean        — remove build artifacts
-#   make test         — compile and run a quick C-level smoke test
+#   make test         — compile and run C-level smoke tests
 
 CC       ?= cc
 CFLAGS   := -O2 -fPIC -std=c11 -Wall -Wextra
@@ -17,17 +17,21 @@ else
     SHARED_FLAGS := -shared
 endif
 
-LIB := libturboquant.$(SHARED_EXT)
+LIB_TQ    := libturboquant.$(SHARED_EXT)
+LIB_ASYNC := libnexa_async.$(SHARED_EXT)
 
-all: $(LIB)
+all: $(LIB_TQ) $(LIB_ASYNC)
 
-$(LIB): turboquant.c turboquant.h
+$(LIB_TQ): turboquant.c turboquant.h
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ turboquant.c -lm
 
-clean:
-	rm -f $(LIB) test_tq
+$(LIB_ASYNC): nexa_async.c
+	$(CC) $(CFLAGS) $(SHARED_FLAGS) -o $@ nexa_async.c
 
-test: $(LIB)
+clean:
+	rm -f $(LIB_TQ) $(LIB_ASYNC) test_tq
+
+test: $(LIB_TQ)
 	@echo "=== TurboQuant C smoke test ==="
 	$(CC) $(CFLAGS) -o test_tq -DTURBOQUANT_TEST turboquant_test.c -L. -lturboquant -lm -Wl,-rpath,.
 	./test_tq

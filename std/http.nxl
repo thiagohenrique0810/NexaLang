@@ -1,0 +1,471 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# std::http — HTTP Server framework
+# ─────────────────────────────────────────────────────────────────────────────
+# Provides a simple HTTP server with routing, JSON helpers, and CORS.
+#
+# Usage:
+#   let mut server = HttpServer::new(8080);
+#   server.get("/hello", handle_hello);
+#   server.post("/data", handle_data);
+#   server.run();
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    # POSIX sockets
+    fn socket(domain: i32, stype: i32, protocol: i32) -> i32;
+    fn bind(sockfd: i32, addr: *u8, addrlen: i32) -> i32;
+    fn listen(sockfd: i32, backlog: i32) -> i32;
+    fn accept(sockfd: i32, addr: *u8, addrlen: *i32) -> i32;
+    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *u8, optlen: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *u8, count: i32) -> i32;
+    fn write(fd: i32, buf: *u8, count: i32) -> i32;
+
+    # C stdlib
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn memset(s: *u8, c: i32, n: i32) -> *u8;
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn strlen(s: *u8) -> i32;
+    fn strcmp(s1: *u8, s2: *u8) -> i32;
+    fn strncmp(s1: *u8, s2: *u8, n: i32) -> i32;
+    fn strstr(haystack: *u8, needle: *u8) -> *u8;
+    fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
+    fn atoi(s: *u8) -> i32;
+    fn fprintf(stream: *u8, fmt: *u8, ...) -> i32;
+    fn fdopen(fd: i32, mode: *u8) -> *u8;
+    fn fflush(stream: *u8);
+
+    # Time for logging
+    fn time(t: *i64) -> i64;
+    fn localtime(t: *i64) -> *u8;
+    fn strftime(buf: *u8, maxsize: i32, fmt: *u8, tm: *u8) -> i32;
+}
+
+use std::string::String;
+
+# ── HTTP Method enum as i32 ─────────────────────────────────────────────────
+# 1=GET, 2=POST, 3=PUT, 4=DELETE, 5=PATCH, 6=OPTIONS, 7=HEAD
+
+# ── Request ─────────────────────────────────────────────────────────────────
+
+pub struct Request {
+    pub method: i32,
+    pub path: *u8,
+    pub body: *u8,
+    pub raw: *u8,
+    pub content_length: i32
+}
+
+fn ptr_add(base: *u8, offset: i32) -> *u8 {
+    return cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset));
+}
+
+impl Request {
+    fn method_name(&self) -> string {
+        if (self.method == 1) { return "GET"; }
+        if (self.method == 2) { return "POST"; }
+        if (self.method == 3) { return "PUT"; }
+        if (self.method == 4) { return "DELETE"; }
+        if (self.method == 5) { return "PATCH"; }
+        if (self.method == 6) { return "OPTIONS"; }
+        if (self.method == 7) { return "HEAD"; }
+        return "UNKNOWN";
+    }
+
+    fn path_str(&self) -> string {
+        return cast::<string>(self.path);
+    }
+
+    fn body_str(&self) -> string {
+        if (cast::<i64>(self.body) == 0) { return ""; }
+        return cast::<string>(self.body);
+    }
+
+    fn header(& self, name: string) -> *u8 {
+        let needle_len = strlen(cast::<*u8>(name));
+        let buf = malloc(needle_len + 3);
+        memcpy(buf, cast::<*u8>(name), needle_len);
+        buf[needle_len] = cast::<u8>(58); # ':'
+        buf[needle_len + 1] = cast::<u8>(32); # ' '
+        buf[needle_len + 2] = cast::<u8>(0);
+
+        let pos = strstr(self.raw, buf);
+        free(buf);
+        if (cast::<i64>(pos) == 0) { return cast::<*u8>(0); }
+
+        let start = cast::<i32>(cast::<i64>(pos) - cast::<i64>(self.raw)) + needle_len + 2;
+        let mut end = start;
+        while (self.raw[end] != cast::<u8>(13) and self.raw[end] != cast::<u8>(10) and self.raw[end] != cast::<u8>(0)) {
+            end = end + 1;
+        }
+        let vlen = end - start;
+        let result = malloc(vlen + 1);
+        memcpy(result, ptr_add(self.raw, start), vlen);
+        result[vlen] = cast::<u8>(0);
+        return result;
+    }
+
+    fn param(&self, name: string) -> i32 {
+        # Extract path parameter: /resource/:id -> extract from path segments
+        # Simple: find the segment after the last / in the path
+        let p = self.path;
+        let plen = strlen(p);
+        let mut last_slash = 0;
+        for i in 0..plen {
+            if (p[i] == cast::<u8>(47)) { last_slash = i; } # '/'
+        }
+        if (last_slash > 0 and last_slash < plen - 1) {
+            return atoi(ptr_add(p, last_slash + 1));
+        }
+        return 0;
+    }
+}
+
+# ── Response Builder ────────────────────────────────────────────────────────
+
+pub struct Response {
+    pub status: i32,
+    pub status_text: *u8,
+    pub body: *u8,
+    pub content_type: *u8
+}
+
+impl Response {
+    fn json(status: i32, body: string) -> Response {
+        let text = cast::<*u8>("OK");
+        if (status == 201) { text = cast::<*u8>("Created"); }
+        if (status == 204) { text = cast::<*u8>("No Content"); }
+        if (status == 400) { text = cast::<*u8>("Bad Request"); }
+        if (status == 401) { text = cast::<*u8>("Unauthorized"); }
+        if (status == 403) { text = cast::<*u8>("Forbidden"); }
+        if (status == 404) { text = cast::<*u8>("Not Found"); }
+        if (status == 405) { text = cast::<*u8>("Method Not Allowed"); }
+        if (status == 500) { text = cast::<*u8>("Internal Server Error"); }
+        return Response(status, text, cast::<*u8>(body), cast::<*u8>("application/json"));
+    }
+
+    fn text(status: i32, body: string) -> Response {
+        let text = cast::<*u8>("OK");
+        if (status >= 400) { text = cast::<*u8>("Error"); }
+        return Response(status, text, cast::<*u8>(body), cast::<*u8>("text/plain"));
+    }
+
+    fn ok(body: string) -> Response {
+        return Response::json(200, body);
+    }
+
+    fn created(body: string) -> Response {
+        return Response::json(201, body);
+    }
+
+    fn no_content() -> Response {
+        return Response::json(204, "");
+    }
+
+    fn bad_request(msg: string) -> Response {
+        let buf = malloc(256);
+        snprintf(buf, 256, cast::<*u8>("{\"error\":\"%s\"}"), cast::<*u8>(msg));
+        return Response(400, cast::<*u8>("Bad Request"), buf, cast::<*u8>("application/json"));
+    }
+
+    fn not_found() -> Response {
+        return Response::json(404, "{\"error\":\"not found\"}");
+    }
+
+    fn error(msg: string) -> Response {
+        let buf = malloc(256);
+        snprintf(buf, 256, cast::<*u8>("{\"error\":\"%s\"}"), cast::<*u8>(msg));
+        return Response(500, cast::<*u8>("Internal Server Error"), buf, cast::<*u8>("application/json"));
+    }
+}
+
+# ── Route ───────────────────────────────────────────────────────────────────
+
+# Route stores: method + path_prefix + handler function pointer
+# We use a flat array of routes (max 64)
+
+struct Route {
+    method: i32,
+    path: *u8,
+    path_len: i32,
+    exact: bool,
+    handler: fn(&Request) -> Response
+}
+
+# ── HttpServer ──────────────────────────────────────────────────────────────
+
+pub struct HttpServer {
+    port: i32,
+    routes: *u8,    # *Route cast to *u8
+    route_count: i32,
+    cors: bool
+}
+
+fn write_response(client_fd: i32, resp: &Response) {
+    let body_len = strlen(resp.body);
+    let header = malloc(1024);
+    snprintf(header, 1024,
+        cast::<*u8>("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"),
+        resp.status, resp.status_text, resp.content_type, body_len);
+    let hlen = strlen(header);
+    write(client_fd, header, hlen);
+    if (body_len > 0) {
+        write(client_fd, resp.body, body_len);
+    }
+    free(header);
+}
+
+fn parse_request(buf: *u8) -> Request {
+    # Parse method
+    let mut method = 0;
+    if (strncmp(buf, cast::<*u8>("GET "), 4) == 0) { method = 1; }
+    if (strncmp(buf, cast::<*u8>("POST "), 5) == 0) { method = 2; }
+    if (strncmp(buf, cast::<*u8>("PUT "), 4) == 0) { method = 3; }
+    if (strncmp(buf, cast::<*u8>("DELETE "), 7) == 0) { method = 4; }
+    if (strncmp(buf, cast::<*u8>("PATCH "), 6) == 0) { method = 5; }
+    if (strncmp(buf, cast::<*u8>("OPTIONS "), 8) == 0) { method = 6; }
+    if (strncmp(buf, cast::<*u8>("HEAD "), 5) == 0) { method = 7; }
+
+    # Parse path
+    let mut i = 0;
+    while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(0)) { i = i + 1; }
+    i = i + 1;
+    let start = i;
+    while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(63) and buf[i] != cast::<u8>(0)) { i = i + 1; }
+    let plen = i - start;
+    let path = malloc(plen + 1);
+    memcpy(path, ptr_add(buf, start), plen);
+    path[plen] = cast::<u8>(0);
+
+    # Parse body
+    let mut body: *u8 = cast::<*u8>(0);
+    let sep = strstr(buf, cast::<*u8>("\r\n\r\n"));
+    if (cast::<i64>(sep) != 0) {
+        body = ptr_add(sep, 4);
+    } else {
+        let sep2 = strstr(buf, cast::<*u8>("\n\n"));
+        if (cast::<i64>(sep2) != 0) {
+            body = ptr_add(sep2, 2);
+        }
+    }
+
+    let content_length = 0;
+    if (cast::<i64>(body) != 0) {
+        let cl_len = strlen(body);
+    }
+
+    return Request(method, path, body, buf, content_length);
+}
+
+fn log_request(method: string, path: *u8, status: i32) {
+    let mut ts: i64 = 0;
+    time(&ts);
+    let tm = localtime(&ts);
+    let ts_buf = malloc(32);
+    strftime(ts_buf, 32, cast::<*u8>("%H:%M:%S"), tm);
+    let stderr = fdopen(2, cast::<*u8>("w"));
+    let color = "\x1b[32m"; # green
+    if (status >= 400) { color = "\x1b[31m"; } # red
+    if (status >= 300 and status < 400) { color = "\x1b[33m"; } # yellow
+    fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m %s%d\x1b[0m %s %s\n"),
+        ts_buf, cast::<*u8>(color), status, cast::<*u8>(method), path);
+    fflush(stderr);
+    free(ts_buf);
+}
+
+impl HttpServer {
+    fn new(port: i32) -> HttpServer {
+        # Allocate space for 64 routes (each Route is ~32 bytes, allocate 64*48=3072)
+        let routes = malloc(3072);
+        memset(routes, 0, 3072);
+        return HttpServer(port, routes, 0, true);
+    }
+
+    fn add_route(&mut self, method: i32, path: string, exact: bool, handler: fn(&Request) -> Response) {
+        if (self.route_count >= 64) { return; }
+        let route_ptr = cast::<*u8>(cast::<i64>(self.routes) + cast::<i64>(self.route_count * 48));
+        let route = cast::<*Route>(route_ptr);
+
+        let path_ptr = cast::<*u8>(path);
+        let plen = strlen(path_ptr);
+        let path_copy = malloc(plen + 1);
+        memcpy(path_copy, path_ptr, plen);
+        path_copy[plen] = cast::<u8>(0);
+
+        (*route).method = method;
+        (*route).path = path_copy;
+        (*route).path_len = plen;
+        (*route).exact = exact;
+        (*route).handler = handler;
+        self.route_count = self.route_count + 1;
+    }
+
+    fn get(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(1, path, true, handler);
+    }
+
+    fn get_prefix(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(1, path, false, handler);
+    }
+
+    fn post(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(2, path, true, handler);
+    }
+
+    fn put_prefix(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(3, path, false, handler);
+    }
+
+    fn delete_prefix(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(4, path, false, handler);
+    }
+
+    fn patch_prefix(&mut self, path: string, handler: fn(&Request) -> Response) {
+        self.add_route(5, path, false, handler);
+    }
+
+    fn set_cors(&mut self, enabled: bool) {
+        self.cors = enabled;
+    }
+
+    fn run(&self) {
+        let server_fd = socket(2, 1, 0);
+        if (server_fd < 0) {
+            print("ERROR: failed to create socket");
+            return;
+        }
+
+        # SO_REUSEADDR
+        let opt_val = malloc(4);
+        opt_val[0] = cast::<u8>(1); opt_val[1] = cast::<u8>(0);
+        opt_val[2] = cast::<u8>(0); opt_val[3] = cast::<u8>(0);
+        setsockopt(server_fd, 65535, 4, opt_val, 4);
+
+        # sockaddr_in (macOS)
+        let addr = malloc(16);
+        memset(addr, 0, 16);
+        addr[0] = cast::<u8>(16);  # sin_len
+        addr[1] = cast::<u8>(2);   # AF_INET
+        # port in big-endian
+        addr[2] = cast::<u8>(self.port >> 8);
+        addr[3] = cast::<u8>(self.port & 255);
+
+        let rc = bind(server_fd, addr, 16);
+        if (rc < 0) {
+            print("ERROR: failed to bind port");
+            close(server_fd);
+            return;
+        }
+
+        listen(server_fd, 128);
+
+        let stderr = fdopen(2, cast::<*u8>("w"));
+        fprintf(stderr, cast::<*u8>("\n\x1b[1m  NexaLang HTTP Server\x1b[0m\n"));
+        fprintf(stderr, cast::<*u8>("  Listening on \x1b[36mhttp://localhost:%d\x1b[0m\n"), self.port);
+        fprintf(stderr, cast::<*u8>("  Routes: %d registered\n"), self.route_count);
+        fprintf(stderr, cast::<*u8>("  CORS: %s\n\n"), cast::<*u8>(if (self.cors) { "enabled" } else { "disabled" }));
+        fflush(stderr);
+
+        # Accept loop
+        while (true) {
+            let mut client_addr_len: i32 = 16;
+            let client_addr = malloc(16);
+            memset(client_addr, 0, 16);
+            let client_fd = accept(server_fd, client_addr, &client_addr_len);
+            free(client_addr);
+
+            if (client_fd < 0) { continue; }
+
+            let buf = malloc(16384);
+            memset(buf, 0, 16384);
+            let n = read(client_fd, buf, 16383);
+            if (n <= 0) {
+                close(client_fd);
+                free(buf);
+                continue;
+            }
+
+            let req = parse_request(buf);
+
+            # OPTIONS preflight
+            if (req.method == 6 and self.cors) {
+                let cors_resp = Response::no_content();
+                write_response(client_fd, &cors_resp);
+                log_request(req.method_name(), req.path, 204);
+                close(client_fd);
+                free(req.path);
+                free(buf);
+                continue;
+            }
+
+            # Route matching
+            let mut matched = false;
+            for i in 0..self.route_count {
+                let route_ptr = cast::<*Route>(cast::<*u8>(cast::<i64>(self.routes) + cast::<i64>(i * 48)));
+                let route = *route_ptr;
+
+                if (route.method != req.method) { continue; }
+
+                let path_match = false;
+                if (route.exact) {
+                    if (strcmp(req.path, route.path) == 0) { path_match = true; }
+                } else {
+                    if (strncmp(req.path, route.path, route.path_len) == 0) { path_match = true; }
+                }
+
+                if (path_match) {
+                    let resp = (route.handler)(&req);
+                    write_response(client_fd, &resp);
+                    log_request(req.method_name(), req.path, resp.status);
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched) {
+                let resp = Response::not_found();
+                write_response(client_fd, &resp);
+                log_request(req.method_name(), req.path, 404);
+            }
+
+            close(client_fd);
+            free(req.path);
+            free(buf);
+        }
+
+        close(server_fd);
+    }
+}
+
+# ── JSON body helpers ───────────────────────────────────────────────────────
+
+pub fn json_get_str(body: *u8, key: string) -> *u8 {
+    let k_ptr = cast::<*u8>(key);
+    let pos = strstr(body, k_ptr);
+    if (cast::<i64>(pos) == 0) { return cast::<*u8>(0); }
+    let klen = strlen(k_ptr);
+    let base = cast::<i64>(body);
+    let mut off = cast::<i32>(cast::<i64>(pos) - base) + klen;
+    while (body[off] == cast::<u8>(32) or body[off] == cast::<u8>(58)) { off = off + 1; }
+    if (body[off] != cast::<u8>(34)) { return cast::<*u8>(0); }
+    off = off + 1;
+    let start = off;
+    while (body[off] != cast::<u8>(34) and body[off] != cast::<u8>(0)) { off = off + 1; }
+    let slen = off - start;
+    let result = malloc(slen + 1);
+    memcpy(result, ptr_add(body, start), slen);
+    result[slen] = cast::<u8>(0);
+    return result;
+}
+
+pub fn json_get_int(body: *u8, key: string) -> i32 {
+    let k_ptr = cast::<*u8>(key);
+    let pos = strstr(body, k_ptr);
+    if (cast::<i64>(pos) == 0) { return 0; }
+    let klen = strlen(k_ptr);
+    let base = cast::<i64>(body);
+    let mut off = cast::<i32>(cast::<i64>(pos) - base) + klen;
+    while (body[off] == cast::<u8>(32) or body[off] == cast::<u8>(58)) { off = off + 1; }
+    return atoi(ptr_add(body, off));
+}

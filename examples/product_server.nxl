@@ -1,0 +1,487 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Product API — HTTP Server (NexaLang)
+# ─────────────────────────────────────────────────────────────────────────────
+# REST API com SQLite, escutando na porta 8080.
+#
+# Rotas:
+#   GET    /products       — listar todos
+#   GET    /products/:id   — buscar por ID
+#   POST   /products       — criar  (body: {"name":"...", "price":N, "stock":N})
+#   PUT    /products/:id   — atualizar estoque (body: {"stock":N})
+#   DELETE /products/:id   — deletar
+#
+# Build & Run:
+#   nxc build examples/product_server.nxl --no-link
+#   clang dev/artifacts/output.ll -lsqlite3 -O2 -o dev/artifacts/product_server
+#   ./dev/artifacts/product_server
+#
+# Testar com Postman ou curl:
+#   curl http://localhost:8080/products
+#   curl -X POST http://localhost:8080/products -d '{"name":"Widget","price":1500,"stock":10}'
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    # ── POSIX sockets ──
+    fn socket(domain: i32, stype: i32, protocol: i32) -> i32;
+    fn bind(sockfd: i32, addr: *u8, addrlen: i32) -> i32;
+    fn listen(sockfd: i32, backlog: i32) -> i32;
+    fn accept(sockfd: i32, addr: *u8, addrlen: *i32) -> i32;
+    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *u8, optlen: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *u8, count: i32) -> i32;
+    fn write(fd: i32, buf: *u8, count: i32) -> i32;
+
+    # ── C stdlib / string ──
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn memset(s: *u8, c: i32, n: i32) -> *u8;
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn strlen(s: *u8) -> i32;
+    fn strcmp(s1: *u8, s2: *u8) -> i32;
+    fn strncmp(s1: *u8, s2: *u8, n: i32) -> i32;
+    fn strstr(haystack: *u8, needle: *u8) -> *u8;
+    fn atoi(s: *u8) -> i32;
+    fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
+    fn printf(fmt: *u8, ...) -> i32;
+
+    # ── SQLite ──
+    fn sqlite3_open(filename: *u8, ppDb: **u8) -> i32;
+    fn sqlite3_exec(db: *u8, sql: *u8, cb: *u8, arg: *u8, errmsg: **u8) -> i32;
+    fn sqlite3_close(db: *u8) -> i32;
+    fn sqlite3_prepare_v2(db: *u8, sql: *u8, nByte: i32, ppStmt: **u8, pzTail: **u8) -> i32;
+    fn sqlite3_step(stmt: *u8) -> i32;
+    fn sqlite3_finalize(stmt: *u8) -> i32;
+    fn sqlite3_column_text(stmt: *u8, iCol: i32) -> *u8;
+    fn sqlite3_column_int(stmt: *u8, iCol: i32) -> i32;
+    fn sqlite3_bind_int(stmt: *u8, idx: i32, val: i32) -> i32;
+    fn sqlite3_bind_text(stmt: *u8, idx: i32, val: *u8, n: i32, d: *u8) -> i32;
+    fn sqlite3_changes(db: *u8) -> i32;
+}
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn ptr_add(base: *u8, offset: i32) -> *u8 {
+    return cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset));
+}
+
+fn str_cat(a: *u8, b: *u8) -> *u8 {
+    let la = strlen(a);
+    let lb = strlen(b);
+    let out = malloc(la + lb + 1);
+    memcpy(out, a, la);
+    memcpy(ptr_add(out, la), b, lb);
+    out[la + lb] = cast::<u8>(0);
+    return out;
+}
+
+fn int_to_str(n: i32) -> *u8 {
+    let buf = malloc(32);
+    snprintf(buf, 32, cast::<*u8>("%d"), n);
+    return buf;
+}
+
+# Extract a string value for a given key from a JSON-like body
+fn json_str(body: *u8, key: *u8) -> *u8 {
+    let pos = strstr(body, key);
+    if (cast::<i64>(pos) == 0) { return cast::<*u8>(0); }
+    let klen = strlen(key);
+    let base = cast::<i64>(body);
+    let off = cast::<i32>(cast::<i64>(pos) - base) + klen;
+    # skip past colon and whitespace to opening quote
+    while (body[off] == cast::<u8>(32) or body[off] == cast::<u8>(58)) { off = off + 1; }
+    # expect opening "
+    if (body[off] != cast::<u8>(34)) { return cast::<*u8>(0); }
+    off = off + 1;
+    let start = off;
+    while (body[off] != cast::<u8>(34) and body[off] != cast::<u8>(0)) { off = off + 1; }
+    let slen = off - start;
+    let result = malloc(slen + 1);
+    memcpy(result, ptr_add(body, start), slen);
+    result[slen] = cast::<u8>(0);
+    return result;
+}
+
+# Extract an integer value for a given key from a JSON-like body
+fn json_int(body: *u8, key: *u8) -> i32 {
+    let pos = strstr(body, key);
+    if (cast::<i64>(pos) == 0) { return 0; }
+    let klen = strlen(key);
+    let base = cast::<i64>(body);
+    let off = cast::<i32>(cast::<i64>(pos) - base) + klen;
+    while (body[off] == cast::<u8>(32) or body[off] == cast::<u8>(58)) { off = off + 1; }
+    return atoi(ptr_add(body, off));
+}
+
+# ── HTTP helpers ────────────────────────────────────────────────────────────
+
+fn send_response(client: i32, status: i32, status_text: *u8, json_body: *u8) {
+    let body_len = strlen(json_body);
+    let header = malloc(512);
+    snprintf(header, 512, cast::<*u8>("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n"), status, status_text, body_len);
+    let hlen = strlen(header);
+    write(client, header, hlen);
+    write(client, json_body, body_len);
+    free(header);
+}
+
+# ── Database ────────────────────────────────────────────────────────────────
+
+fn db_open() -> *u8 {
+    let mut h: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_open(cast::<*u8>("products.db"), &h);
+    if (rc != 0) {
+        print("ERRO: Falha ao abrir banco de dados");
+    }
+    let mut err: *u8 = cast::<*u8>(0);
+    sqlite3_exec(h,
+        cast::<*u8>("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price INTEGER NOT NULL, stock INTEGER DEFAULT 0);"),
+        cast::<*u8>(0), cast::<*u8>(0), &err);
+    return h;
+}
+
+fn product_json(id: i32, name: *u8, price: i32, stock: i32) -> *u8 {
+    let buf = malloc(1024);
+    snprintf(buf, 1024, cast::<*u8>("{\"id\":%d,\"name\":\"%s\",\"price\":%d,\"stock\":%d}"), id, name, price, stock);
+    return buf;
+}
+
+# ── Route handlers ──────────────────────────────────────────────────────────
+
+fn handle_list(client: i32, db: *u8) {
+    let mut stmt: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_prepare_v2(db, cast::<*u8>("SELECT id, name, price, stock FROM products ORDER BY id;"),
+                                 -1, &stmt, cast::<**u8>(0));
+    if (rc != 0) {
+        send_response(client, 500, cast::<*u8>("Internal Server Error"), cast::<*u8>("{\"error\":\"db query failed\"}"));
+        return;
+    }
+
+    let mut result = malloc(65536);
+    result[0] = cast::<u8>(91); # [
+    result[1] = cast::<u8>(0);
+    let mut count = 0;
+
+    while (sqlite3_step(stmt) == 100) {
+        if (count > 0) {
+            result = str_cat(result, cast::<*u8>(","));
+        }
+        let pj = product_json(
+            sqlite3_column_int(stmt, 0),
+            sqlite3_column_text(stmt, 1),
+            sqlite3_column_int(stmt, 2),
+            sqlite3_column_int(stmt, 3)
+        );
+        result = str_cat(result, pj);
+        free(pj);
+        count = count + 1;
+    }
+    sqlite3_finalize(stmt);
+    result = str_cat(result, cast::<*u8>("]"));
+    send_response(client, 200, cast::<*u8>("OK"), result);
+    free(result);
+}
+
+fn handle_get_by_id(client: i32, db: *u8, id: i32) {
+    let mut stmt: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_prepare_v2(db, cast::<*u8>("SELECT id, name, price, stock FROM products WHERE id = ?;"),
+                                 -1, &stmt, cast::<**u8>(0));
+    if (rc != 0) {
+        send_response(client, 500, cast::<*u8>("Internal Server Error"), cast::<*u8>("{\"error\":\"db error\"}"));
+        return;
+    }
+    sqlite3_bind_int(stmt, 1, id);
+    let step = sqlite3_step(stmt);
+    if (step == 100) {
+        let pj = product_json(
+            sqlite3_column_int(stmt, 0),
+            sqlite3_column_text(stmt, 1),
+            sqlite3_column_int(stmt, 2),
+            sqlite3_column_int(stmt, 3)
+        );
+        sqlite3_finalize(stmt);
+        send_response(client, 200, cast::<*u8>("OK"), pj);
+        free(pj);
+    } else {
+        sqlite3_finalize(stmt);
+        send_response(client, 404, cast::<*u8>("Not Found"), cast::<*u8>("{\"error\":\"product not found\"}"));
+    }
+}
+
+fn handle_create(client: i32, db: *u8, body: *u8) {
+    let name = json_str(body, cast::<*u8>("\"name\""));
+    let price = json_int(body, cast::<*u8>("\"price\""));
+    let stock = json_int(body, cast::<*u8>("\"stock\""));
+
+    if (cast::<i64>(name) == 0) {
+        send_response(client, 400, cast::<*u8>("Bad Request"), cast::<*u8>("{\"error\":\"missing name\"}"));
+        return;
+    }
+
+    let mut stmt: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_prepare_v2(db, cast::<*u8>("INSERT INTO products (name, price, stock) VALUES (?, ?, ?);"),
+                                 -1, &stmt, cast::<**u8>(0));
+    if (rc != 0) {
+        send_response(client, 500, cast::<*u8>("Internal Server Error"), cast::<*u8>("{\"error\":\"db error\"}"));
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, cast::<*u8>(0));
+    sqlite3_bind_int(stmt, 2, price);
+    sqlite3_bind_int(stmt, 3, stock);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    # Get the last inserted ID
+    let mut stmt2: *u8 = cast::<*u8>(0);
+    sqlite3_prepare_v2(db, cast::<*u8>("SELECT last_insert_rowid();"), -1, &stmt2, cast::<**u8>(0));
+    sqlite3_step(stmt2);
+    let new_id = sqlite3_column_int(stmt2, 0);
+    sqlite3_finalize(stmt2);
+
+    let pj = product_json(new_id, name, price, stock);
+    send_response(client, 201, cast::<*u8>("Created"), pj);
+    free(pj);
+    free(name);
+}
+
+fn handle_update(client: i32, db: *u8, id: i32, body: *u8) {
+    let stock = json_int(body, cast::<*u8>("\"stock\""));
+    let mut stmt: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_prepare_v2(db, cast::<*u8>("UPDATE products SET stock = ? WHERE id = ?;"),
+                                 -1, &stmt, cast::<**u8>(0));
+    if (rc != 0) {
+        send_response(client, 500, cast::<*u8>("Internal Server Error"), cast::<*u8>("{\"error\":\"db error\"}"));
+        return;
+    }
+    sqlite3_bind_int(stmt, 1, stock);
+    sqlite3_bind_int(stmt, 2, id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    let changed = sqlite3_changes(db);
+    if (changed > 0) {
+        handle_get_by_id(client, db, id);
+    } else {
+        send_response(client, 404, cast::<*u8>("Not Found"), cast::<*u8>("{\"error\":\"product not found\"}"));
+    }
+}
+
+fn handle_delete(client: i32, db: *u8, id: i32) {
+    let mut stmt: *u8 = cast::<*u8>(0);
+    let rc = sqlite3_prepare_v2(db, cast::<*u8>("DELETE FROM products WHERE id = ?;"),
+                                 -1, &stmt, cast::<**u8>(0));
+    if (rc != 0) {
+        send_response(client, 500, cast::<*u8>("Internal Server Error"), cast::<*u8>("{\"error\":\"db error\"}"));
+        return;
+    }
+    sqlite3_bind_int(stmt, 1, id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    let changed = sqlite3_changes(db);
+    if (changed > 0) {
+        send_response(client, 200, cast::<*u8>("OK"), cast::<*u8>("{\"message\":\"product deleted\"}"));
+    } else {
+        send_response(client, 404, cast::<*u8>("Not Found"), cast::<*u8>("{\"error\":\"product not found\"}"));
+    }
+}
+
+# ── HTTP Request Parser ────────────────────────────────────────────────────
+
+fn parse_method(buf: *u8) -> i32 {
+    # Returns: 1=GET, 2=POST, 3=PUT, 4=DELETE, 5=OPTIONS, 0=unknown
+    if (strncmp(buf, cast::<*u8>("GET "), 4) == 0) { return 1; }
+    if (strncmp(buf, cast::<*u8>("POST "), 5) == 0) { return 2; }
+    if (strncmp(buf, cast::<*u8>("PUT "), 4) == 0) { return 3; }
+    if (strncmp(buf, cast::<*u8>("DELETE "), 7) == 0) { return 4; }
+    if (strncmp(buf, cast::<*u8>("OPTIONS "), 8) == 0) { return 5; }
+    return 0;
+}
+
+fn parse_path(buf: *u8) -> *u8 {
+    # Find first space (after method), then extract until next space
+    let mut i = 0;
+    while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(0)) { i = i + 1; }
+    i = i + 1; # skip space
+    let start = i;
+    while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(0)) { i = i + 1; }
+    let plen = i - start;
+    let path = malloc(plen + 1);
+    memcpy(path, ptr_add(buf, start), plen);
+    path[plen] = cast::<u8>(0);
+    return path;
+}
+
+fn parse_body(buf: *u8) -> *u8 {
+    # Find "\r\n\r\n" separator
+    let sep = strstr(buf, cast::<*u8>("\r\n\r\n"));
+    if (cast::<i64>(sep) != 0) {
+        return ptr_add(sep, 4);
+    }
+    # Fallback: try "\n\n"
+    let sep2 = strstr(buf, cast::<*u8>("\n\n"));
+    if (cast::<i64>(sep2) != 0) {
+        return ptr_add(sep2, 2);
+    }
+    return cast::<*u8>(0);
+}
+
+fn extract_id(path: *u8) -> i32 {
+    # /products/123  -> extract 123
+    # Find the second /
+    let mut i = 1; # skip first /
+    while (path[i] != cast::<u8>(47) and path[i] != cast::<u8>(0)) { i = i + 1; } # 47 = '/'
+    if (path[i] == cast::<u8>(0)) { return 0; }
+    i = i + 1; # skip second /
+    return atoi(ptr_add(path, i));
+}
+
+# ── Main Server ─────────────────────────────────────────────────────────────
+
+fn main() -> i32 {
+    let db = db_open();
+
+    # Create socket: AF_INET=2, SOCK_STREAM=1
+    let server_fd = socket(2, 1, 0);
+    if (server_fd < 0) {
+        print("ERRO: falha ao criar socket");
+        return 1;
+    }
+
+    # SO_REUSEADDR: SOL_SOCKET=0xFFFF(65535), SO_REUSEADDR=0x0004(4)
+    let opt_val = malloc(4);
+    opt_val[0] = cast::<u8>(1);
+    opt_val[1] = cast::<u8>(0);
+    opt_val[2] = cast::<u8>(0);
+    opt_val[3] = cast::<u8>(0);
+    setsockopt(server_fd, 65535, 4, opt_val, 4);
+
+    # Build sockaddr_in (16 bytes on macOS)
+    # sin_len(1) + sin_family(1) + sin_port(2) + sin_addr(4) + sin_zero(8)
+    let addr = malloc(16);
+    memset(addr, 0, 16);
+    addr[0] = cast::<u8>(16);  # sin_len = 16
+    addr[1] = cast::<u8>(2);   # sin_family = AF_INET
+    # sin_port = htons(8080) -> big-endian: 0x1F 0x90
+    addr[2] = cast::<u8>(31);  # 0x1F
+    addr[3] = cast::<u8>(144); # 0x90
+    # sin_addr = INADDR_ANY = 0 (already zeroed)
+
+    let rc = bind(server_fd, addr, 16);
+    if (rc < 0) {
+        print("ERRO: falha ao fazer bind na porta 8080");
+        close(server_fd);
+        return 1;
+    }
+
+    listen(server_fd, 128);
+
+    print("===========================================");
+    print("  NexaLang Product API Server");
+    print("  Rodando em http://localhost:8080");
+    print("===========================================");
+    print("");
+    print("Rotas:");
+    print("  GET    /products       - listar todos");
+    print("  GET    /products/:id   - buscar por ID");
+    print("  POST   /products       - criar produto");
+    print("  PUT    /products/:id   - atualizar estoque");
+    print("  DELETE /products/:id   - deletar produto");
+    print("");
+    print("Aguardando conexoes...");
+
+    # Accept loop
+    while (true) {
+        let mut client_addr_len: i32 = 16;
+        let mut client_addr = malloc(16);
+        memset(client_addr, 0, 16);
+        let client_fd = accept(server_fd, client_addr, &client_addr_len);
+        free(client_addr);
+
+        if (client_fd < 0) {
+            print("WARN: accept falhou");
+            continue;
+        }
+
+        # Read request
+        let buf = malloc(8192);
+        memset(buf, 0, 8192);
+        let n = read(client_fd, buf, 8191);
+        if (n <= 0) {
+            close(client_fd);
+            free(buf);
+            continue;
+        }
+
+        let method = parse_method(buf);
+        let path = parse_path(buf);
+
+        # Log request
+        let log_buf = malloc(256);
+        if (method == 1) { snprintf(log_buf, 256, cast::<*u8>(">> GET %s"), path); }
+        if (method == 2) { snprintf(log_buf, 256, cast::<*u8>(">> POST %s"), path); }
+        if (method == 3) { snprintf(log_buf, 256, cast::<*u8>(">> PUT %s"), path); }
+        if (method == 4) { snprintf(log_buf, 256, cast::<*u8>(">> DELETE %s"), path); }
+        if (method == 5) { snprintf(log_buf, 256, cast::<*u8>(">> OPTIONS %s"), path); }
+        print(cast::<string>(log_buf));
+        free(log_buf);
+
+        # ── CORS preflight ──
+        if (method == 5) {
+            send_response(client_fd, 204, cast::<*u8>("No Content"), cast::<*u8>(""));
+            close(client_fd);
+            free(path);
+            free(buf);
+            continue;
+        }
+
+        # ── Routing ──
+        let is_products = strcmp(path, cast::<*u8>("/products")) == 0;
+        let starts_products = strncmp(path, cast::<*u8>("/products/"), 10) == 0;
+
+        if (method == 1 and is_products) {
+            # GET /products
+            handle_list(client_fd, db);
+        } else {
+            if (method == 1 and starts_products) {
+                # GET /products/:id
+                let id = extract_id(path);
+                handle_get_by_id(client_fd, db, id);
+            } else {
+                if (method == 2 and is_products) {
+                    # POST /products
+                    let body = parse_body(buf);
+                    if (cast::<i64>(body) != 0) {
+                        handle_create(client_fd, db, body);
+                    } else {
+                        send_response(client_fd, 400, cast::<*u8>("Bad Request"), cast::<*u8>("{\"error\":\"missing body\"}"));
+                    }
+                } else {
+                    if (method == 3 and starts_products) {
+                        # PUT /products/:id
+                        let id = extract_id(path);
+                        let body = parse_body(buf);
+                        if (cast::<i64>(body) != 0) {
+                            handle_update(client_fd, db, id, body);
+                        } else {
+                            send_response(client_fd, 400, cast::<*u8>("Bad Request"), cast::<*u8>("{\"error\":\"missing body\"}"));
+                        }
+                    } else {
+                        if (method == 4 and starts_products) {
+                            # DELETE /products/:id
+                            let id = extract_id(path);
+                            handle_delete(client_fd, db, id);
+                        } else {
+                            send_response(client_fd, 404, cast::<*u8>("Not Found"), cast::<*u8>("{\"error\":\"route not found\"}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        close(client_fd);
+        free(path);
+        free(buf);
+    }
+
+    sqlite3_close(db);
+    close(server_fd);
+    return 0;
+}

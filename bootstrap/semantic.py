@@ -265,46 +265,127 @@ class SemanticAnalyzer:
         self.error(f"No overload of '{base_name}' matches arguments: ({', '.join(arg_types)})", node)
 
     def generate_derive(self, node, trait):
-        from n_parser import ImplDef, FunctionDef, CallExpr, StringLiteral, MemberAccess, VariableExpr, ReturnStmt, IntegerLiteral, MethodCall
+        from n_parser import ImplDef, FunctionDef, CallExpr, StringLiteral, MemberAccess, VariableExpr, ReturnStmt, IntegerLiteral, MethodCall, BinaryExpr, BooleanLiteral
+
+        def _set_attrs(n):
+            """Ensure all generated AST nodes have required attributes."""
+            n.line = getattr(node, 'line', 0)
+            n.column = getattr(node, 'column', 0)
+            return n
+
         if trait == 'Debug':
-            # Generate Debug for Struct
             if isinstance(node, StructDef):
                 # fn debug_print(&self)
                 body = []
-                body.append(CallExpr("print", [StringLiteral(f"{node.name} {{ ")]))
+                body.append(_set_attrs(CallExpr("print", [_set_attrs(StringLiteral(f"{node.name} {{ "))])))
                 for i, (fname, ftype) in enumerate(node.fields):
-                    body.append(CallExpr("print", [StringLiteral(f"{fname}: ")]))
-                    # print(self.field) - only works if field is primitive!
-                    # For now, let's assume primitives
-                    body.append(CallExpr("print", [MemberAccess(VariableExpr("self"), fname)]))
+                    body.append(_set_attrs(CallExpr("print", [_set_attrs(StringLiteral(f"{fname}: "))])))
+                    body.append(_set_attrs(CallExpr("print", [_set_attrs(MemberAccess(_set_attrs(VariableExpr("self")), fname))])))
                     if i < len(node.fields) - 1:
-                        body.append(CallExpr("print", [StringLiteral(", ")]))
-                body.append(CallExpr("print", [StringLiteral(" }\n")]))
-                # No explicit return needed for void functions if we handle it in codegen
-                # or use ReturnStmt(None)
-                
+                        body.append(_set_attrs(CallExpr("print", [_set_attrs(StringLiteral(", "))])))
+                body.append(_set_attrs(CallExpr("print", [_set_attrs(StringLiteral(" }"))])))
+
                 method = FunctionDef("debug_print", [("self", f"&{node.name}")], "void", body)
-                return [ImplDef(node.name, [method])]
-        
+                method.generics = []
+                method.is_kernel = False
+                method.is_async = False
+                method.is_pub = True
+                method.is_vararg = False
+                method.attrs = []
+                method.module = getattr(node, 'module', '')
+                method.used = True
+                _set_attrs(method)
+
+                impl_node = ImplDef(node.name, [method])
+                impl_node.generics = []
+                impl_node.trait_name = None
+                impl_node.associated_types = {}
+                _set_attrs(impl_node)
+                return [impl_node]
+
+            elif isinstance(node, EnumDef):
+                body = []
+                body.append(_set_attrs(CallExpr("print", [_set_attrs(StringLiteral(f"{node.name}::variant"))])))
+                method = FunctionDef("debug_print", [("self", f"&{node.name}")], "void", body)
+                method.generics = []
+                method.is_kernel = False
+                method.is_async = False
+                method.is_pub = True
+                method.is_vararg = False
+                method.attrs = []
+                method.module = getattr(node, 'module', '')
+                method.used = True
+                _set_attrs(method)
+                impl_node = ImplDef(node.name, [method])
+                impl_node.generics = []
+                impl_node.trait_name = None
+                impl_node.associated_types = {}
+                _set_attrs(impl_node)
+                return [impl_node]
+
         elif trait == 'Clone':
             if isinstance(node, StructDef):
-                # fn clone(&self) -> Self
                 args = []
                 for fname, ftype in node.fields:
-                    # Recursive clone for each field: self.field.clone()
-                    field_access = MemberAccess(VariableExpr("self"), fname)
-                    # For primitives we could just use them directly, 
-                    # but calling .clone() is safer if we have overloaded it.
-                    # Simplified: if it's primitive i32/f32/u8/bool just copy
-                    if ftype in ('i32', 'f32', 'u8', 'bool', 'i64'):
+                    field_access = _set_attrs(MemberAccess(_set_attrs(VariableExpr("self")), fname))
+                    if ftype in ('i32', 'f32', 'u8', 'bool', 'i64', 'f64'):
                         args.append(field_access)
                     else:
-                        args.append(MethodCall(field_access, "clone", []))
-                
-                body = [ReturnStmt(CallExpr(node.name, args))]
+                        args.append(_set_attrs(MethodCall(field_access, "clone", [])))
+
+                body = [_set_attrs(ReturnStmt(_set_attrs(CallExpr(node.name, args))))]
                 method = FunctionDef("clone", [("self", f"&{node.name}")], node.name, body)
-                return [ImplDef(node.name, [method])]
-                
+                method.generics = []
+                method.is_kernel = False
+                method.is_async = False
+                method.is_pub = True
+                method.is_vararg = False
+                method.attrs = []
+                method.module = getattr(node, 'module', '')
+                method.used = True
+                _set_attrs(method)
+                impl_node = ImplDef(node.name, [method])
+                impl_node.generics = []
+                impl_node.trait_name = None
+                impl_node.associated_types = {}
+                _set_attrs(impl_node)
+                return [impl_node]
+
+        elif trait == 'PartialEq':
+            if isinstance(node, StructDef):
+                # fn eq(&self, other: &Self) -> bool
+                if not node.fields:
+                    body = [_set_attrs(ReturnStmt(_set_attrs(BooleanLiteral(True))))]
+                else:
+                    # self.field0 == other.field0 && self.field1 == other.field1 ...
+                    checks = []
+                    for fname, ftype in node.fields:
+                        lhs = _set_attrs(MemberAccess(_set_attrs(VariableExpr("self")), fname))
+                        rhs = _set_attrs(MemberAccess(_set_attrs(VariableExpr("other")), fname))
+                        cmp = _set_attrs(BinaryExpr(lhs, 'EQEQ', rhs))
+                        checks.append(cmp)
+                    expr = checks[0]
+                    for c in checks[1:]:
+                        expr = _set_attrs(BinaryExpr(expr, 'AND', c))
+                    body = [_set_attrs(ReturnStmt(expr))]
+
+                method = FunctionDef("eq", [("self", f"&{node.name}"), ("other", f"&{node.name}")], "bool", body)
+                method.generics = []
+                method.is_kernel = False
+                method.is_async = False
+                method.is_pub = True
+                method.is_vararg = False
+                method.attrs = []
+                method.module = getattr(node, 'module', '')
+                method.used = True
+                _set_attrs(method)
+                impl_node = ImplDef(node.name, [method])
+                impl_node.generics = []
+                impl_node.trait_name = None
+                impl_node.associated_types = {}
+                _set_attrs(impl_node)
+                return [impl_node]
+
         return []
 
     def visit_AwaitExpr(self, node):
@@ -1208,8 +1289,9 @@ class SemanticAnalyzer:
         if l != r and not self.check_type_compatibility(l, r, node) and not self.check_type_compatibility(r, l, node):
             self.error(f"Type mismatch: {l} {node.op} {r}", node, error_code="E0002")
         if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return l
+        if node.op in ('AMPERSAND', 'PIPE', 'CARET', 'SHL', 'SHR'): return l
         if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ', 'AND', 'OR'): return 'bool'
-        raise Exception("Unsupported binary op")
+        raise Exception(f"Unsupported binary op: {node.op}")
 
     def visit_IntegerLiteral(self, node): return 'i32'
     def visit_FloatLiteral(self, node): return 'f32'
@@ -1343,12 +1425,18 @@ class SemanticAnalyzer:
         if result is not None:
             return result
 
-        # 4. Cast/sizeof builtins
+        # 4. Cast/sizeof/ptr_offset builtins
         if isinstance(callee, str) and callee.startswith('cast<'):
             self.visit(node.args[0])
             return callee[5:-1]
         if isinstance(callee, str) and callee.startswith('sizeof<'):
             return 'i32'
+        if isinstance(callee, str) and callee.startswith('ptr_offset<'):
+            for a in node.args:
+                self.visit(a)
+            # Returns pointer to the element type
+            elem_type = callee[11:-1]  # extract T from ptr_offset<T>
+            return f'*{elem_type}'
 
         # 5. Local module lookup
         callee = self._resolve_local_module(callee, node)

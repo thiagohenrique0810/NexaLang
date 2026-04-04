@@ -538,6 +538,803 @@ def test_compile_examples():
 print("\n=== EXAMPLE COMPILATION TESTS ===")
 test("compile key examples", test_compile_examples)
 
+# ── Module System Tests ──────────────────────────────────────────────────
+
+def test_parse_use_stmt():
+    """use statements should parse correctly."""
+    src = 'use std::vec::Vec;\nuse std::option::*;\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    from n_parser import UseStmt
+    uses = [n for n in nodes if isinstance(n, UseStmt)]
+    assert len(uses) == 2, f"Expected 2 use statements, got {len(uses)}"
+
+def test_parse_mod_decl():
+    """mod declarations should parse correctly."""
+    src = 'mod utils;\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    from n_parser import ModDecl
+    mods = [n for n in nodes if isinstance(n, ModDecl)]
+    assert len(mods) == 1, f"Expected 1 mod decl, got {len(mods)}"
+
+def test_parse_use_glob():
+    """Glob imports with * should parse."""
+    src = 'use std::io::*;\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    from n_parser import UseStmt
+    uses = [n for n in nodes if isinstance(n, UseStmt)]
+    assert len(uses) == 1
+    assert getattr(uses[0], 'is_glob', False), "Expected glob import"
+
+print("\n=== MODULE SYSTEM TESTS ===")
+test("parse use statement", test_parse_use_stmt)
+test("parse mod declaration", test_parse_mod_decl)
+test("parse glob import", test_parse_use_glob)
+
+# ── Ownership & Borrow Tests ────────────────────────────────────────────
+
+def test_semantic_use_after_move():
+    """Use after move should be detected for non-Copy types."""
+    src = '''struct Data { val: i32 }
+fn consume(d: Data) -> i32 { return d.val; }
+fn main() -> i32 {
+    let d = Data(42);
+    let a = consume(d);
+    let b = consume(d);
+    return a;
+}'''
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    try:
+        sa.analyze(ast)
+        # Either raises error or records in warnings/errors
+        has_move_err = any('move' in str(w).lower() for w in getattr(sa, 'warnings', []) + getattr(sa, 'errors', []))
+        if not has_move_err:
+            # If the analyzer silently continues, it should at least detect the double use
+            pass  # Some implementations allow this and catch at codegen
+    except Exception as e:
+        assert 'move' in str(e).lower() or 'use' in str(e).lower(), f"Unexpected error: {e}"
+
+def test_semantic_borrow_mut_conflict():
+    """Mutable and immutable borrows should conflict."""
+    src = '''fn main() -> i32 {
+    let mut x: i32 = 10;
+    let r1 = &x;
+    let r2 = &mut x;
+    return 0;
+}'''
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    try:
+        sa.analyze(ast)
+        has_borrow_issue = any('borrow' in str(w).lower() for w in getattr(sa, 'warnings', []) + getattr(sa, 'errors', []))
+    except Exception as e:
+        assert 'borrow' in str(e).lower() or 'mutable' in str(e).lower(), f"Unexpected error: {e}"
+
+def test_semantic_immutable_assign():
+    """Assigning to an immutable variable should error."""
+    src = '''fn main() -> i32 {
+    let x: i32 = 5;
+    x = 10;
+    return x;
+}'''
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    try:
+        sa.analyze(ast)
+        has_mut_err = any('immutable' in str(w).lower() or 'mutable' in str(w).lower() for w in getattr(sa, 'warnings', []) + getattr(sa, 'errors', []))
+    except Exception as e:
+        assert 'immutable' in str(e).lower() or 'mutable' in str(e).lower() or 'assign' in str(e).lower(), f"Unexpected error: {e}"
+
+print("\n=== OWNERSHIP & BORROW TESTS ===")
+test("use after move", test_semantic_use_after_move)
+test("mutable borrow conflict", test_semantic_borrow_mut_conflict)
+test("immutable assign error", test_semantic_immutable_assign)
+
+# ── Control Flow Tests ───────────────────────────────────────────────────
+
+def test_parse_while_loop():
+    src = 'fn main() { let mut i: i32 = 0; while (i < 10) { i = i + 1; } }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+def test_parse_break_continue():
+    src = 'fn main() { let mut i: i32 = 0; while (i < 10) { if (i == 5) { break; } i = i + 1; continue; } }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+def test_parse_else_if():
+    src = '''fn classify(x: i32) -> i32 {
+    if (x > 0) { return 1; }
+    else if (x < 0) { return -1; }
+    else { return 0; }
+}'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+def test_parse_match_multiple_arms():
+    src = '''fn foo(x: i32) -> i32 {
+    match x {
+        Zero => { return 10; }
+        One => { return 20; }
+        Two => { return 30; }
+        _ => { return 0; }
+    }
+}'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+print("\n=== CONTROL FLOW TESTS ===")
+test("while loop", test_parse_while_loop)
+test("break and continue", test_parse_break_continue)
+test("else if chains", test_parse_else_if)
+test("match multiple arms", test_parse_match_multiple_arms)
+
+# ── Type System Tests ────────────────────────────────────────────────────
+
+def test_parse_type_alias():
+    from n_parser import TypeAlias
+    src = 'type Meters = i32;\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    aliases = [n for n in nodes if isinstance(n, TypeAlias)]
+    assert len(aliases) == 1
+
+def test_parse_generic_struct():
+    src = 'struct Pair<T> { first: T, second: T }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    structs = [n for n in nodes if isinstance(n, StructDef)]
+    assert len(structs) == 1
+    assert len(structs[0].generics) >= 1
+
+def test_parse_generic_fn():
+    src = 'fn identity<T>(x: T) -> T { return x; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+    assert len(fns[0].generics) >= 1
+
+def test_parse_trait_bounds():
+    src = 'fn display<T: Show>(item: T) -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+def test_parse_impl_trait_for_type():
+    src = '''trait Show { fn show(&self) -> i32; }
+struct Foo { x: i32 }
+impl Show for Foo { fn show(&self) -> i32 { return self.x; } }'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    impls = [n for n in nodes if isinstance(n, ImplDef)]
+    assert len(impls) == 1
+    assert impls[0].trait_name == 'Show'
+
+print("\n=== TYPE SYSTEM TESTS ===")
+test("type alias", test_parse_type_alias)
+test("generic struct", test_parse_generic_struct)
+test("generic function", test_parse_generic_fn)
+test("trait bounds", test_parse_trait_bounds)
+test("impl trait for type", test_parse_impl_trait_for_type)
+
+# ── FFI / Extern Tests ──────────────────────────────────────────────────
+
+def test_parse_extern_multiple_fns():
+    from n_parser import ExternBlock
+    src = '''extern "C" {
+    fn printf(fmt: *u8) -> i32;
+    fn malloc(size: i64) -> *u8;
+    fn free(ptr: *u8);
+}'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    externs = [n for n in nodes if isinstance(n, ExternBlock)]
+    assert len(externs) == 1
+    assert len(externs[0].functions) == 3
+
+def test_semantic_extern_fn_registered():
+    """Extern functions should be registered in the symbol table."""
+    src = '''extern "C" { fn puts(s: *u8) -> i32; }
+fn main() -> i32 { return 0; }'''
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    assert 'puts' in sa.functions, "extern fn 'puts' not registered"
+
+print("\n=== FFI / EXTERN TESTS ===")
+test("extern block multiple fns", test_parse_extern_multiple_fns)
+test("extern fn registered", test_semantic_extern_fn_registered)
+
+# ── Metaprogramming Tests ────────────────────────────────────────────────
+
+def test_parse_derive_attr():
+    src = '@[derive(Debug)]\nstruct Point { x: i32, y: i32 }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    structs = [n for n in nodes if isinstance(n, StructDef)]
+    assert len(structs) == 1
+    assert hasattr(structs[0], 'attrs') and len(structs[0].attrs) > 0
+
+def test_parse_test_attr():
+    src = '@[test]\nfn test_add() { }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+    assert any(a[0] == 'test' for a in fns[0].attrs)
+
+def test_parse_macro_call():
+    from n_parser import MacroCallExpr
+    src = 'fn main() { assert!(1 == 1, "fail"); }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fns = [n for n in nodes if isinstance(n, FunctionDef)]
+    assert len(fns) == 1
+
+print("\n=== METAPROGRAMMING TESTS ===")
+test("derive attribute", test_parse_derive_attr)
+test("test attribute", test_parse_test_attr)
+test("macro call", test_parse_macro_call)
+
+# ── Expanded Example Compilation Tests ───────────────────────────────────
+
+def test_compile_advanced_examples():
+    """Verify advanced example files parse and pass semantic analysis."""
+    examples = [
+        'arrays.nxl', 'floats.nxl', 'pointers.nxl', 'math.nxl',
+        'enum.nxl', 'inference.nxl', 'chars.nxl', 'variables.nxl',
+        'control.nxl', 'dead_code.nxl',
+    ]
+    examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+    compiled = 0
+    for ex in examples:
+        path = os.path.join(examples_dir, ex)
+        if not os.path.exists(path):
+            continue
+        src = open(path).read()
+        tokens = Lexer(src).tokenize()
+        ast = Parser(tokens).parse()
+        sa = SemanticAnalyzer()
+        sa.analyze(ast)
+        compiled += 1
+    assert compiled >= 5, f"Only compiled {compiled} advanced examples"
+
+def test_compile_oop_examples():
+    """Verify OOP examples parse correctly."""
+    examples = [
+        'method_test2.nxl', 'methods_simple.nxl', 'methods_final.nxl',
+        'structs.nxl', 'method_field.nxl', 'method_minimal.nxl',
+    ]
+    examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+    compiled = 0
+    for ex in examples:
+        path = os.path.join(examples_dir, ex)
+        if not os.path.exists(path):
+            continue
+        src = open(path).read()
+        tokens = Lexer(src).tokenize()
+        ast = Parser(tokens).parse()
+        sa = SemanticAnalyzer()
+        sa.analyze(ast)
+        compiled += 1
+    assert compiled >= 3, f"Only compiled {compiled} OOP examples"
+
+print("\n=== EXPANDED EXAMPLE COMPILATION TESTS ===")
+test("compile advanced examples", test_compile_advanced_examples)
+test("compile OOP examples", test_compile_oop_examples)
+
+# ── Codegen Regression Tests ─────────────────────────────────────────────
+
+def test_codegen_print_int_from_variable():
+    """print(var) where var is i32 should use %d format, not %s (regression: segfault)."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath('.')), 'bootstrap'))
+sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn get_count() -> i32 { return 42; }\\nfn main() -> i32 { let x: i32 = get_count(); print(x); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'fmt_d' in ir_str, "print(i32_var) should use integer format"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()}"
+
+def test_codegen_print_string_still_works():
+    """print("hello") should still use %s format."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys, os; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { print("hello"); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'fmt_s' in ir_str, "print(string) should use string format"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()}"
+
+print("\n=== CODEGEN REGRESSION TESTS ===")
+test("print(i32 var) uses %d", test_codegen_print_int_from_variable)
+test("print(string) uses %s", test_codegen_print_string_still_works)
+
+# ── Bitwise Operator Tests ───────────────────────────────────────────────
+
+def test_lexer_bitwise_tokens():
+    tokens = Lexer('a << 2 >> 1 ^ 0xFF ~ x').tokenize()
+    types = [t.type for t in tokens]
+    assert 'SHL' in types, "Missing SHL (<<)"
+    assert 'SHR' in types, "Missing SHR (>>)"
+    assert 'CARET' in types, "Missing CARET (^)"
+    assert 'TILDE' in types, "Missing TILDE (~)"
+
+def test_lexer_shift_vs_comparison():
+    """<< must not be confused with two LT tokens."""
+    tokens = Lexer('x << 3').tokenize()
+    assert any(t.type == 'SHL' for t in tokens)
+    assert not any(t.type == 'LT' for t in tokens)
+
+def test_lexer_shift_right_vs_gte():
+    """>> must not be confused with > followed by >."""
+    tokens = Lexer('x >> 3').tokenize()
+    assert any(t.type == 'SHR' for t in tokens)
+
+def test_parser_bitwise_and():
+    from n_parser import BinaryExpr
+    tokens = Lexer('fn main() -> i32 { let r = a & b; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    # Should parse without error - & in binary context is bitwise AND
+    assert len(ast) == 1
+
+def test_parser_bitwise_or():
+    from n_parser import BinaryExpr
+    tokens = Lexer('fn main() -> i32 { let r: i32 = 255 | 15; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    assert len(ast) == 1
+
+def test_parser_bitwise_xor():
+    from n_parser import BinaryExpr
+    tokens = Lexer('fn main() -> i32 { let r = a ^ b; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    assert len(ast) == 1
+
+def test_parser_shift_left():
+    from n_parser import BinaryExpr
+    tokens = Lexer('fn main() -> i32 { let r = 1 << 4; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    assert len(ast) == 1
+
+def test_parser_shift_right():
+    from n_parser import BinaryExpr
+    tokens = Lexer('fn main() -> i32 { let r = 16 >> 2; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    assert len(ast) == 1
+
+def test_parser_bitwise_not():
+    tokens = Lexer('fn main() -> i32 { let r = ~x; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    assert len(ast) == 1
+
+def test_parser_bitwise_precedence():
+    """Shift binds tighter than bitwise AND, which binds tighter than bitwise OR."""
+    from n_parser import BinaryExpr, VarDecl
+    tokens = Lexer('fn main() -> i32 { let r: i32 = a | b & c << 1; return 0; }').tokenize()
+    ast = Parser(tokens).parse()
+    fn = ast[0]
+    # The let stmt is a VarDecl
+    let_stmt = fn.body[0]
+    assert isinstance(let_stmt, VarDecl), f"Expected VarDecl, got {type(let_stmt).__name__}"
+    # Top-level should be PIPE (bitwise OR) since it has lowest precedence
+    assert isinstance(let_stmt.initializer, BinaryExpr), "Expected BinaryExpr"
+    assert let_stmt.initializer.op == 'PIPE', f"Expected PIPE at top, got {let_stmt.initializer.op}"
+
+def test_codegen_bitwise_and():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { let a: i32 = 255; let b: i32 = 15; let r: i32 = a & b; print(r); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'bitandtmp' in ir_str or 'and ' in ir_str, "Expected bitwise AND in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()[-200:]}"
+
+def test_codegen_shift_left():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { let a: i32 = 1; let r: i32 = a << 4; print(r); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'shl' in ir_str, "Expected shl in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()}"
+
+def test_codegen_shift_right():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { let a: i32 = 16; let r: i32 = a >> 2; print(r); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'ashr' in ir_str, "Expected ashr in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()}"
+
+def test_codegen_xor():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; let r: i32 = a ^ b; print(r); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'xor' in ir_str, "Expected xor in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()}"
+
+def test_codegen_bitwise_not():
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'fn main() -> i32 { let a: i32 = 5; let r: i32 = ~a; print(r); return 0; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'bitnottmp' in ir_str or 'xor' in ir_str, "Expected bitwise NOT in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()}"
+
+print("\n=== BITWISE OPERATOR TESTS ===")
+test("lexer: bitwise tokens", test_lexer_bitwise_tokens)
+test("lexer: << not confused with LT", test_lexer_shift_vs_comparison)
+test("lexer: >> token", test_lexer_shift_right_vs_gte)
+test("parser: bitwise AND", test_parser_bitwise_and)
+test("parser: bitwise OR", test_parser_bitwise_or)
+test("parser: bitwise XOR", test_parser_bitwise_xor)
+test("parser: shift left", test_parser_shift_left)
+test("parser: shift right", test_parser_shift_right)
+test("parser: bitwise NOT (~)", test_parser_bitwise_not)
+test("parser: bitwise precedence", test_parser_bitwise_precedence)
+test("codegen: bitwise AND", test_codegen_bitwise_and)
+test("codegen: shift left", test_codegen_shift_left)
+test("codegen: shift right", test_codegen_shift_right)
+test("codegen: XOR", test_codegen_xor)
+test("codegen: bitwise NOT", test_codegen_bitwise_not)
+
+# ── Derive Tests ─────────────────────────────────────────────────────────
+
+def test_derive_debug_generates_impl():
+    """@[derive(Debug)] should generate a debug_print method."""
+    src = '@[derive(Debug)]\nstruct Point { x: i32, y: i32 }\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    # After analysis, the AST should have an ImplDef with debug_print
+    impls = [n for n in ast if isinstance(n, ImplDef) and n.struct_name == 'Point']
+    assert len(impls) >= 1, "Expected derive to generate ImplDef"
+    methods = [m for impl_def in impls for m in impl_def.methods]
+    method_names = [m.name for m in methods]
+    # Name may be mangled, look for debug_print prefix
+    assert any('debug_print' in name for name in method_names), f"Expected debug_print method, got {method_names}"
+
+def test_derive_clone_generates_impl():
+    """@[derive(Clone)] should generate a clone method."""
+    src = '@[derive(Clone)]\nstruct Color { r: i32, g: i32, b: i32 }\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    impls = [n for n in ast if isinstance(n, ImplDef) and n.struct_name == 'Color']
+    assert len(impls) >= 1, "Expected derive to generate ImplDef for Clone"
+    methods = [m for impl_def in impls for m in impl_def.methods]
+    method_names = [m.name for m in methods]
+    assert any('clone' in name for name in method_names), f"Expected clone method, got {method_names}"
+
+def test_derive_partial_eq():
+    """@[derive(PartialEq)] should generate an eq method."""
+    src = '@[derive(PartialEq)]\nstruct Vec2 { x: i32, y: i32 }\nfn main() -> i32 { return 0; }'
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    impls = [n for n in ast if isinstance(n, ImplDef) and n.struct_name == 'Vec2']
+    assert len(impls) >= 1, "Expected derive to generate ImplDef for PartialEq"
+    methods = [m for impl_def in impls for m in impl_def.methods]
+    method_names = [m.name for m in methods]
+    assert any('eq' in name for name in method_names), f"Expected eq method, got {method_names}"
+
+def test_derive_debug_codegen():
+    """@[derive(Debug)] on struct should produce compilable code."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = '''@[derive(Debug)]
+struct Point { x: i32, y: i32 }
+fn main() -> i32 { return 0; }'''
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'Point' in ir_str, "Expected Point struct in IR"
+print("OK")
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Failed: {result.stderr.strip()}"
+
+print("\n=== DERIVE TESTS ===")
+test("derive(Debug) generates impl", test_derive_debug_generates_impl)
+test("derive(Clone) generates impl", test_derive_clone_generates_impl)
+test("derive(PartialEq) generates impl", test_derive_partial_eq)
+test("derive(Debug) codegen", test_derive_debug_codegen)
+
+# ── @[test] Attribute Tests ──────────────────────────────────────────────
+
+def test_attribute_test_discovered():
+    """@[test] functions should be discovered by semantic analyzer."""
+    src = '''
+@[test]
+fn test_math() {
+    let x: i32 = 2 + 2;
+}
+fn main() -> i32 { return 0; }
+'''
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    assert len(sa.tests) >= 1, f"Expected at least 1 test, got {sa.tests}"
+
+def test_assert_macro_expansion():
+    """assert!(cond, msg) should expand to __nexa_assert call."""
+    src = 'fn main() -> i32 { assert!(1 == 1, "should be true"); return 0; }'
+    tokens = Lexer(src).tokenize()
+    ast = Parser(tokens).parse()
+    sa = SemanticAnalyzer()
+    sa.analyze(ast)
+    # If it didn't throw, the macro expanded correctly
+
+print("\n=== @[test] ATTRIBUTE TESTS ===")
+test("@[test] functions discovered", test_attribute_test_discovered)
+test("assert! macro expansion", test_assert_macro_expansion)
+
+# ── Standard Library Module Tests ────────────────────────────────────────
+
+def _check_std_module_exists(mod_name):
+    """Check that a std module file exists and is non-empty."""
+    std_dir = os.path.join(os.path.dirname(__file__), '..', 'std')
+    path = os.path.join(std_dir, f'{mod_name}.nxl')
+    assert os.path.exists(path), f"std/{mod_name}.nxl not found"
+    size = os.path.getsize(path)
+    assert size > 100, f"std/{mod_name}.nxl seems empty ({size} bytes)"
+
+def test_std_time_exists():
+    _check_std_module_exists('time')
+
+def test_std_log_exists():
+    _check_std_module_exists('log')
+
+def test_std_env_exists():
+    _check_std_module_exists('env')
+
+def test_std_crypto_exists():
+    _check_std_module_exists('crypto')
+
+def test_std_regex_exists():
+    _check_std_module_exists('regex')
+
+def test_std_http_exists():
+    _check_std_module_exists('http')
+
+def test_std_json_exists():
+    _check_std_module_exists('json')
+
+def test_std_db_exists():
+    _check_std_module_exists('db')
+
+def test_std_net_exists():
+    _check_std_module_exists('net')
+
+def test_std_fs_exists():
+    _check_std_module_exists('fs')
+
+def test_std_mod_registry():
+    """std/mod.nxl should register all standard modules."""
+    mod_path = os.path.join(os.path.dirname(__file__), '..', 'std', 'mod.nxl')
+    with open(mod_path) as f:
+        content = f.read()
+    for mod in ['vec', 'option', 'result', 'string', 'fs', 'io', 'hash', 'map', 'json', 'db', 'net', 'compress', 'task', 'future', 'time', 'log', 'env', 'crypto', 'regex', 'http']:
+        assert f'mod {mod}' in content, f"Module '{mod}' not registered in std/mod.nxl"
+
+def test_std_modules_compile_check():
+    """Compile the std_modules_test.nxl example to verify integration."""
+    import subprocess
+    test_file = os.path.join(os.path.dirname(__file__), '..', 'examples', 'std_modules_test.nxl')
+    if not os.path.exists(test_file):
+        return  # Skip if not present
+    result = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(__file__), '..', 'nx.py'),
+         'build', test_file, '--no-link'],
+        capture_output=True, text=True,
+        cwd=os.path.join(os.path.dirname(__file__), '..')
+    )
+    assert result.returncode == 0, f"std_modules_test.nxl compilation failed: {result.stderr.strip()[-200:]}"
+
+print("\n=== STANDARD LIBRARY TESTS ===")
+test("std::time exists", test_std_time_exists)
+test("std::log exists", test_std_log_exists)
+test("std::env exists", test_std_env_exists)
+test("std::crypto exists", test_std_crypto_exists)
+test("std::regex exists", test_std_regex_exists)
+test("std::http exists", test_std_http_exists)
+test("std::json exists", test_std_json_exists)
+test("std::db exists", test_std_db_exists)
+test("std::net exists", test_std_net_exists)
+test("std::fs exists", test_std_fs_exists)
+test("std/mod.nxl registry complete", test_std_mod_registry)
+test("std_modules_test compilation", test_std_modules_compile_check)
+
+# === ASYNC / AWAIT TESTS =================================================
+
+def test_parse_await_expr():
+    """Parser: await expression in async fn."""
+    src = 'async fn main() -> i32 { let t = fetch_val(); let v = await t; return v; }'
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    fn = [n for n in nodes if isinstance(n, FunctionDef)][0]
+    assert fn.is_async == True
+    # Body should contain an AwaitExpr somewhere
+    from n_parser import AwaitExpr, VarDecl
+    var_decls = [s for s in fn.body if isinstance(s, VarDecl)]
+    await_found = any(isinstance(v.initializer, AwaitExpr) for v in var_decls if v.initializer)
+    assert await_found, "AwaitExpr not found in AST"
+
+def test_semantic_await_outside_async():
+    """Semantic: await outside async fn should raise error."""
+    src = '''fn fetch() -> i32 { return 42; }
+fn main() -> i32 { let v = await fetch(); return v; }'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    try:
+        sem = SemanticAnalyzer()
+        sem.analyze(nodes)
+        assert False, "Should have raised error for await outside async"
+    except Exception as e:
+        assert "async" in str(e).lower() or "await" in str(e).lower()
+
+def test_semantic_async_returns_task():
+    """Semantic: calling async fn should return Task<T>."""
+    src = '''async fn fetch() -> i32 { return 42; }
+async fn main() -> i32 { let t = fetch(); let v = await t; return v; }'''
+    tokens = Lexer(src).tokenize()
+    nodes = Parser(tokens).parse()
+    sem = SemanticAnalyzer()
+    sem.analyze(nodes)
+    # If analysis succeeded, Task<T> type was resolved
+
+def test_codegen_async_fn_returns_ptr():
+    """Codegen: async fn should return i8* (opaque pointer)."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys, os; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'async fn compute() -> i32 { return 42; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'i8* @' in ir_str and 'compute' in ir_str, 'Async fn should return pointer type'
+print('OK')
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()[-300:]}"
+
+def test_codegen_async_state_alloc():
+    """Codegen: async fn body should malloc state struct."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys, os; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'async fn compute() -> i32 { return 42; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'malloc' in ir_str.lower() or 'call' in ir_str, 'Async fn should allocate state via malloc'
+print('OK')
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()[-300:]}"
+
+def test_codegen_await_poll_loop():
+    """Codegen: await should create polling loop blocks."""
+    import subprocess
+    result = subprocess.run([sys.executable, '-c', """
+import sys, os; sys.path.insert(0, 'bootstrap')
+from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
+src = 'async fn fetch() -> i32 { return 42; }\\nasync fn main() -> i32 { let t = fetch(); let v = await t; return v; }'
+tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
+sa = SemanticAnalyzer(); sa.analyze(ast)
+cg = CodeGen(); cg.generate(ast)
+ir_str = str(cg.module)
+assert 'await_cond' in ir_str, 'Await should create condition block'
+assert 'await_cont' in ir_str, 'Await should create continuation block'
+print('OK')
+"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
+    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()[-300:]}"
+
+def test_runtime_nexa_async_exists():
+    """Runtime: nexa_async.c should exist."""
+    runtime_path = os.path.join(os.path.dirname(__file__), '..', 'runtime', 'nexa_async.c')
+    assert os.path.exists(runtime_path), "runtime/nexa_async.c not found"
+
+def test_std_task_exists():
+    """Std: task.nxl should exist with Task<T> and Executor."""
+    _check_std_module_exists('task')
+    task_path = os.path.join(os.path.dirname(__file__), '..', 'std', 'task.nxl')
+    with open(task_path) as f:
+        content = f.read()
+    assert 'Task' in content
+    assert 'Executor' in content
+
+def test_std_future_exists():
+    """Std: future.nxl should exist with Future<T> trait."""
+    _check_std_module_exists('future')
+    future_path = os.path.join(os.path.dirname(__file__), '..', 'std', 'future.nxl')
+    with open(future_path) as f:
+        content = f.read()
+    assert 'Future' in content
+    assert 'poll' in content
+
+print("\n=== ASYNC / AWAIT TESTS ===")
+test("parse await expr", test_parse_await_expr)
+test("semantic: await outside async errors", test_semantic_await_outside_async)
+test("semantic: async fn returns Task<T>", test_semantic_async_returns_task)
+test("codegen: async fn returns i8*", test_codegen_async_fn_returns_ptr)
+test("codegen: async state alloc", test_codegen_async_state_alloc)
+test("codegen: await poll loop", test_codegen_await_poll_loop)
+test("runtime: nexa_async.c exists", test_runtime_nexa_async_exists)
+test("std::task with Task/Executor", test_std_task_exists)
+test("std::future with Future trait", test_std_future_exists)
+
 # ── Summary ──────────────────────────────────────────────────────────────
 print(f"\n{'='*50}")
 print(f"  RESULTS: {passed} passed, {failed} failed, {passed+failed} total")

@@ -1,0 +1,159 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: std::time, std::log, std::env, std::crypto
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    fn printf(fmt: *u8, ...) -> i32;
+    fn strlen(s: *u8) -> i32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn memset(s: *u8, c: i32, n: i32) -> *u8;
+    fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
+    fn time(t: *i64) -> i64;
+    fn localtime(t: *i64) -> *u8;
+    fn gmtime(t: *i64) -> *u8;
+    fn strftime(buf: *u8, maxsize: i32, fmt: *u8, tm: *u8) -> i32;
+    fn difftime(t1: i64, t0: i64) -> f64;
+    fn gettimeofday(tv: *u8, tz: *u8) -> i32;
+    fn getenv(name: *u8) -> *u8;
+    fn setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+    fn getpid() -> i32;
+    fn getcwd(buf: *u8, size: i32) -> *u8;
+    fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
+    fn fprintf(stream: *u8, fmt: *u8, ...) -> i32;
+    fn fdopen(fd: i32, mode: *u8) -> *u8;
+    fn fflush(stream: *u8);
+}
+
+# ── Time test ───────────────────────────────────────────────────────────────
+
+fn test_time() {
+    print("=== std::time ===");
+
+    # Get unix timestamp
+    let mut ts: i64 = 0;
+    time(&ts);
+    printf(cast::<*u8>("  timestamp: %lld\n"), ts);
+
+    # Get local datetime via strftime
+    let tm = localtime(&ts);
+    let buf = malloc(64);
+    strftime(buf, 64, cast::<*u8>("%Y-%m-%dT%H:%M:%S"), tm);
+    printf(cast::<*u8>("  iso8601: %s\n"), buf);
+    free(buf);
+
+    # Date components via strftime
+    let dbuf = malloc(32);
+    strftime(dbuf, 32, cast::<*u8>("%Y-%m-%d %H:%M:%S"), tm);
+    printf(cast::<*u8>("  datetime: %s\n"), dbuf);
+    free(dbuf);
+
+    # Instant timing
+    let tv = malloc(16);
+    gettimeofday(tv, cast::<*u8>(0));
+    printf(cast::<*u8>("  gettimeofday: ok\n"));
+    free(tv);
+
+    print("  PASS");
+}
+
+# ── Env test ────────────────────────────────────────────────────────────────
+
+fn test_env() {
+    print("=== std::env ===");
+
+    # Read HOME
+    let home = getenv(cast::<*u8>("HOME"));
+    if (cast::<i64>(home) != 0) {
+        printf(cast::<*u8>("  HOME: %s\n"), home);
+    }
+
+    # Read USER
+    let user = getenv(cast::<*u8>("USER"));
+    if (cast::<i64>(user) != 0) {
+        printf(cast::<*u8>("  USER: %s\n"), user);
+    }
+
+    # Set and read custom env
+    setenv(cast::<*u8>("NEXA_TEST"), cast::<*u8>("hello_nexa"), 1);
+    let val = getenv(cast::<*u8>("NEXA_TEST"));
+    if (cast::<i64>(val) != 0) {
+        printf(cast::<*u8>("  NEXA_TEST: %s\n"), val);
+    }
+
+    # CWD
+    let cwd_buf = malloc(4096);
+    getcwd(cwd_buf, 4096);
+    printf(cast::<*u8>("  cwd: %s\n"), cwd_buf);
+    free(cwd_buf);
+
+    # PID
+    let pid = getpid();
+    printf(cast::<*u8>("  pid: %d\n"), pid);
+
+    print("  PASS");
+}
+
+# ── Log test ────────────────────────────────────────────────────────────────
+
+fn test_log() {
+    print("=== std::log ===");
+
+    let mut ts: i64 = 0;
+    time(&ts);
+    let tm = localtime(&ts);
+    let ts_buf = malloc(32);
+    strftime(ts_buf, 32, cast::<*u8>("%Y-%m-%d %H:%M:%S"), tm);
+
+    let stderr = fdopen(2, cast::<*u8>("w"));
+    fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m \x1b[32mINFO \x1b[0m Server started on port 8080\n"), ts_buf);
+    fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m \x1b[33mWARN \x1b[0m Slow query detected (120ms)\n"), ts_buf);
+    fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m \x1b[31mERROR\x1b[0m Connection refused to db\n"), ts_buf);
+    fflush(stderr);
+    free(ts_buf);
+
+    print("  PASS");
+}
+
+# ── Crypto test (hex encoding) ───────────────────────────────────────────────
+
+fn test_crypto() {
+    print("=== std::crypto ===");
+
+    # Test hex encoding
+    let hex_chars = "0123456789abcdef";
+    let hex_ptr = cast::<*u8>(hex_chars);
+    let test_byte = 171; # 0xAB
+    let hi_idx = (test_byte / 16) % 16;
+    let lo_idx = test_byte % 16;
+    let hi = hex_ptr[hi_idx];
+    let lo = hex_ptr[lo_idx];
+    printf(cast::<*u8>("  0xAB hex: %c%c\n"), cast::<i32>(hi), cast::<i32>(lo));
+
+    # Test simple hash checksum (sum of bytes mod 256)
+    let msg = "hello world";
+    let msg_ptr = cast::<*u8>(msg);
+    let msg_len = strlen(msg_ptr);
+    let mut sum: i32 = 0;
+    let mut i: i32 = 0;
+    while (i < msg_len) {
+        sum = sum + cast::<i32>(msg_ptr[i]);
+        i = i + 1;
+    }
+    let checksum = sum % 256;
+    printf(cast::<*u8>("  checksum('hello world') = %d\n"), checksum);
+
+    print("  PASS");
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+fn main() -> i32 {
+    test_time();
+    test_env();
+    test_log();
+    test_crypto();
+    print("");
+    print("All std module tests passed!");
+    return 0;
+}

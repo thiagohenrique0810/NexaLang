@@ -1,0 +1,175 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# std::time — Date/Time utilities via POSIX C FFI
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    fn time(t: *i64) -> i64;
+    fn localtime(t: *i64) -> *u8;
+    fn gmtime(t: *i64) -> *u8;
+    fn strftime(buf: *u8, maxsize: i32, fmt: *u8, tm: *u8) -> i32;
+    fn mktime(tm: *u8) -> i64;
+    fn difftime(t1: i64, t0: i64) -> f64;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
+    fn gettimeofday(tv: *u8, tz: *u8) -> i32;
+}
+
+use std::string::String;
+
+# ── Instant (monotonic-like timestamp) ──────────────────────────────────────
+
+pub struct Instant {
+    secs: i64,
+    usecs: i32
+}
+
+impl Instant {
+    fn now() -> Instant {
+        # struct timeval { tv_sec: i64, tv_usec: i32 }  (16 bytes on 64-bit)
+        let tv = malloc(16);
+        gettimeofday(tv, cast::<*u8>(0));
+        let secs_ptr = cast::<*i64>(tv);
+        let secs = *secs_ptr;
+        # tv_usec is at offset 8
+        let usecs_ptr = cast::<*i32>(cast::<*u8>(cast::<i64>(tv) + 8));
+        let usecs = *usecs_ptr;
+        free(tv);
+        return Instant(secs, usecs);
+    }
+
+    fn elapsed_ms(&self, since: &Instant) -> i32 {
+        let ds = cast::<i32>(self.secs - since.secs);
+        let du = self.usecs - since.usecs;
+        return ds * 1000 + du / 1000;
+    }
+
+    fn elapsed_us(&self, since: &Instant) -> i64 {
+        let ds = self.secs - since.secs;
+        let du = cast::<i64>(self.usecs - since.usecs);
+        return ds * 1000000 + du;
+    }
+}
+
+# ── DateTime ────────────────────────────────────────────────────────────────
+
+pub struct DateTime {
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+    timestamp: i64
+}
+
+# tm struct field offsets (each i32, 4 bytes):
+#   0: tm_sec, 4: tm_min, 8: tm_hour, 12: tm_mday,
+#   16: tm_mon, 20: tm_year, 24: tm_wday, 28: tm_yday, 32: tm_isdst
+
+fn read_tm_field(tm: *u8, offset: i32) -> i32 {
+    let ptr = cast::<*i32>(cast::<*u8>(cast::<i64>(tm) + cast::<i64>(offset)));
+    return *ptr;
+}
+
+impl DateTime {
+    fn now() -> DateTime {
+        let mut ts: i64 = 0;
+        time(&ts);
+        let tm = localtime(&ts);
+        return DateTime(
+            read_tm_field(tm, 20) + 1900,
+            read_tm_field(tm, 16) + 1,
+            read_tm_field(tm, 12),
+            read_tm_field(tm, 8),
+            read_tm_field(tm, 4),
+            read_tm_field(tm, 0),
+            ts
+        );
+    }
+
+    fn now_utc() -> DateTime {
+        let mut ts: i64 = 0;
+        time(&ts);
+        let tm = gmtime(&ts);
+        return DateTime(
+            read_tm_field(tm, 20) + 1900,
+            read_tm_field(tm, 16) + 1,
+            read_tm_field(tm, 12),
+            read_tm_field(tm, 8),
+            read_tm_field(tm, 4),
+            read_tm_field(tm, 0),
+            ts
+        );
+    }
+
+    fn from_timestamp(ts: i64) -> DateTime {
+        let mut t = ts;
+        let tm = localtime(&t);
+        return DateTime(
+            read_tm_field(tm, 20) + 1900,
+            read_tm_field(tm, 16) + 1,
+            read_tm_field(tm, 12),
+            read_tm_field(tm, 8),
+            read_tm_field(tm, 4),
+            read_tm_field(tm, 0),
+            ts
+        );
+    }
+
+    fn unix_timestamp() -> i64 {
+        let mut ts: i64 = 0;
+        time(&ts);
+        return ts;
+    }
+
+    fn format(&self, fmt: string) -> String {
+        let mut ts = self.timestamp;
+        let tm = localtime(&ts);
+        let buf = malloc(256);
+        strftime(buf, 256, cast::<*u8>(fmt), tm);
+        let result = String::from(cast::<string>(buf));
+        free(buf);
+        return result;
+    }
+
+    fn to_iso8601(&self) -> String {
+        return self.format("%Y-%m-%dT%H:%M:%S");
+    }
+
+    fn to_date_string(&self) -> String {
+        return self.format("%Y-%m-%d");
+    }
+
+    fn to_time_string(&self) -> String {
+        return self.format("%H:%M:%S");
+    }
+
+    fn diff_seconds(&self, other: &DateTime) -> f64 {
+        return difftime(self.timestamp, other.timestamp);
+    }
+
+    fn weekday(&self) -> i32 {
+        let mut ts = self.timestamp;
+        let tm = localtime(&ts);
+        return read_tm_field(tm, 24);
+    }
+
+    fn day_of_year(&self) -> i32 {
+        let mut ts = self.timestamp;
+        let tm = localtime(&ts);
+        return read_tm_field(tm, 28) + 1;
+    }
+}
+
+# ── Convenience ─────────────────────────────────────────────────────────────
+
+pub fn timestamp() -> i64 {
+    return DateTime::unix_timestamp();
+}
+
+pub fn sleep_ms(ms: i32) {
+    # usleep takes microseconds
+    extern "C" { fn usleep(usec: i32) -> i32; }
+    usleep(ms * 1000);
+}

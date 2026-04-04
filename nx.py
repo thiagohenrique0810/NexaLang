@@ -1,5 +1,6 @@
 import argparse
 import os
+import platform
 import subprocess
 import sys
 import json
@@ -8,6 +9,10 @@ import json
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 BOOTSTRAP_MAIN = os.path.join(REPO_ROOT, "bootstrap", "main.py")
 DEV_ARTIFACTS = os.path.join(REPO_ROOT, "dev", "artifacts")
+
+_EXE_EXT = ".exe" if platform.system() == "Windows" else ""
+
+__version__ = "0.5.0"
 
 
 def _ensure_dir(path: str) -> None:
@@ -35,19 +40,49 @@ def _python() -> list[str]:
 
 
 def _clang():
-    # Try to find clang
-    paths = [
-        "clang",
-        os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "apps", "llvm", "current", "bin", "clang.exe"),
-        "C:\\Program Files\\LLVM\\bin\\clang.exe"
-    ]
-    for p in paths:
-        try:
-            subprocess.run([p, "--version"], capture_output=True)
+    # Try to find clang across platforms
+    import shutil
+    import platform
+
+    # 1. Check if clang is on PATH (works on all platforms)
+    clang_path = shutil.which("clang")
+    if clang_path:
+        return clang_path
+
+    # 2. Platform-specific fallback paths
+    system = platform.system()
+    candidates = []
+
+    if system == "Windows":
+        candidates = [
+            os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "apps", "llvm", "current", "bin", "clang.exe"),
+            "C:\\Program Files\\LLVM\\bin\\clang.exe",
+            "C:\\Program Files (x86)\\LLVM\\bin\\clang.exe",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            "/usr/local/opt/llvm/bin/clang",  # Homebrew Intel
+            "/opt/homebrew/opt/llvm/bin/clang",  # Homebrew Apple Silicon
+            "/Library/Developer/CommandLineTools/usr/bin/clang",
+            "/usr/bin/clang",
+        ]
+    else:  # Linux
+        # Try versioned clang (clang-15, clang-16, etc.)
+        for ver in range(20, 13, -1):
+            versioned = shutil.which(f"clang-{ver}")
+            if versioned:
+                return versioned
+        candidates = [
+            "/usr/bin/clang",
+            "/usr/local/bin/clang",
+        ]
+
+    for p in candidates:
+        if os.path.isfile(p):
             return p
-        except:
-            continue
-    return "clang" # Fallback
+
+    print("Warning: clang not found. Install LLVM/Clang for native compilation.")
+    return "clang"  # Fallback — will fail with a clear error
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -62,7 +97,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             print("Error: No input file specified and no nexa.json project file found.")
             return 1
 
-    out = args.out or (os.path.join(DEV_ARTIFACTS, "output.exe") if args.target == "native" else None)
+    out = args.out or (os.path.join(DEV_ARTIFACTS, f"output{_EXE_EXT}") if args.target == "native" else None)
     ll_out = args.ll_out or (os.path.join(DEV_ARTIFACTS, "output.ll") if args.emit == "ll" else os.path.join(DEV_ARTIFACTS, "output.ll"))
     spv_out = args.spv_out or (os.path.join(DEV_ARTIFACTS, "output.spv") if args.emit == "spv" else None)
 
@@ -142,7 +177,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--run-jit")
         return _run(cmd)
 
-    exe = args.exe or os.path.join(DEV_ARTIFACTS, "output.exe")
+    exe = args.exe or os.path.join(DEV_ARTIFACTS, f"output{_EXE_EXT}")
     ll_out = args.ll_out or os.path.join(DEV_ARTIFACTS, "output.ll")
     
     cmd.extend(["--emit", "ll", "--out", ll_out])
@@ -175,7 +210,7 @@ def cmd_test(args: argparse.Namespace) -> int:
             return 1
 
     ll_out = os.path.join(DEV_ARTIFACTS, "test.ll")
-    exe_out = os.path.join(DEV_ARTIFACTS, "test.exe")
+    exe_out = os.path.join(DEV_ARTIFACTS, f"test{_EXE_EXT}")
 
     # We need to tell the compiler to run tests
     rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--run-tests", "--out", ll_out])
@@ -199,7 +234,8 @@ def cmd_examples(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="nx", description="NexaLang helper CLI (bootstrap)")
+    ap = argparse.ArgumentParser(prog="nxc", description="NexaLang compiler CLI")
+    ap.add_argument("--version", "-v", action="version", version=f"NexaLang {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build", help="Build a .nxl file (native or SPIR-V)")

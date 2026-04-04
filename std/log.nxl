@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# std::log — Structured logging with levels
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    fn fprintf(stream: *u8, fmt: *u8, ...) -> i32;
+    fn time(t: *i64) -> i64;
+    fn localtime(t: *i64) -> *u8;
+    fn strftime(buf: *u8, maxsize: i32, fmt: *u8, tm: *u8) -> i32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn fdopen(fd: i32, mode: *u8) -> *u8;
+    fn fflush(stream: *u8);
+}
+
+# ── Log Level ───────────────────────────────────────────────────────────────
+
+# Levels as constants (enum-like)
+#   0 = TRACE, 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR, 5 = FATAL
+
+pub struct LogLevel {
+    value: i32
+}
+
+impl LogLevel {
+    fn trace() -> LogLevel { return LogLevel(0); }
+    fn debug() -> LogLevel { return LogLevel(1); }
+    fn info()  -> LogLevel { return LogLevel(2); }
+    fn warn()  -> LogLevel { return LogLevel(3); }
+    fn error() -> LogLevel { return LogLevel(4); }
+    fn fatal() -> LogLevel { return LogLevel(5); }
+
+    fn name(&self) -> string {
+        if (self.value == 0) { return "TRACE"; }
+        if (self.value == 1) { return "DEBUG"; }
+        if (self.value == 2) { return "INFO"; }
+        if (self.value == 3) { return "WARN"; }
+        if (self.value == 4) { return "ERROR"; }
+        return "FATAL";
+    }
+
+    fn color_code(&self) -> string {
+        if (self.value == 0) { return "\x1b[90m"; }  # gray
+        if (self.value == 1) { return "\x1b[36m"; }  # cyan
+        if (self.value == 2) { return "\x1b[32m"; }  # green
+        if (self.value == 3) { return "\x1b[33m"; }  # yellow
+        if (self.value == 4) { return "\x1b[31m"; }  # red
+        return "\x1b[35m";                            # magenta (fatal)
+    }
+}
+
+# ── Logger ──────────────────────────────────────────────────────────────────
+
+pub struct Logger {
+    min_level: i32,
+    use_color: bool,
+    prefix: string
+}
+
+fn get_timestamp_str() -> *u8 {
+    let mut ts: i64 = 0;
+    time(&ts);
+    let tm = localtime(&ts);
+    let buf = malloc(32);
+    strftime(buf, 32, cast::<*u8>("%Y-%m-%d %H:%M:%S"), tm);
+    return buf;
+}
+
+# We use fd 2 (stderr) for logging
+fn get_stderr() -> *u8 {
+    return fdopen(2, cast::<*u8>("w"));
+}
+
+impl Logger {
+    fn new() -> Logger {
+        return Logger(2, true, "");
+    }
+
+    fn with_prefix(prefix: string) -> Logger {
+        return Logger(2, true, prefix);
+    }
+
+    fn set_level(&mut self, level: LogLevel) {
+        self.min_level = level.value;
+    }
+
+    fn set_color(&mut self, enabled: bool) {
+        self.use_color = enabled;
+    }
+
+    fn log(&self, level: LogLevel, msg: string) {
+        if (level.value < self.min_level) { return; }
+
+        let ts = get_timestamp_str();
+        let stderr = get_stderr();
+
+        if (self.use_color) {
+            if (self.prefix == "") {
+                fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m %s%-5s\x1b[0m %s\n"),
+                    ts, cast::<*u8>(level.color_code()), cast::<*u8>(level.name()), cast::<*u8>(msg));
+            } else {
+                fprintf(stderr, cast::<*u8>("\x1b[90m%s\x1b[0m %s%-5s\x1b[0m \x1b[1m[%s]\x1b[0m %s\n"),
+                    ts, cast::<*u8>(level.color_code()), cast::<*u8>(level.name()),
+                    cast::<*u8>(self.prefix), cast::<*u8>(msg));
+            }
+        } else {
+            if (self.prefix == "") {
+                fprintf(stderr, cast::<*u8>("%s %-5s %s\n"),
+                    ts, cast::<*u8>(level.name()), cast::<*u8>(msg));
+            } else {
+                fprintf(stderr, cast::<*u8>("%s %-5s [%s] %s\n"),
+                    ts, cast::<*u8>(level.name()),
+                    cast::<*u8>(self.prefix), cast::<*u8>(msg));
+            }
+        }
+        fflush(stderr);
+        free(ts);
+    }
+
+    fn trace(&self, msg: string) { self.log(LogLevel::trace(), msg); }
+    fn debug(&self, msg: string) { self.log(LogLevel::debug(), msg); }
+    fn info(&self, msg: string)  { self.log(LogLevel::info(), msg); }
+    fn warn(&self, msg: string)  { self.log(LogLevel::warn(), msg); }
+    fn error(&self, msg: string) { self.log(LogLevel::error(), msg); }
+    fn fatal(&self, msg: string) { self.log(LogLevel::fatal(), msg); }
+}
+
+# ── Global convenience functions ────────────────────────────────────────────
+
+fn _global_logger() -> Logger {
+    return Logger::new();
+}
+
+pub fn trace(msg: string) { _global_logger().trace(msg); }
+pub fn debug(msg: string) { _global_logger().debug(msg); }
+pub fn info(msg: string)  { _global_logger().info(msg); }
+pub fn warn(msg: string)  { _global_logger().warn(msg); }
+pub fn error(msg: string) { _global_logger().error(msg); }
+pub fn fatal(msg: string) { _global_logger().fatal(msg); }

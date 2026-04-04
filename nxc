@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""NexaLang Compiler CLI — delegates to nx.py"""
+import os, sys
+
+sys.argv[0] = "nxc"
+root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, root)
+
+exec(open(os.path.join(root, "nx.py")).read())

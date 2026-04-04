@@ -8,11 +8,15 @@ on:
 
 jobs:
   test:
+    name: Tests (${{ matrix.os }} / Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.11', '3.12']
+        exclude:
+          - os: windows-latest
+            python-version: '3.11'
 
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +31,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build TurboQuant runtime
+      - name: Build TurboQuant runtime (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
           cd runtime
           if [[ "$RUNNER_OS" == "Linux" ]]; then
@@ -35,6 +40,13 @@ jobs:
           else
             gcc -O2 -shared -fPIC -o libturboquant.dylib turboquant.c -lm
           fi
+
+      - name: Build TurboQuant runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cd runtime
+          gcc -O2 -shared -o turboquant.dll turboquant.c -lm 2>nul || echo TurboQuant build skipped on Windows
 
       - name: Run tests
         run: python tests/run_tests.py

@@ -1,0 +1,270 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# API de Consulta de Produtos — NexaLang
+# ─────────────────────────────────────────────────────────────────────────────
+# Uma API básica CRUD que usa SQLite para armazenar produtos.
+#
+# Compilar e rodar:
+#   nxc run examples/product_api.nxl
+#
+# Requer: SQLite3 instalado (já vem no macOS e na maioria dos Linux)
+# ─────────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    fn sqlite3_open(filename: *u8, ppDb: **u8) -> i32;
+    fn sqlite3_exec(db: *u8, sql: *u8, cb: *u8, arg: *u8, errmsg: **u8) -> i32;
+    fn sqlite3_close(db: *u8) -> i32;
+    fn sqlite3_prepare_v2(db: *u8, sql: *u8, nByte: i32, ppStmt: **u8, pzTail: **u8) -> i32;
+    fn sqlite3_step(stmt: *u8) -> i32;
+    fn sqlite3_finalize(stmt: *u8) -> i32;
+    fn sqlite3_column_text(stmt: *u8, iCol: i32) -> *u8;
+    fn sqlite3_column_int(stmt: *u8, iCol: i32) -> i32;
+    fn sqlite3_bind_int(stmt: *u8, idx: i32, val: i32) -> i32;
+    fn sqlite3_bind_text(stmt: *u8, idx: i32, val: *u8, n: i32, d: *u8) -> i32;
+    fn sqlite3_changes(db: *u8) -> i32;
+    fn printf(fmt: *u8) -> i32;
+    fn remove(path: *u8) -> i32;
+}
+
+# ── Modelo ──────────────────────────────────────────────────────────────────
+
+struct Product {
+    id: i32,
+    name: string,
+    price: i32,
+    stock: i32
+}
+
+impl Product {
+    fn new(id: i32, name: string, price: i32, stock: i32) -> Product {
+        return Product(id, name, price, stock);
+    }
+
+    fn display(&self) {
+        print("  ──────────────────────");
+        print("  ID:");
+        print(self.id);
+        print("  Nome:");
+        print(self.name);
+        print("  Preco (centavos):");
+        print(self.price);
+        print("  Estoque:");
+        print(self.stock);
+    }
+}
+
+# ── Repositório (SQLite) ───────────────────────────────────────────────────
+
+struct ProductRepo {
+    db: *u8
+}
+
+impl ProductRepo {
+    fn open(path: string) -> ProductRepo {
+        let mut h: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_open(cast::<*u8>(path), &h);
+        if (rc != 0) {
+            print("ERRO: Falha ao abrir banco de dados");
+        }
+        # Criar tabela
+        let mut err: *u8 = cast::<*u8>(0);
+        sqlite3_exec(h, cast::<*u8>("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price INTEGER NOT NULL, stock INTEGER DEFAULT 0);"), cast::<*u8>(0), cast::<*u8>(0), &err);
+        return ProductRepo(h);
+    }
+
+    # Inserir produto
+    fn insert(&self, name: string, price: i32, stock: i32) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("INSERT INTO products (name, price, stock) VALUES (?, ?, ?);"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, cast::<*u8>(name), -1, cast::<*u8>(0));
+            sqlite3_bind_int(stmt, 2, price);
+            sqlite3_bind_int(stmt, 3, stock);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            print("  + Produto inserido");
+            return 1;
+        }
+        print("  ERRO ao inserir");
+        return 0;
+    }
+
+    # Buscar por ID
+    fn find_by_id(&self, id: i32) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("SELECT id, name, price, stock FROM products WHERE id = ?;"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            sqlite3_bind_int(stmt, 1, id);
+            let step = sqlite3_step(stmt);
+            if (step == 100) {
+                let p = Product::new(
+                    sqlite3_column_int(stmt, 0),
+                    cast::<string>(sqlite3_column_text(stmt, 1)),
+                    sqlite3_column_int(stmt, 2),
+                    sqlite3_column_int(stmt, 3)
+                );
+                p.display();
+                sqlite3_finalize(stmt);
+                return 1;
+            }
+            print("  Produto nao encontrado");
+            sqlite3_finalize(stmt);
+        }
+        return 0;
+    }
+
+    # Listar todos
+    fn list_all(&self) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("SELECT id, name, price, stock FROM products ORDER BY id;"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            let mut count: i32 = 0;
+            while (sqlite3_step(stmt) == 100) {
+                let p = Product::new(
+                    sqlite3_column_int(stmt, 0),
+                    cast::<string>(sqlite3_column_text(stmt, 1)),
+                    sqlite3_column_int(stmt, 2),
+                    sqlite3_column_int(stmt, 3)
+                );
+                p.display();
+                count = count + 1;
+            }
+            sqlite3_finalize(stmt);
+            print("  ──────────────────────");
+            print("  Total:");
+            print(count);
+            return count;
+        }
+        return 0;
+    }
+
+    # Buscar por nome (LIKE)
+    fn search(&self, term: string) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("SELECT id, name, price, stock FROM products WHERE name LIKE '%' || ? || '%';"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, cast::<*u8>(term), -1, cast::<*u8>(0));
+            let mut count: i32 = 0;
+            while (sqlite3_step(stmt) == 100) {
+                let p = Product::new(
+                    sqlite3_column_int(stmt, 0),
+                    cast::<string>(sqlite3_column_text(stmt, 1)),
+                    sqlite3_column_int(stmt, 2),
+                    sqlite3_column_int(stmt, 3)
+                );
+                p.display();
+                count = count + 1;
+            }
+            sqlite3_finalize(stmt);
+            print("  Resultados:");
+            print(count);
+            return count;
+        }
+        return 0;
+    }
+
+    # Atualizar estoque
+    fn update_stock(&self, id: i32, new_stock: i32) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("UPDATE products SET stock = ? WHERE id = ?;"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            sqlite3_bind_int(stmt, 1, new_stock);
+            sqlite3_bind_int(stmt, 2, id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            let changed = sqlite3_changes(self.db);
+            if (changed > 0) {
+                print("  Estoque atualizado!");
+            } else {
+                print("  Produto nao encontrado");
+            }
+            return changed;
+        }
+        return 0;
+    }
+
+    # Deletar produto
+    fn delete(&self, id: i32) -> i32 {
+        let mut stmt: *u8 = cast::<*u8>(0);
+        let rc = sqlite3_prepare_v2(self.db, cast::<*u8>("DELETE FROM products WHERE id = ?;"), -1, &stmt, cast::<**u8>(0));
+        if (rc == 0) {
+            sqlite3_bind_int(stmt, 1, id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            let changed = sqlite3_changes(self.db);
+            if (changed > 0) {
+                print("  Produto removido!");
+            } else {
+                print("  Produto nao encontrado");
+            }
+            return changed;
+        }
+        return 0;
+    }
+
+    fn close(&self) {
+        sqlite3_close(self.db);
+    }
+}
+
+# ── Main: simula operações da API ──────────────────────────────────────────
+
+fn main() -> i32 {
+    print("========================================");
+    print("  API de Produtos - NexaLang v0.5");
+    print("========================================");
+
+    # Limpar banco anterior para demo limpa
+    remove(cast::<*u8>("products_demo.db"));
+    let repo = ProductRepo::open("products_demo.db");
+
+    # ── CREATE ──
+    print("");
+    print("[POST] /produtos - Inserindo...");
+    repo.insert("Teclado Mecanico RGB", 29990, 50);
+    repo.insert("Mouse Gamer 16000 DPI", 14990, 120);
+    repo.insert("Monitor 27 4K", 189990, 15);
+    repo.insert("Headset Bluetooth", 19990, 80);
+    repo.insert("Webcam Full HD", 9990, 200);
+
+    # ── READ: Listar todos ──
+    print("");
+    print("[GET] /produtos - Listando todos:");
+    let total: i32 = repo.list_all();
+
+    # ── READ: Buscar por ID ──
+    print("");
+    print("[GET] /produtos/2 - Buscar por ID:");
+    repo.find_by_id(2);
+
+    # ── READ: Buscar por nome ──
+    print("");
+    print("[GET] /produtos?q=Gamer - Buscar:");
+    let found: i32 = repo.search("Gamer");
+
+    # ── UPDATE: Atualizar estoque ──
+    print("");
+    print("[PATCH] /produtos/3/stock - Atualizar:");
+    repo.update_stock(3, 25);
+    repo.find_by_id(3);
+
+    # ── DELETE ──
+    print("");
+    print("[DELETE] /produtos/4 - Remover:");
+    repo.delete(4);
+
+    # ── Estado final ──
+    print("");
+    print("[GET] /produtos - Estado final:");
+    let final_count: i32 = repo.list_all();
+
+    repo.close();
+
+    # Limpar arquivo de demo
+    remove(cast::<*u8>("products_demo.db"));
+
+    print("");
+    print("========================================");
+    print("  API finalizada com sucesso!");
+    print("========================================");
+    return 0;
+}

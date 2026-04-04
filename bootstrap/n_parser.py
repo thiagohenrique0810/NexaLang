@@ -870,14 +870,22 @@ class Parser:
             if self.peek().type == 'LT':
                 self.consume('LT')
                 args = []
-                while self.peek().type != 'GT':
+                while self.peek().type != 'GT' and self.peek().type != 'SHR':
                     if self.peek().type == 'NUMBER':
                          args.append(str(self.consume('NUMBER').value))
                     else:
                          args.append(self.parse_type())
                     if self.peek().type == 'COMMA':
                         self.consume('COMMA')
-                self.consume('GT')
+                # Handle >> (SHR) as two closing > for nested generics
+                if self.peek().type == 'SHR':
+                    # Split >> into > + >: consume SHR and inject a GT back
+                    shr_tok = self.consume('SHR')
+                    # Insert a synthetic GT token at current position for the outer generic
+                    from lexer import Token as LexToken
+                    self.tokens.insert(self.pos, LexToken('GT', '>', shr_tok.line, shr_tok.column + 1))
+                else:
+                    self.consume('GT')
                 name = f"{name}<{','.join(args)}>"
             
             # Support Postfix '*' (e.g. i32*)
@@ -1137,6 +1145,10 @@ class Parser:
             self.consume('MINUS')
             operand = self.parse_unary()
             return UnaryExpr('-', operand)
+        elif token.type == 'TILDE':
+            self.consume('TILDE')
+            operand = self.parse_unary()
+            return UnaryExpr('~', operand)
         else:
             return self.parse_primary()
 
@@ -1162,9 +1174,13 @@ class Parser:
     def get_precedence(self, op_type):
         if op_type in ('OR',): return 0
         if op_type in ('AND',): return 1
-        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 2
-        if op_type in ('PLUS', 'MINUS'): return 3
-        if op_type in ('STAR', 'SLASH', 'PERCENT'): return 4
+        if op_type in ('PIPE',): return 2        # bitwise OR
+        if op_type in ('CARET',): return 3       # bitwise XOR
+        if op_type in ('AMPERSAND',): return 4   # bitwise AND
+        if op_type in ('EQEQ', 'NEQ', 'LT', 'GT', 'LTE', 'GTE'): return 5
+        if op_type in ('SHL', 'SHR'): return 6   # bitwise shift
+        if op_type in ('PLUS', 'MINUS'): return 7
+        if op_type in ('STAR', 'SLASH', 'PERCENT'): return 8
         return -1
 
     def parse_primary(self):

@@ -735,6 +735,9 @@ class CodeGen:
         elif node.op == '-':
             val = self.visit(node.operand)
             return self.builder.neg(val)
+        elif node.op == '~':
+            val = self.visit(node.operand)
+            return self.builder.not_(val, name="bitnottmp")
         else:
             raise Exception(f"Unsupported unary operator: {node.op}")
 
@@ -1515,6 +1518,16 @@ class CodeGen:
             return self.builder.and_(left, right, name="andtmp")
         elif node.op == 'OR':
             return self.builder.or_(left, right, name="ortmp")
+        elif node.op == 'AMPERSAND':
+            return self.builder.and_(left, right, name="bitandtmp")
+        elif node.op == 'PIPE':
+            return self.builder.or_(left, right, name="bitortmp")
+        elif node.op == 'CARET':
+            return self.builder.xor(left, right, name="xortmp")
+        elif node.op == 'SHL':
+            return self.builder.shl(left, right, name="shltmp")
+        elif node.op == 'SHR':
+            return self.builder.ashr(left, right, name="shrtmp")
         elif node.op == 'EQEQ':
             if left.type == ir.FloatType():
                 return self.builder.fcmp_ordered('==', left, right, name="feqtmp")
@@ -1903,12 +1916,21 @@ class CodeGen:
                 int_like = True
             elif val.type == ir.FloatType():
                 fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
+            elif val.type == ir.DoubleType():
+                fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
+            elif isinstance(val.type, ir.IntType) and not isinstance(val.type, ir.PointerType):
+                # Fallback: LLVM type is integer but AST type_name was missing
+                fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
+                if val.type.width < 32: val = self.builder.zext(val, ir.IntType(32))
+                elif val.type.width > 32: val = self.builder.trunc(val, ir.IntType(32))
+                int_like = True
             else:
                 fmt_str = self.visit_StringLiteral(None, name="fmt_s", value_override="%s\n\0")
             
             fmt_arg = self.builder.bitcast(fmt_str, voidptr_ty)
             if int_like: self.builder.call(self.printf, [fmt_arg, val])
             elif val.type == ir.FloatType(): self.builder.call(self.printf, [fmt_arg, self.builder.fpext(val, ir.DoubleType())])
+            elif val.type == ir.DoubleType(): self.builder.call(self.printf, [fmt_arg, val])
             else:
                 if isinstance(val.type, ir.PointerType): val_arg = self.builder.bitcast(val, voidptr_ty)
                 else: val_arg = val
@@ -1952,6 +1974,43 @@ class CodeGen:
             if path_ptr.type != void_ptr: path_ptr = self.builder.bitcast(path_ptr, void_ptr)
             if mode_ptr.type != void_ptr: mode_ptr = self.builder.bitcast(mode_ptr, void_ptr)
             return self.builder.call(self.fopen, [path_ptr, mode_ptr])
+
+        elif callee_name == "__nexa_assert":
+            # __nexa_assert(condition, message, file, line)
+            cond = self.visit(node.args[0])
+            msg = self.visit(node.args[1])
+            file_arg = self.visit(node.args[2])
+            line_arg = self.visit(node.args[3])
+
+            # Ensure cond is i1
+            if cond.type != ir.IntType(1):
+                cond = self.builder.icmp_signed('!=', cond, ir.Constant(cond.type, 0), name="assert_cond")
+
+            then_bb = self.builder.append_basic_block(name="assert_fail")
+            merge_bb = self.builder.append_basic_block(name="assert_ok")
+            self.builder.cbranch(cond, merge_bb, then_bb)
+
+            # Fail path: print message and exit(1)
+            self.builder.position_at_end(then_bb)
+            voidptr_ty = ir.IntType(8).as_pointer()
+            fmt = self.visit_StringLiteral(None, name="assert_fmt", value_override="ASSERTION FAILED at %s:%d: %s\n\0")
+            fmt_ptr = self.builder.bitcast(fmt, voidptr_ty)
+            if isinstance(file_arg.type, ir.PointerType):
+                file_ptr = self.builder.bitcast(file_arg, voidptr_ty)
+            else:
+                file_ptr = file_arg
+            if isinstance(msg.type, ir.PointerType):
+                msg_ptr = self.builder.bitcast(msg, voidptr_ty)
+            else:
+                msg_ptr = msg
+            if line_arg.type != ir.IntType(32):
+                line_arg = self.builder.trunc(line_arg, ir.IntType(32)) if line_arg.type.width > 32 else self.builder.zext(line_arg, ir.IntType(32))
+            self.builder.call(self.printf, [fmt_ptr, file_ptr, line_arg, msg_ptr])
+            self.builder.call(self.exit_func, [ir.Constant(ir.IntType(32), 1)])
+            self.builder.unreachable()
+
+            self.builder.position_at_end(merge_bb)
+            return None
 
         elif callee_name == "fclose":
             file_ptr = self.visit(node.args[0])

@@ -120,14 +120,20 @@ class Lexer:
                    tokens.append(Token('EQ', '=', start_line, start_col))
                    self.advance()
             elif char == '<':
-                if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '<':
+                   tokens.append(Token('SHL', '<<', start_line, start_col))
+                   self.advance(2)
+                elif self.pos + 1 < self.length and self.source[self.pos+1] == '=':
                    tokens.append(Token('LTE', '<=', start_line, start_col))
                    self.advance(2)
                 else:
                    tokens.append(Token('LT', '<', start_line, start_col))
                    self.advance()
             elif char == '>':
-                if self.pos + 1 < self.length and self.source[self.pos+1] == '=':
+                if self.pos + 1 < self.length and self.source[self.pos+1] == '>':
+                   tokens.append(Token('SHR', '>>', start_line, start_col))
+                   self.advance(2)
+                elif self.pos + 1 < self.length and self.source[self.pos+1] == '=':
                    tokens.append(Token('GTE', '>=', start_line, start_col))
                    self.advance(2)
                 else:
@@ -165,6 +171,12 @@ class Lexer:
             elif char == '|':
                 tokens.append(Token('PIPE', '|', start_line, start_col))
                 self.advance()
+            elif char == '^':
+                tokens.append(Token('CARET', '^', start_line, start_col))
+                self.advance()
+            elif char == '~':
+                tokens.append(Token('TILDE', '~', start_line, start_col))
+                self.advance()
 
             # String Literals
             elif char == '"':
@@ -177,8 +189,12 @@ class Lexer:
                         esc = self.source[self.pos + 1]
                         if esc == 'n':
                             value += '\n'
+                        elif esc == 'r':
+                            value += '\r'
                         elif esc == 't':
                             value += '\t'
+                        elif esc == '0':
+                            value += '\0'
                         elif esc == '\\':
                             value += '\\'
                         elif esc == '"':
