@@ -9,6 +9,8 @@
 #   python3 bootstrap/main.py examples/llama_chat.nxl --emit ll --opt 3
 #   clang artifacts/build/output.ll -o llama_chat -lm -O2 -framework Accelerate
 
+use std::kv_cache_quant::new_cache;
+
 extern "C" {
     fn malloc(size: i32) -> *u8;
     fn free(ptr: *u8);
@@ -523,14 +525,19 @@ fn main() -> i32 {
     let temp_buf: *f32 = alloc_raw(V);
     let probs: *f32 = alloc_raw(V);
 
+    # TurboQuant-compressed context KV store (model-agnostic context compression).
+    let mut tq_kv_ctx = new_cache(D_KV, 3, T);
+
     # ═══ CHAT STATE ═══
     let EOS_ID: i32 = 2;
-    let GEN_LEN: i32 = 300;
-    let TEMP: f32 = 0.7;
-    let TOP_K: i32 = 40;
+    let GEN_LEN: i32 = 220;
+    let TEMP: f32 = 0.2;
+    let TOP_K: i32 = 8;
 
+    let BOS_ID: i32 = 1;
     let ctx: *i32 = cast::<*i32>(malloc(T * 4));
     for i in 0..T { ctx[i] = 0; }
+    ctx[T - 1] = BOS_ID;
     let input_buf: *u8 = malloc(2048);
     let prompt_buf: *u8 = malloc(4096);
     let bpe_buf: *i32 = cast::<*i32>(malloc(4096 * 4));
@@ -689,12 +696,24 @@ fn main() -> i32 {
                     # Stop on EOS token
                     if (next_tok == EOS_ID) { done = 1; }
                     else {
+                        # Push current step KV vectors into TurboQuant context cache.
+                        let k_last = ptr_at(k_buf, (T - 1) * D_KV);
+                        let v_last = ptr_at(v_buf, (T - 1) * D_KV);
+                        tq_kv_ctx.push(k_last, v_last);
+
                         # BPE decode: output bytes
                         let tok_base: i32 = next_tok * max_tok_len;
                         let tok_len: i32 = decode_len[next_tok];
                         for b in 0..tok_len {
                             let byte_val: i32 = cast::<i32>(decode_data[tok_base + b]);
-                            putchar(byte_val);
+                            # Avoid terminal control chars (e.g. ^Z) from raw piece bytes.
+                            if (byte_val == 10) {
+                                putchar(byte_val);
+                            } else {
+                                if (byte_val >= 32 and byte_val <= 126) {
+                                    putchar(byte_val);
+                                }
+                            }
                         }
                         fflush(cast::<*u8>(0));
 
