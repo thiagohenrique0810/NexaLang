@@ -85,6 +85,50 @@ def _clang():
     return "clang"  # Fallback — will fail with a clear error
 
 
+def _uses_turboquant(ll_path: str) -> bool:
+    """Return True if generated LLVM IR references TurboQuant runtime symbols."""
+    if not os.path.exists(ll_path):
+        return False
+    try:
+        with open(ll_path, "r", encoding="utf-8", errors="ignore") as f:
+            ir_text = f.read()
+        return (
+            "tq_create" in ir_text
+            or "tq_quantize" in ir_text
+            or "tq_dequantize" in ir_text
+            or "tq_mse" in ir_text
+            or "tq_destroy" in ir_text
+        )
+    except OSError:
+        return False
+
+
+def _turboquant_link_args() -> list[str]:
+    """Return linker flags for TurboQuant, preferring static linking when available."""
+    runtime_dir = os.path.join(REPO_ROOT, "runtime")
+    static_lib = os.path.join(runtime_dir, "libturboquant.a")
+    dyn_lib = os.path.join(runtime_dir, "libturboquant.dylib")
+
+    if os.path.exists(static_lib):
+        args = [static_lib]
+    elif os.path.exists(dyn_lib):
+        args = ["-L", runtime_dir, "-lturboquant"]
+    else:
+        args = ["-L", runtime_dir, "-lturboquant"]
+
+    # TurboQuant uses math + pthread APIs.
+    if platform.system() != "Windows":
+        args.extend(["-lm", "-lpthread"])
+    return args
+
+
+def _native_link_cmd(ll_out: str, exe_out: str, opt: str) -> list[str]:
+    cmd = [_clang(), ll_out, f"-{opt}", "-o", exe_out]
+    if _uses_turboquant(ll_out):
+        cmd.extend(_turboquant_link_args())
+    return cmd
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     _ensure_dir(DEV_ARTIFACTS)
     
@@ -108,7 +152,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             return rc
         # Link
         if not args.no_link:
-            return _run([_clang(), ll_out, f"-{args.opt}", "-o", out])
+            return _run(_native_link_cmd(ll_out, out, args.opt))
         return 0
 
     # SPIR-V
@@ -185,7 +229,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     rc = _run(cmd)
     if rc != 0:
         return rc
-    rc = _run([_clang(), ll_out, f"-{getattr(args, 'opt', 'O0')}", "-o", exe])
+    rc = _run(_native_link_cmd(ll_out, exe, getattr(args, "opt", "O0")))
     if rc != 0:
         return rc
     return _run([exe])
@@ -217,7 +261,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     if rc != 0: return rc
     
     # Link
-    rc = _run([_clang(), ll_out, f"-{getattr(args, 'opt', 'O0')}", "-o", exe_out])
+    rc = _run(_native_link_cmd(ll_out, exe_out, getattr(args, "opt", "O0")))
     if rc != 0: return rc
     
     # Run
