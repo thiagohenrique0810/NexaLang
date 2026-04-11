@@ -20,8 +20,35 @@ extern "C" {
     fn tq_mse(ctx: *u8, original: *f32, n_vectors: i32) -> f32;
     fn tq_upper_bound(ctx: *u8) -> f32;
     fn tq_lower_bound(ctx: *u8) -> f32;
+    fn tq_quantize_prod(ctx: *u8, input: *f32, out_idx: *u8, out_qjl: *u8, out_gamma: *f32, n_vectors: i32) -> i32;
+    fn tq_dequantize_prod(ctx: *u8, in_idx: *u8, in_qjl: *u8, in_gamma: *f32, output: *f32, n_vectors: i32) -> i32;
     fn malloc(size: i32) -> *u8;
     fn free(ptr: *u8);
+}
+
+# ── TurboQuantProd payload (MSE base + 1-bit residual sketch) ───────────
+
+pub struct QuantizedProd {
+    idx: *u8,
+    qjl: *u8,
+    gamma: *f32,
+    n_vectors: i32,
+    dim: i32,
+    bits: i32
+}
+
+impl QuantizedProd {
+    fn drop(self) {
+        if (cast::<i64>(self.idx) != 0) {
+            free(self.idx);
+        }
+        if (cast::<i64>(self.qjl) != 0) {
+            free(self.qjl);
+        }
+        if (cast::<i64>(self.gamma) != 0) {
+            free(cast::<*u8>(self.gamma));
+        }
+    }
 }
 
 # ── Quantizer ──────────────────────────────────────────────────────────────
@@ -88,6 +115,49 @@ impl Quantizer {
     # Original size in bytes (f32 per coordinate).
     fn original_size(&self, n_vectors: i32) -> i32 {
         return n_vectors * self.dim * 4;
+    }
+
+    # Size (bytes) of TurboQuantProd packed base indices at (bits-1) bpc.
+    fn prod_idx_size(&self, n_vectors: i32) -> i32 {
+        if (self.bits <= 1) {
+            return 0;
+        }
+        let total_bits = n_vectors * self.dim * (self.bits - 1);
+        return (total_bits + 7) / 8;
+    }
+
+    # Size (bytes) of TurboQuantProd 1-bit QJL payload.
+    fn prod_qjl_size(&self, n_vectors: i32) -> i32 {
+        let total_bits = n_vectors * self.dim;
+        return (total_bits + 7) / 8;
+    }
+
+    # Quantize with TurboQuantProd (inner-product oriented).
+    # Requires bits >= 2.
+    fn quantize_prod(&self, input: *f32, out_idx: *u8, out_qjl: *u8, out_gamma: *f32, n_vectors: i32) {
+        let rc = tq_quantize_prod(self.handle, input, out_idx, out_qjl, out_gamma, n_vectors);
+        if (rc != 0) {
+            return;
+        }
+    }
+
+    # Dequantize TurboQuantProd payload.
+    fn dequantize_prod(&self, in_idx: *u8, in_qjl: *u8, in_gamma: *f32, output: *f32, n_vectors: i32) {
+        let rc = tq_dequantize_prod(self.handle, in_idx, in_qjl, in_gamma, output, n_vectors);
+        if (rc != 0) {
+            return;
+        }
+    }
+
+    # Allocate payload buffers and quantize using TurboQuantProd.
+    fn quantize_prod_alloc(&self, input: *f32, n_vectors: i32) -> QuantizedProd {
+        let idx_size = self.prod_idx_size(n_vectors);
+        let qjl_size = self.prod_qjl_size(n_vectors);
+        let gamma = cast::<*f32>(malloc(n_vectors * 4));
+        let idx = malloc(idx_size);
+        let qjl = malloc(qjl_size);
+        self.quantize_prod(input, idx, qjl, gamma, n_vectors);
+        return QuantizedProd(idx, qjl, gamma, n_vectors, self.dim, self.bits);
     }
 
     fn drop(self) {
@@ -167,6 +237,25 @@ pub fn quick_decompress(indices: *u8, dim: i32, n_vectors: i32, bits: i32) -> *f
     let out_size = n_vectors * dim * 4;
     let out = cast::<*f32>(malloc(out_size));
     q.dequantize(indices, out, n_vectors);
+    q.drop();
+    return out;
+}
+
+# Quick TurboQuantProd quantize: returns allocated payload.
+pub fn quick_quantize_prod(data: *f32, dim: i32, n_vectors: i32, bits: i32) -> QuantizedProd {
+    let q = Quantizer::new(dim, bits);
+    let payload = q.quantize_prod_alloc(data, n_vectors);
+    q.drop();
+    return payload;
+}
+
+# Quick TurboQuantProd dequantize from payload.
+# Caller must free the returned pointer.
+pub fn quick_dequantize_prod(payload: QuantizedProd) -> *f32 {
+    let q = Quantizer::new(payload.dim, payload.bits);
+    let out_size = payload.n_vectors * payload.dim * 4;
+    let out = cast::<*f32>(malloc(out_size));
+    q.dequantize_prod(payload.idx, payload.qjl, payload.gamma, out, payload.n_vectors);
     q.drop();
     return out;
 }
