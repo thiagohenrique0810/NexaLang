@@ -35,7 +35,7 @@ fn main() -> i32 {
     let q = Quantizer::new(dim, bits);
 
     let input = cast::<*f32>(malloc(dim * 4));
-    let compressed = malloc(dim * 2);  # u16 per coordinate
+    let compressed = malloc(q.compressed_size(1));
     let output = cast::<*f32>(malloc(dim * 4));
 
     fill_test_vector(input, dim, 0.01);

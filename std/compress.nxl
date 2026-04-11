@@ -15,8 +15,8 @@
 extern "C" {
     fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
     fn tq_destroy(ctx: *u8);
-    fn tq_quantize(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
-    fn tq_dequantize(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
+    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
     fn tq_mse(ctx: *u8, original: *f32, n_vectors: i32) -> f32;
     fn tq_upper_bound(ctx: *u8) -> f32;
     fn tq_lower_bound(ctx: *u8) -> f32;
@@ -49,18 +49,18 @@ impl Quantizer {
         return Quantizer(h, dim, bits);
     }
 
-    # Quantize n_vectors of f32[dim] into compressed u16[dim] indices.
+    # Quantize n_vectors of f32[dim] into packed bitstream indices.
     # Input buffer:  f32 array of size n_vectors * dim
-    # Output buffer: u16 array of size n_vectors * dim (caller-allocated)
+    # Output buffer: packed bitstream of size compressed_size(n_vectors)
     fn quantize(&self, input: *f32, output: *u8, n_vectors: i32) {
-        tq_quantize(self.handle, input, output, n_vectors);
+        tq_quantize_packed(self.handle, input, output, n_vectors);
     }
 
-    # Dequantize compressed indices back to approximate f32 vectors.
-    # Input buffer:  u16 array of size n_vectors * dim
+    # Dequantize compressed bitstream back to approximate f32 vectors.
+    # Input buffer: packed bitstream of size compressed_size(n_vectors)
     # Output buffer: f32 array of size n_vectors * dim (caller-allocated)
     fn dequantize(&self, input: *u8, output: *f32, n_vectors: i32) {
-        tq_dequantize(self.handle, input, output, n_vectors);
+        tq_dequantize_packed(self.handle, input, output, n_vectors);
     }
 
     # Compute mean squared error between originals and round-trip reconstruction.
@@ -78,10 +78,11 @@ impl Quantizer {
         return tq_lower_bound(self.handle);
     }
 
-    # How many bytes needed for compressed output of n_vectors.
-    # Each coordinate is stored as u16 (2 bytes), so total = n * dim * 2.
+    # How many bytes needed for compressed output of n_vectors
+    # at 'bits' bits per coordinate.
     fn compressed_size(&self, n_vectors: i32) -> i32 {
-        return n_vectors * self.dim * 2;
+        let total_bits = n_vectors * self.dim * self.bits;
+        return (total_bits + 7) / 8;
     }
 
     # Original size in bytes (f32 per coordinate).
@@ -110,7 +111,8 @@ impl CompressedBuffer {
     # Create a compressed buffer for vectors of given dimension.
     fn new(dim: i32, bits: i32, capacity: i32) -> CompressedBuffer {
         let q = Quantizer::new(dim, bits);
-        let buf_size = capacity * dim * 2;  # u16 per coordinate
+        let total_bits = capacity * dim * bits;
+        let buf_size = (total_bits + 7) / 8;
         let buf = malloc(buf_size);
         return CompressedBuffer(q, buf, 0, capacity);
     }
@@ -120,7 +122,7 @@ impl CompressedBuffer {
         if (self.n_vectors >= self.capacity) {
             return;
         }
-        let offset = self.n_vectors * self.quant.dim * 2;
+        let offset = self.quant.compressed_size(self.n_vectors);
         let dst = cast::<*u8>(cast::<i64>(self.data) + cast::<i64>(offset));
         self.quant.quantize(vector, dst, 1);
         self.n_vectors = self.n_vectors + 1;
@@ -128,7 +130,7 @@ impl CompressedBuffer {
 
     # Decompress a single vector at the given index.
     fn get(&self, index: i32, output: *f32) {
-        let offset = index * self.quant.dim * 2;
+        let offset = self.quant.compressed_size(index);
         let src = cast::<*u8>(cast::<i64>(self.data) + cast::<i64>(offset));
         self.quant.dequantize(src, output, 1);
     }
@@ -151,7 +153,7 @@ impl CompressedBuffer {
 # Caller must free the returned pointer.
 pub fn quick_compress(data: *f32, dim: i32, n_vectors: i32, bits: i32) -> *u8 {
     let q = Quantizer::new(dim, bits);
-    let out_size = n_vectors * dim * 2;
+    let out_size = q.compressed_size(n_vectors);
     let out = malloc(out_size);
     q.quantize(data, out, n_vectors);
     q.drop();

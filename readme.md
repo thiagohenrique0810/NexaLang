@@ -56,6 +56,7 @@ q.drop();
 ```
 
 The runtime library (`runtime/libturboquant`) is data-oblivious — no calibration data or codebook training required.
+Compressed buffers are bit-packed (1-4 bits per coordinate) in `std::compress`, and dimensions should be powers of 2 for the current SRHT path.
 
 ---
 

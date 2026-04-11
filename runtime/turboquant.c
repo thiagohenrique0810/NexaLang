@@ -1,11 +1,11 @@
 /*
  * turboquant.c — NexaLang C runtime for TurboQuant vector compression.
  *
- * Pure C implementation of the TurboQuant MSE algorithm:
- *   1. Generate random Haar-distributed orthogonal rotation matrix (QR)
+ * Pure C implementation of TurboQuant-style MSE quantization:
+ *   1. Randomized orthogonal transform (SRHT)
  *   2. Precompute Lloyd-Max codebook for Gaussian(0, 1/sqrt(d))
- *   3. Rotate → scalar quantize each coordinate → indices
- *   4. Lookup centroids → inverse rotate → reconstruct
+ *   3. Transform -> scalar quantize each coordinate -> indices
+ *   4. Lookup centroids -> inverse transform -> reconstruct
  *
  * Reference: Zandieh, Daliri, Hadian, Mirrokni — arXiv 2504.19874, 2025.
  */
@@ -83,6 +83,12 @@ struct tq_ctx {
     float* boundaries;  /* n_levels-1 decision boundaries (midpoints) */
     float* buf;         /* scratch buffer, dim floats */
     int log2_dim;       /* log2(dim) for Hadamard stages */
+
+    /* TurboQuantProd support: (bits-1)-bit MSE base + 1-bit QJL residual */
+    int n_levels_prod;
+    float* centroids_prod;
+    float* boundaries_prod;
+    float* qjl_proj;    /* d x d Gaussian projection matrix, row-major */
 };
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -174,6 +180,35 @@ static int tq_log2i(int n) {
     return r;
 }
 
+static int tq_is_pow2(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+static size_t tq_bits_packed_size(int total_coords, int bits_per_coord) {
+    if (total_coords <= 0 || bits_per_coord <= 0) return 0;
+    return ((size_t)total_coords * (size_t)bits_per_coord + 7u) >> 3;
+}
+
+static inline void tq_pack_value(uint8_t* dst, size_t bit_pos, int bits, uint32_t val) {
+    size_t byte = bit_pos >> 3;
+    int shift = (int)(bit_pos & 7u);
+    uint32_t v = val & ((1u << bits) - 1u);
+    dst[byte] |= (uint8_t)(v << shift);
+    if (shift + bits > 8) {
+        dst[byte + 1] |= (uint8_t)(v >> (8 - shift));
+    }
+}
+
+static inline uint32_t tq_unpack_value(const uint8_t* src, size_t bit_pos, int bits) {
+    size_t byte = bit_pos >> 3;
+    int shift = (int)(bit_pos & 7u);
+    uint32_t v = (uint32_t)src[byte] >> shift;
+    if (shift + bits > 8) {
+        v |= (uint32_t)src[byte + 1] << (8 - shift);
+    }
+    return v & ((1u << bits) - 1u);
+}
+
 /* In-place unnormalized Walsh-Hadamard transform.  d must be power of 2. */
 static void fwht_inplace(float* x, int d) {
     for (int half = 1; half < d; half <<= 1) {
@@ -220,6 +255,7 @@ static void fwht_inplace_neon(float* x, int d) {
 
 /* Apply random sign flip + FWHT + normalize = randomized Hadamard rotation */
 static void srht_forward(const float* restrict signs, float* restrict buf, int d, int log2d) {
+    (void)log2d;
     /* Step 1: multiply by random diagonal D (±1) */
     #if TQ_HAS_NEON
     for (int i = 0; i + 4 <= d; i += 4) {
@@ -249,6 +285,7 @@ static void srht_forward(const float* restrict signs, float* restrict buf, int d
 
 /* Inverse = same operation (Hadamard is self-inverse, D² = I) */
 static void srht_inverse(const float* restrict signs, float* restrict buf, int d, int log2d) {
+    (void)log2d;
     float inv_sqrt_d = 1.0f / sqrtf((float)d);
     #if TQ_HAS_NEON
     float32x4_t norm = vdupq_n_f32(inv_sqrt_d);
@@ -278,7 +315,11 @@ static void srht_inverse(const float* restrict signs, float* restrict buf, int d
 /* ──────────────────────────────────────────────────────────────────────── */
 
 tq_ctx* tq_create(int dim, int bits, int seed) {
+    if (!tq_is_pow2(dim)) return NULL;
+    if (bits < 1 || bits > 8) return NULL;
+
     tq_ctx* ctx = (tq_ctx*)calloc(1, sizeof(tq_ctx));
+    if (!ctx) return NULL;
     ctx->dim = dim;
     ctx->bits = bits;
     ctx->n_levels = 1 << bits;
@@ -286,6 +327,7 @@ tq_ctx* tq_create(int dim, int bits, int seed) {
 
     /* Random sign vector for SRHT */
     ctx->signs = (float*)malloc(dim * sizeof(float));
+    if (!ctx->signs) { tq_destroy(ctx); return NULL; }
     tq_rng rng;
     tq_rng_seed(&rng, (uint64_t)seed);
     for (int i = 0; i < dim; i++) {
@@ -294,15 +336,37 @@ tq_ctx* tq_create(int dim, int bits, int seed) {
 
     /* Lloyd-Max codebook */
     ctx->centroids = (float*)malloc(ctx->n_levels * sizeof(float));
+    if (!ctx->centroids) { tq_destroy(ctx); return NULL; }
     lloyd_max(dim, bits, ctx->centroids);
 
     /* Pre-compute decision boundaries (midpoints between centroids) */
     ctx->boundaries = (float*)malloc((ctx->n_levels - 1) * sizeof(float));
+    if (!ctx->boundaries) { tq_destroy(ctx); return NULL; }
     for (int i = 0; i < ctx->n_levels - 1; i++) {
         ctx->boundaries[i] = 0.5f * (ctx->centroids[i] + ctx->centroids[i + 1]);
     }
 
     ctx->buf = (float*)malloc(dim * sizeof(float));
+    if (!ctx->buf) { tq_destroy(ctx); return NULL; }
+
+    if (bits >= 2) {
+        int bits_prod = bits - 1;
+        ctx->n_levels_prod = 1 << bits_prod;
+        ctx->centroids_prod = (float*)malloc(ctx->n_levels_prod * sizeof(float));
+        ctx->boundaries_prod = (float*)malloc((ctx->n_levels_prod - 1) * sizeof(float));
+        if (!ctx->centroids_prod || !ctx->boundaries_prod) { tq_destroy(ctx); return NULL; }
+        lloyd_max(dim, bits_prod, ctx->centroids_prod);
+        for (int i = 0; i < ctx->n_levels_prod - 1; i++) {
+            ctx->boundaries_prod[i] = 0.5f * (ctx->centroids_prod[i] + ctx->centroids_prod[i + 1]);
+        }
+    }
+
+    ctx->qjl_proj = (float*)malloc((size_t)dim * (size_t)dim * sizeof(float));
+    if (!ctx->qjl_proj) { tq_destroy(ctx); return NULL; }
+    for (int i = 0; i < dim * dim; i++) {
+        ctx->qjl_proj[i] = tq_randn(&rng);
+    }
+
     return ctx;
 }
 
@@ -312,6 +376,9 @@ void tq_destroy(tq_ctx* ctx) {
     free(ctx->centroids);
     free(ctx->boundaries);
     free(ctx->buf);
+    free(ctx->centroids_prod);
+    free(ctx->boundaries_prod);
+    free(ctx->qjl_proj);
     free(ctx);
 }
 
@@ -418,6 +485,165 @@ float tq_upper_bound(tq_ctx* ctx) {
 float tq_lower_bound(tq_ctx* ctx) {
     /* Theorem 3: no quantizer can do better than 4^{-b} */
     return powf(4.0f, -(float)ctx->bits);
+}
+
+size_t tq_packed_size(const tq_ctx* ctx, int n_vectors) {
+    if (!ctx || n_vectors <= 0) return 0;
+    return tq_bits_packed_size(n_vectors * ctx->dim, ctx->bits);
+}
+
+void tq_quantize_packed(tq_ctx* ctx, const float* in, uint8_t* out, int n_vectors) {
+    if (!ctx || !in || !out || n_vectors <= 0) return;
+    const int total = n_vectors * ctx->dim;
+    size_t out_sz = tq_packed_size(ctx, n_vectors);
+    memset(out, 0, out_sz);
+
+    uint16_t* idx = (uint16_t*)malloc((size_t)total * sizeof(uint16_t));
+    if (!idx) return;
+
+    tq_quantize(ctx, in, idx, n_vectors);
+    for (int i = 0; i < total; i++) {
+        tq_pack_value(out, (size_t)i * (size_t)ctx->bits, ctx->bits, (uint32_t)idx[i]);
+    }
+    free(idx);
+}
+
+void tq_dequantize_packed(tq_ctx* ctx, const uint8_t* in, float* out, int n_vectors) {
+    if (!ctx || !in || !out || n_vectors <= 0) return;
+    const int total = n_vectors * ctx->dim;
+    uint16_t* idx = (uint16_t*)malloc((size_t)total * sizeof(uint16_t));
+    if (!idx) return;
+
+    for (int i = 0; i < total; i++) {
+        idx[i] = (uint16_t)tq_unpack_value(in, (size_t)i * (size_t)ctx->bits, ctx->bits);
+    }
+    tq_dequantize(ctx, idx, out, n_vectors);
+    free(idx);
+}
+
+size_t tq_prod_idx_packed_size(const tq_ctx* ctx, int n_vectors) {
+    if (!ctx || n_vectors <= 0 || ctx->bits < 2) return 0;
+    return tq_bits_packed_size(n_vectors * ctx->dim, ctx->bits - 1);
+}
+
+size_t tq_prod_qjl_packed_size(const tq_ctx* ctx, int n_vectors) {
+    if (!ctx || n_vectors <= 0) return 0;
+    return tq_bits_packed_size(n_vectors * ctx->dim, 1);
+}
+
+int tq_quantize_prod(
+    tq_ctx* ctx,
+    const float* in,
+    uint8_t* out_idx_packed,
+    uint8_t* out_qjl_packed,
+    float* out_gamma,
+    int n_vectors
+) {
+    if (!ctx || !in || !out_idx_packed || !out_qjl_packed || !out_gamma || n_vectors <= 0) return -1;
+    if (ctx->bits < 2 || !ctx->centroids_prod || !ctx->boundaries_prod || !ctx->qjl_proj) return -2;
+
+    const int d = ctx->dim;
+    const int nb = ctx->n_levels_prod - 1;
+    const int bidx = ctx->bits - 1;
+    const int log2d = ctx->log2_dim;
+
+    memset(out_idx_packed, 0, tq_prod_idx_packed_size(ctx, n_vectors));
+    memset(out_qjl_packed, 0, tq_prod_qjl_packed_size(ctx, n_vectors));
+
+    float* rot = (float*)malloc((size_t)d * sizeof(float));
+    float* xhat = (float*)malloc((size_t)d * sizeof(float));
+    float* res = (float*)malloc((size_t)d * sizeof(float));
+    if (!rot || !xhat || !res) {
+        free(rot); free(xhat); free(res);
+        return -3;
+    }
+
+    for (int v = 0; v < n_vectors; v++) {
+        const float* x = in + (size_t)v * (size_t)d;
+
+        memcpy(rot, x, (size_t)d * sizeof(float));
+        srht_forward(ctx->signs, rot, d, log2d);
+
+        for (int j = 0; j < d; j++) {
+            float val = rot[j];
+            int level = 0;
+            for (int b = 0; b < nb; b++) level += (val > ctx->boundaries_prod[b]);
+            tq_pack_value(out_idx_packed, ((size_t)v * (size_t)d + (size_t)j) * (size_t)bidx, bidx, (uint32_t)level);
+            xhat[j] = ctx->centroids_prod[level];
+        }
+
+        srht_inverse(ctx->signs, xhat, d, log2d);
+
+        float gamma_sq = 0.0f;
+        for (int j = 0; j < d; j++) {
+            float r = x[j] - xhat[j];
+            res[j] = r;
+            gamma_sq += r * r;
+        }
+        float gamma = sqrtf(gamma_sq);
+        out_gamma[v] = gamma;
+
+        for (int i = 0; i < d; i++) {
+            const float* row = ctx->qjl_proj + (size_t)i * (size_t)d;
+            float dot = 0.0f;
+            for (int j = 0; j < d; j++) dot += row[j] * res[j];
+            uint32_t bit = (dot >= 0.0f) ? 1u : 0u;
+            tq_pack_value(out_qjl_packed, (size_t)v * (size_t)d + (size_t)i, 1, bit);
+        }
+    }
+
+    free(rot); free(xhat); free(res);
+    return 0;
+}
+
+int tq_dequantize_prod(
+    tq_ctx* ctx,
+    const uint8_t* in_idx_packed,
+    const uint8_t* in_qjl_packed,
+    const float* in_gamma,
+    float* out,
+    int n_vectors
+) {
+    if (!ctx || !in_idx_packed || !in_qjl_packed || !in_gamma || !out || n_vectors <= 0) return -1;
+    if (ctx->bits < 2 || !ctx->centroids_prod || !ctx->qjl_proj) return -2;
+
+    const int d = ctx->dim;
+    const int bidx = ctx->bits - 1;
+    const int log2d = ctx->log2_dim;
+    const float qjl_scale = (float)M_PI / (2.0f * (float)d);
+
+    float* xhat = (float*)malloc((size_t)d * sizeof(float));
+    float* z = (float*)malloc((size_t)d * sizeof(float));
+    if (!xhat || !z) {
+        free(xhat); free(z);
+        return -3;
+    }
+
+    for (int v = 0; v < n_vectors; v++) {
+        for (int j = 0; j < d; j++) {
+            uint32_t level = tq_unpack_value(in_idx_packed, ((size_t)v * (size_t)d + (size_t)j) * (size_t)bidx, bidx);
+            xhat[j] = ctx->centroids_prod[level];
+        }
+        srht_inverse(ctx->signs, xhat, d, log2d);
+
+        for (int i = 0; i < d; i++) {
+            uint32_t bit = tq_unpack_value(in_qjl_packed, (size_t)v * (size_t)d + (size_t)i, 1);
+            z[i] = bit ? 1.0f : -1.0f;
+        }
+
+        float* out_v = out + (size_t)v * (size_t)d;
+        for (int j = 0; j < d; j++) {
+            float stz = 0.0f;
+            for (int i = 0; i < d; i++) {
+                stz += ctx->qjl_proj[(size_t)i * (size_t)d + (size_t)j] * z[i];
+            }
+            float corr = in_gamma[v] * qjl_scale * stz;
+            out_v[j] = xhat[j] + corr;
+        }
+    }
+
+    free(xhat); free(z);
+    return 0;
 }
 
 /* ──────────────────────────────────────────────────────────────────────── */
