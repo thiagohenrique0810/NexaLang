@@ -1,0 +1,53 @@
+# kv_cache_quant_test.nxl — Generic quantized KV cache usage example
+
+use std::kv_cache_quant::new_cache;
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+}
+
+fn fill_vec(buf: *f32, dim: i32, base: f32) {
+    for i in 0..dim {
+        buf[i] = base + cast::<f32>(i) * 0.01;
+    }
+}
+
+fn main() -> i32 {
+    let dim: i32 = 64;
+    let bits: i32 = 3;
+    let max_tokens: i32 = 128;
+
+    let mut cache = new_cache(dim, bits, max_tokens);
+
+    let k = cast::<*f32>(malloc(dim * 4));
+    let v = cast::<*f32>(malloc(dim * 4));
+    let out_k = cast::<*f32>(malloc(dim * 4));
+    let out_v = cast::<*f32>(malloc(dim * 4));
+
+    for t in 0..10 {
+        fill_vec(k, dim, cast::<f32>(t));
+        fill_vec(v, dim, cast::<f32>(t) * 2.0);
+        cache.push(k, v);
+    }
+
+    cache.get_kv(5, out_k, out_v);
+
+    print("KV cache len:");
+    print(cache.len());
+    print("K[0] token 5:");
+    print(out_k[0]);
+    print("V[0] token 5:");
+    print(out_v[0]);
+
+    print("Quantized total bytes:");
+    print(cache.quantized_bytes_total());
+    print("FP32 total bytes:");
+    print(cache.fp32_bytes_total());
+
+    free(cast::<*u8>(k));
+    free(cast::<*u8>(v));
+    free(cast::<*u8>(out_k));
+    free(cast::<*u8>(out_v));
+    return 0;
+}

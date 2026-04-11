@@ -1,0 +1,138 @@
+# std/kv_cache_quant.nxl — Generic quantized KV cache for local LLM inference
+#
+# This module is model-agnostic and can be used by any LLM implementation
+# that represents each key/value token as a contiguous f32 vector.
+#
+# Requirements:
+#   - dim should be power-of-two for current TurboQuant SRHT runtime path
+#   - bits in [2..4] recommended for KV usage
+
+extern "C" {
+    fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
+    fn tq_destroy(ctx: *u8);
+    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
+    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+}
+
+pub struct QuantizedKVCache {
+    qk: *u8,
+    qv: *u8,
+    dim: i32,
+    bits: i32,
+    max_tokens: i32,
+    len_tokens: i32,
+    k_buf: *u8,
+    v_buf: *u8,
+    bytes_per_token: i32
+}
+
+impl QuantizedKVCache {
+    fn new(dim: i32, bits: i32, max_tokens: i32) -> QuantizedKVCache {
+        let qk = tq_create(dim, bits, 42);
+        let qv = tq_create(dim, bits, 42);
+        let total_bits = dim * bits;
+        let per_token = (total_bits + 7) / 8;
+        let total_size = per_token * max_tokens;
+        let k = malloc(total_size);
+        let v = malloc(total_size);
+        return QuantizedKVCache(qk, qv, dim, bits, max_tokens, 0, k, v, per_token);
+    }
+
+    fn len(&self) -> i32 {
+        return self.len_tokens;
+    }
+
+    fn capacity(&self) -> i32 {
+        return self.max_tokens;
+    }
+
+    fn bytes_per_entry(&self) -> i32 {
+        return self.bytes_per_token;
+    }
+
+    fn quantized_bytes_total(&self) -> i32 {
+        return self.max_tokens * self.bytes_per_token * 2;
+    }
+
+    fn fp32_bytes_total(&self) -> i32 {
+        return self.max_tokens * self.dim * 4 * 2;
+    }
+
+    # Push one token's K and V vectors (shape: [dim]).
+    # Returns 1 on success, 0 if cache is full.
+    fn push(&mut self, k_in: *f32, v_in: *f32) -> i32 {
+        if (self.len_tokens >= self.max_tokens) {
+            return 0;
+        }
+        let offset = self.len_tokens * self.bytes_per_token;
+        let k_dst = cast::<*u8>(cast::<i64>(self.k_buf) + cast::<i64>(offset));
+        let v_dst = cast::<*u8>(cast::<i64>(self.v_buf) + cast::<i64>(offset));
+
+        tq_quantize_packed(self.qk, k_in, k_dst, 1);
+        tq_quantize_packed(self.qv, v_in, v_dst, 1);
+
+        self.len_tokens = self.len_tokens + 1;
+        return 1;
+    }
+
+    # Dequantize key at token index into out_k[dim].
+    fn get_k(&self, index: i32, out_k: *f32) {
+        if (index < 0) {
+            return;
+        }
+        if (index >= self.len_tokens) {
+            return;
+        }
+        let offset = index * self.bytes_per_token;
+        let src = cast::<*u8>(cast::<i64>(self.k_buf) + cast::<i64>(offset));
+        tq_dequantize_packed(self.qk, src, out_k, 1);
+    }
+
+    # Dequantize value at token index into out_v[dim].
+    fn get_v(&self, index: i32, out_v: *f32) {
+        if (index < 0) {
+            return;
+        }
+        if (index >= self.len_tokens) {
+            return;
+        }
+        let offset = index * self.bytes_per_token;
+        let src = cast::<*u8>(cast::<i64>(self.v_buf) + cast::<i64>(offset));
+        tq_dequantize_packed(self.qv, src, out_v, 1);
+    }
+
+    # Dequantize both K and V at token index.
+    fn get_kv(&self, index: i32, out_k: *f32, out_v: *f32) {
+        self.get_k(index, out_k);
+        self.get_v(index, out_v);
+    }
+
+    fn drop(self) {
+        if (cast::<i64>(self.k_buf) != 0) {
+            free(self.k_buf);
+        }
+        if (cast::<i64>(self.v_buf) != 0) {
+            free(self.v_buf);
+        }
+        if (cast::<i64>(self.qk) != 0) {
+            tq_destroy(self.qk);
+        }
+        if (cast::<i64>(self.qv) != 0) {
+            tq_destroy(self.qv);
+        }
+    }
+}
+
+# Module-level constructor for broader compiler compatibility.
+pub fn new_cache(dim: i32, bits: i32, max_tokens: i32) -> QuantizedKVCache {
+    let qk = tq_create(dim, bits, 42);
+    let qv = tq_create(dim, bits, 42);
+    let total_bits = dim * bits;
+    let per_token = (total_bits + 7) / 8;
+    let total_size = per_token * max_tokens;
+    let k = malloc(total_size);
+    let v = malloc(total_size);
+    return QuantizedKVCache(qk, qv, dim, bits, max_tokens, 0, k, v, per_token);
+}

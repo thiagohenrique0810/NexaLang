@@ -369,6 +369,12 @@ class CodeGen:
     def get_llvm_type(self, type_name):
         # Debug trace
         # print(f"DEBUG GET_LLVM_TYPE: {type_name} generics={self._current_generics}", flush=True)
+        if isinstance(type_name, str):
+            if type_name.startswith('mut '):
+                type_name = type_name[4:]
+            elif type_name.startswith('mut') and len(type_name) > 3 and type_name[3] != '<':
+                type_name = type_name[3:]
+
         if type_name == 'i32':
             return ir.IntType(32)
         elif type_name == 'bool':
@@ -394,6 +400,8 @@ class CodeGen:
             inner = type_name[1:]
             if inner.startswith("mut "):
                 inner = inner[4:]
+            elif inner.startswith("mut") and len(inner) > 3 and inner[3] != '<':
+                inner = inner[3:]
             return self.get_llvm_type(inner).as_pointer()
         elif type_name.endswith('*'):
             inner_type = type_name[:-1]

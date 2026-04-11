@@ -18,3 +18,4 @@ pub mod env;
 pub mod crypto;
 pub mod regex;
 pub mod http;
+pub mod kv_cache_quant;
