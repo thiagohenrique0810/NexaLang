@@ -2,7 +2,7 @@
 # Compile with self-hosted compiler, then link with libturboquant:
 #   nxc build examples/turboquant_ffi.nxl   (uses bootstrap)
 #   -- or after self-hosted compile --
-#   clang dev/artifacts/output.ll -Lruntime -lturboquant -lm -o tq_test
+#   clang artifacts/build/output.ll -Lruntime -lturboquant -lm -o tq_test
 
 extern "C" {
     fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;

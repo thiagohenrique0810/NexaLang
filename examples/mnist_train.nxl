@@ -1,0 +1,502 @@
+# mnist_train.nxl — Train MLP on MNIST (60k images, 10 classes)
+#
+# Architecture: Input(784) → Linear(784,128) → ReLU → Linear(128,10) → Softmax → CE Loss
+# Data: pre-converted flat binary (data/mnist/*.bin)
+# Matrix multiply: Apple Accelerate BLAS (cblas_sgemm)
+# Backward: manual chain rule
+#
+# Expected: >95% accuracy in <10 epochs
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn printf(fmt: *u8, ...) -> i32;
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32,
+                   m: i32, n: i32, k: i32,
+                   alpha: f32, A: *f32, lda: i32,
+                   B: *f32, ldb: i32,
+                   beta: f32, C: *f32, ldc: i32);
+    fn gettimeofday(tv: *u8, tz: *u8) -> i32;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fclose(stream: *u8) -> i32;
+    fn sqrtf(x: f32) -> f32;
+    fn expf(x: f32) -> f32;
+    fn logf(x: f32) -> f32;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+fn alloc_f32(n: i32) -> *f32 {
+    let buf: *f32 = cast::<*f32>(malloc(n * 4));
+    for i in 0..n {
+        buf[i] = 0.0;
+    }
+    return buf;
+}
+
+fn alloc_u8(n: i32) -> *u8 {
+    return malloc(n);
+}
+
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+fn rand_init(data: *f32, n: i32, scale: f32, seed: i32) -> i32 {
+    let mut state: i32 = seed;
+    for i in 0..n {
+        state = xorshift32(state);
+        data[i] = (cast::<f32>(state & 2147483647) / cast::<f32>(2147483647) * 2.0 - 1.0) * scale;
+    }
+    return state;
+}
+
+struct Timer {
+    secs: i64,
+    usecs: i32
+}
+
+fn timer_now() -> Timer {
+    let tv: *u8 = malloc(16);
+    gettimeofday(tv, cast::<*u8>(0));
+    let secs: i64 = *cast::<*i64>(tv);
+    let usecs: i32 = *cast::<*i32>(cast::<*u8>(cast::<i64>(tv) + cast::<i64>(8)));
+    free(tv);
+    return Timer(secs, usecs);
+}
+
+fn elapsed_ms(t1: Timer, t0: Timer) -> i32 {
+    let ds: i32 = cast::<i32>(t1.secs - t0.secs);
+    let du: i32 = t1.usecs - t0.usecs;
+    return ds * 1000 + du / 1000;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Data loader — flat binary format
+# Images: [n:i32][pixels:i32][data: n*pixels * f32]
+# Labels: [n:i32][data: n * u8]
+# ═══════════════════════════════════════════════════════════════════════
+
+fn load_images(path: *u8, out_n: *i32, out_dim: *i32) -> *f32 {
+    let f: *u8 = fopen(path, "rb");
+    if (cast::<i64>(f) == cast::<i64>(0)) {
+        print("ERROR: cannot open image file");
+        *out_n = 0;
+        *out_dim = 0;
+        return cast::<*f32>(cast::<*u8>(0));
+    }
+    # Read header: n_samples, n_pixels (2 x i32 = 8 bytes)
+    let hdr: *i32 = cast::<*i32>(malloc(8));
+    fread(cast::<*u8>(hdr), cast::<i64>(4), cast::<i64>(2), f);
+    let n: i32 = hdr[0];
+    let dim: i32 = hdr[1];
+    *out_n = n;
+    *out_dim = dim;
+    free(cast::<*u8>(hdr));
+
+    # Read pixel data: n*dim f32 values
+    let total: i32 = n * dim;
+    let data: *f32 = cast::<*f32>(malloc(total * 4));
+    fread(cast::<*u8>(data), cast::<i64>(4), cast::<i64>(total), f);
+    fclose(f);
+    return data;
+}
+
+fn load_labels(path: *u8, out_n: *i32) -> *u8 {
+    let f: *u8 = fopen(path, "rb");
+    if (cast::<i64>(f) == cast::<i64>(0)) {
+        print("ERROR: cannot open label file");
+        *out_n = 0;
+        return cast::<*u8>(0);
+    }
+    let hdr: *i32 = cast::<*i32>(malloc(4));
+    fread(cast::<*u8>(hdr), cast::<i64>(4), cast::<i64>(1), f);
+    let n: i32 = hdr[0];
+    *out_n = n;
+    free(cast::<*u8>(hdr));
+
+    let labels: *u8 = malloc(n);
+    fread(labels, cast::<i64>(1), cast::<i64>(n), f);
+    fclose(f);
+    return labels;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# BLAS matrix multiply wrappers
+# ═══════════════════════════════════════════════════════════════════════
+
+# C = A @ B
+fn matmul(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 111, 111, m, n, k, 1.0, A, k, B, n, 0.0, C, n);
+}
+
+# C = Aᵀ @ B
+fn matmul_at(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 112, 111, m, n, k, 1.0, A, m, B, n, 0.0, C, n);
+}
+
+# C = A @ Bᵀ
+fn matmul_bt(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 111, 112, m, n, k, 1.0, A, k, B, k, 0.0, C, n);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Activation / Loss
+# ═══════════════════════════════════════════════════════════════════════
+
+fn relu_fwd(x: *f32, out: *f32, n: i32) {
+    for i in 0..n {
+        if (x[i] > 0.0) {
+            out[i] = x[i];
+        } else {
+            out[i] = 0.0;
+        }
+    }
+}
+
+fn relu_bwd(pre_act: *f32, d_out: *f32, d_in: *f32, n: i32) {
+    for i in 0..n {
+        if (pre_act[i] > 0.0) {
+            d_in[i] = d_out[i];
+        } else {
+            d_in[i] = 0.0;
+        }
+    }
+}
+
+fn add_bias(out: *f32, bias: *f32, samples: i32, cols: i32) {
+    for s in 0..samples {
+        for j in 0..cols {
+            out[s * cols + j] = out[s * cols + j] + bias[j];
+        }
+    }
+}
+
+fn bias_grad(d_out: *f32, d_bias: *f32, samples: i32, cols: i32) {
+    for j in 0..cols {
+        d_bias[j] = 0.0;
+    }
+    for s in 0..samples {
+        for j in 0..cols {
+            d_bias[j] = d_bias[j] + d_out[s * cols + j];
+        }
+    }
+}
+
+# Softmax: out[s, c] = exp(x[s,c] - max_c) / sum_c exp(...)
+fn softmax(x: *f32, out: *f32, samples: i32, classes: i32) {
+    for s in 0..samples {
+        let base: i32 = s * classes;
+        # Find max for numerical stability
+        let mut mx: f32 = x[base];
+        for c in 1..classes {
+            if (x[base + c] > mx) {
+                mx = x[base + c];
+            }
+        }
+        # Compute exp and sum
+        let mut sum: f32 = 0.0;
+        for c in 0..classes {
+            out[base + c] = expf(x[base + c] - mx);
+            sum = sum + out[base + c];
+        }
+        # Normalize
+        let inv_sum: f32 = 1.0 / sum;
+        for c in 0..classes {
+            out[base + c] = out[base + c] * inv_sum;
+        }
+    }
+}
+
+# Cross-entropy loss = -1/N * Σ log(prob[s, label[s]])
+fn cross_entropy_loss(probs: *f32, labels: *u8, samples: i32, classes: i32) -> f32 {
+    let mut loss: f32 = 0.0;
+    for s in 0..samples {
+        let label: i32 = cast::<i32>(labels[s]);
+        let p: f32 = probs[s * classes + label];
+        # Clamp for numerical stability
+        let mut p_safe: f32 = p;
+        if (p_safe < 0.0000001) {
+            p_safe = 0.0000001;
+        }
+        loss = loss - logf(p_safe);
+    }
+    return loss / cast::<f32>(samples);
+}
+
+# Softmax + CE gradient: d_logits[s, c] = probs[s, c] - one_hot(label[s], c)
+fn softmax_ce_grad(probs: *f32, labels: *u8, d_logits: *f32, samples: i32, classes: i32) {
+    let inv_n: f32 = 1.0 / cast::<f32>(samples);
+    for s in 0..samples {
+        let label: i32 = cast::<i32>(labels[s]);
+        for c in 0..classes {
+            d_logits[s * classes + c] = probs[s * classes + c] * inv_n;
+        }
+        d_logits[s * classes + label] = d_logits[s * classes + label] - inv_n;
+    }
+}
+
+# Argmax per sample
+fn argmax_accuracy(probs: *f32, labels: *u8, samples: i32, classes: i32) -> i32 {
+    let mut correct: i32 = 0;
+    for s in 0..samples {
+        let base: i32 = s * classes;
+        let mut best: i32 = 0;
+        let mut best_val: f32 = probs[base];
+        for c in 1..classes {
+            if (probs[base + c] > best_val) {
+                best_val = probs[base + c];
+                best = c;
+            }
+        }
+        if (best == cast::<i32>(labels[s])) {
+            correct = correct + 1;
+        }
+    }
+    return correct;
+}
+
+fn sgd_update(param: *f32, grad: *f32, n: i32, lr: f32) {
+    for i in 0..n {
+        param[i] = param[i] - lr * grad[i];
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════╗");
+    print("║   NexaLang Neural Network — MNIST Training      ║");
+    print("║   MLP(784→128→10) · BLAS · Softmax+CE          ║");
+    print("╚══════════════════════════════════════════════════╝");
+    print("");
+
+    # ── Load data ─────────────────────────────────────────────────────
+    print("Loading MNIST data...");
+
+    let p_n: *i32 = cast::<*i32>(malloc(4));
+    let p_dim: *i32 = cast::<*i32>(malloc(4));
+
+    let train_images: *f32 = load_images("data/mnist/train-images.bin", p_n, p_dim);
+    let train_n: i32 = *p_n;
+    let train_dim: i32 = *p_dim;
+
+    let train_labels: *u8 = load_labels("data/mnist/train-labels.bin", p_n);
+    let train_ln: i32 = *p_n;
+
+    let test_images: *f32 = load_images("data/mnist/test-images.bin", p_n, p_dim);
+    let test_n: i32 = *p_n;
+    let test_dim: i32 = *p_dim;
+
+    let test_labels: *u8 = load_labels("data/mnist/test-labels.bin", p_n);
+    let test_ln: i32 = *p_n;
+
+    free(cast::<*u8>(p_n));
+    free(cast::<*u8>(p_dim));
+
+    print("  Train samples:");
+    print(train_n);
+    print("  Test samples:");
+    print(test_n);
+    print("  Input dim:");
+    print(train_dim);
+    print("");
+
+    # ── Hyperparameters ───────────────────────────────────────────────
+    let D_IN: i32 = 784;
+    let D_HID: i32 = 256;
+    let D_OUT: i32 = 10;
+    let BATCH: i32 = 64;
+    let EPOCHS: i32 = 20;
+    let lr: f32 = 0.1;
+
+    # ── Model parameters ──────────────────────────────────────────────
+    # Xavier init: scale ≈ sqrt(2/fan_in)
+    let W1: *f32 = alloc_f32(D_IN * D_HID);
+    let b1: *f32 = alloc_f32(D_HID);
+    let W2: *f32 = alloc_f32(D_HID * D_OUT);
+    let b2: *f32 = alloc_f32(D_OUT);
+
+    let mut seed: i32 = rand_init(W1, D_IN * D_HID, 0.05, 42);
+    seed = rand_init(W2, D_HID * D_OUT, 0.12, seed);
+
+    # ── Batch buffers ─────────────────────────────────────────────────
+    let h_pre: *f32 = alloc_f32(BATCH * D_HID);
+    let h_act: *f32 = alloc_f32(BATCH * D_HID);
+    let logits: *f32 = alloc_f32(BATCH * D_OUT);
+    let probs: *f32 = alloc_f32(BATCH * D_OUT);
+
+    # Gradient buffers
+    let d_logits: *f32 = alloc_f32(BATCH * D_OUT);
+    let d_hact: *f32 = alloc_f32(BATCH * D_HID);
+    let d_hpre: *f32 = alloc_f32(BATCH * D_HID);
+    let d_W2: *f32 = alloc_f32(D_HID * D_OUT);
+    let d_b2: *f32 = alloc_f32(D_OUT);
+    let d_W1: *f32 = alloc_f32(D_IN * D_HID);
+    let d_b1: *f32 = alloc_f32(D_HID);
+
+    # Test evaluation buffers (full test set or chunks)
+    let test_batch: i32 = 1000;
+    let test_hpre: *f32 = alloc_f32(test_batch * D_HID);
+    let test_hact: *f32 = alloc_f32(test_batch * D_HID);
+    let test_logits: *f32 = alloc_f32(test_batch * D_OUT);
+    let test_probs: *f32 = alloc_f32(test_batch * D_OUT);
+
+    # Batch label buffer
+    let batch_labels: *u8 = alloc_u8(BATCH);
+
+    # ── Training loop ─────────────────────────────────────────────────
+    let n_batches: i32 = train_n / BATCH;
+
+    print("Training...");
+    print("  Batches/epoch:");
+    print(n_batches);
+    print("");
+
+    let t_total_start = timer_now();
+
+    for epoch in 0..EPOCHS {
+        let t_epoch = timer_now();
+        let mut epoch_loss: f32 = 0.0;
+        let mut epoch_correct: i32 = 0;
+
+        for batch_idx in 0..n_batches {
+            let offset: i32 = batch_idx * BATCH;
+            let x_ptr: *f32 = cast::<*f32>(cast::<*u8>(cast::<i64>(train_images) + cast::<i64>(offset * D_IN * 4)));
+
+            # Copy batch labels
+            for bi in 0..BATCH {
+                batch_labels[bi] = train_labels[offset + bi];
+            }
+
+            # ═══ FORWARD ═══
+            # h_pre = X_batch @ W1 + b1    (BATCH×784 @ 784×128 = BATCH×128)
+            matmul(x_ptr, W1, h_pre, BATCH, D_HID, D_IN);
+            add_bias(h_pre, b1, BATCH, D_HID);
+
+            # h_act = relu(h_pre)
+            relu_fwd(h_pre, h_act, BATCH * D_HID);
+
+            # logits = h_act @ W2 + b2     (BATCH×128 @ 128×10 = BATCH×10)
+            matmul(h_act, W2, logits, BATCH, D_OUT, D_HID);
+            add_bias(logits, b2, BATCH, D_OUT);
+
+            # probs = softmax(logits)
+            softmax(logits, probs, BATCH, D_OUT);
+
+            # Loss
+            let loss: f32 = cross_entropy_loss(probs, batch_labels, BATCH, D_OUT);
+            epoch_loss = epoch_loss + loss;
+
+            # Accuracy
+            let correct: i32 = argmax_accuracy(probs, batch_labels, BATCH, D_OUT);
+            epoch_correct = epoch_correct + correct;
+
+            # ═══ BACKWARD ═══
+            # d_logits = (probs - one_hot) / N
+            softmax_ce_grad(probs, batch_labels, d_logits, BATCH, D_OUT);
+
+            # d_W2 = h_actᵀ @ d_logits     (128×BATCH @ BATCH×10 = 128×10)
+            matmul_at(h_act, d_logits, d_W2, D_HID, D_OUT, BATCH);
+
+            # d_b2 = Σ d_logits
+            bias_grad(d_logits, d_b2, BATCH, D_OUT);
+
+            # d_hact = d_logits @ W2ᵀ      (BATCH×10 @ 10×128 = BATCH×128)
+            matmul_bt(d_logits, W2, d_hact, BATCH, D_HID, D_OUT);
+
+            # d_hpre = d_hact ⊙ relu'(h_pre)
+            relu_bwd(h_pre, d_hact, d_hpre, BATCH * D_HID);
+
+            # d_W1 = Xᵀ @ d_hpre           (784×BATCH @ BATCH×128 = 784×128)
+            matmul_at(x_ptr, d_hpre, d_W1, D_IN, D_HID, BATCH);
+
+            # d_b1 = Σ d_hpre
+            bias_grad(d_hpre, d_b1, BATCH, D_HID);
+
+            # ═══ SGD UPDATE ═══
+            sgd_update(W1, d_W1, D_IN * D_HID, lr);
+            sgd_update(b1, d_b1, D_HID, lr);
+            sgd_update(W2, d_W2, D_HID * D_OUT, lr);
+            sgd_update(b2, d_b2, D_OUT, lr);
+        }
+
+        # ── Evaluate on test set ──────────────────────────────────────
+        let mut test_correct: i32 = 0;
+        let test_chunks: i32 = test_n / test_batch;
+        for chunk in 0..test_chunks {
+            let t_offset: i32 = chunk * test_batch;
+            let t_ptr: *f32 = cast::<*f32>(cast::<*u8>(cast::<i64>(test_images) + cast::<i64>(t_offset * D_IN * 4)));
+            let tl_ptr: *u8 = cast::<*u8>(cast::<i64>(test_labels) + cast::<i64>(t_offset));
+
+            matmul(t_ptr, W1, test_hpre, test_batch, D_HID, D_IN);
+            add_bias(test_hpre, b1, test_batch, D_HID);
+            relu_fwd(test_hpre, test_hact, test_batch * D_HID);
+            matmul(test_hact, W2, test_logits, test_batch, D_OUT, D_HID);
+            add_bias(test_logits, b2, test_batch, D_OUT);
+            softmax(test_logits, test_probs, test_batch, D_OUT);
+            test_correct = test_correct + argmax_accuracy(test_probs, tl_ptr, test_batch, D_OUT);
+        }
+
+        let t_epoch_end = timer_now();
+        let epoch_ms: i32 = elapsed_ms(t_epoch_end, t_epoch);
+        let avg_loss: f32 = epoch_loss / cast::<f32>(n_batches);
+
+        print("  Epoch:");
+        print(epoch);
+        print("  Loss:");
+        print(avg_loss);
+        print("  Train acc:");
+        print(epoch_correct * 100 / (n_batches * BATCH));
+        print("  Test acc:");
+        print(test_correct * 100 / test_n);
+        print("  Time (ms):");
+        print(epoch_ms);
+        print("");
+    }
+
+    let t_total_end = timer_now();
+    let total_ms: i32 = elapsed_ms(t_total_end, t_total_start);
+
+    print("══════════════════════════════════════════════════");
+    print("  Training complete");
+    print("  Total time (ms):");
+    print(total_ms);
+    print("══════════════════════════════════════════════════");
+
+    # ═══ CLEANUP ═══
+    free(cast::<*u8>(train_images));
+    free(train_labels);
+    free(cast::<*u8>(test_images));
+    free(test_labels);
+    free(cast::<*u8>(W1));
+    free(cast::<*u8>(b1));
+    free(cast::<*u8>(W2));
+    free(cast::<*u8>(b2));
+    free(cast::<*u8>(h_pre));
+    free(cast::<*u8>(h_act));
+    free(cast::<*u8>(logits));
+    free(cast::<*u8>(probs));
+    free(cast::<*u8>(d_logits));
+    free(cast::<*u8>(d_hact));
+    free(cast::<*u8>(d_hpre));
+    free(cast::<*u8>(d_W2));
+    free(cast::<*u8>(d_b2));
+    free(cast::<*u8>(d_W1));
+    free(cast::<*u8>(d_b1));
+    free(cast::<*u8>(test_hpre));
+    free(cast::<*u8>(test_hact));
+    free(cast::<*u8>(test_logits));
+    free(cast::<*u8>(test_probs));
+    free(batch_labels);
+
+    return 0;
+}

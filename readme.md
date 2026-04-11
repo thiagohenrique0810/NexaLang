@@ -87,7 +87,11 @@ nxpkg init my_project
 nxc run main.nxl
 
 # Build a standalone executable with O3 optimization
-nxc build main.nxl --opt O3 --out my_app.exe
+nxc build main.nxl --opt O3 --out artifacts/build/bin/my_app
+
+# Bootstrap compiler default output
+python3 bootstrap/main.py examples/hello.nxl --emit ll --opt 3
+# writes LLVM IR to artifacts/build/output.ll
 
 # Run integrated unit tests
 nxc test my_logic.nxl

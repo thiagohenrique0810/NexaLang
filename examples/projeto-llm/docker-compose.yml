@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  turboserve:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TURBO_HOST=0.0.0.0
+      - TURBO_PORT=8000
+      - TURBO_LOG_LEVEL=info
+      - TURBO_DEVICE=auto
+    volumes:
+      - ./model_cache:/app/model_cache
+      - ./examples:/app/examples
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

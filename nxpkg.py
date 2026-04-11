@@ -113,7 +113,7 @@ def cmd_init(args):
 
     # Create .gitignore
     with open(".gitignore", "w") as f:
-        f.write("dev/artifacts/\n*.o\n*.ll\n*.exe\n")
+        f.write("artifacts/\n*.o\n*.ll\n*.exe\n")
 
     save_lockfile({"packages": {}})
     print(f"✓ Project '{name}' initialized.")
@@ -437,7 +437,10 @@ def cmd_clean(args):
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
         removed.append(LOCK_FILE)
-    if os.path.exists("dev/artifacts"):
+    if os.path.exists("artifacts"):
+        shutil.rmtree("artifacts")
+        removed.append("artifacts/")
+    elif os.path.exists("dev/artifacts"):
         shutil.rmtree("dev/artifacts")
         removed.append("dev/artifacts/")
 

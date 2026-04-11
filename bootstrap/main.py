@@ -9,6 +9,17 @@ from errors import CompilerError
 import semantic
 
 
+DEFAULT_BUILD_DIR = os.path.join("artifacts", "build")
+DEFAULT_LL_PATH = os.path.join(DEFAULT_BUILD_DIR, "output.ll")
+DEFAULT_SPV_PATH = os.path.join(DEFAULT_BUILD_DIR, "output.spv")
+
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def _build_test_runner(test_names):
     """Build a proper test main function body with error handling."""
     body = []
@@ -104,7 +115,7 @@ def main():
     ap.add_argument("--spirv-vulkan-binding-base", type=int, default=0, help="(vulkan) First binding number to assign to kernel args")
     ap.add_argument("--run-jit", action="store_true", help="Run the generated code immediately using JIT (no external compiler required)")
     ap.add_argument("--run-tests", action="store_true", help="Find and run all functions marked with @[test]")
-    ap.add_argument("--out", default=None, help="Output path (default: output.ll or output.spv)")
+    ap.add_argument("--out", default=None, help="Output path (default: artifacts/build/output.ll or artifacts/build/output.spv)")
     ap.add_argument("--emit-mir", action="store_true", help="Emit MIR (Mid-level IR) for debugging/optimization analysis")
     ap.add_argument("--opt", choices=["0", "1", "2", "3"], default="1", help="Optimization level (0=none, 1=basic, 2=aggressive, 3=max)")
     ap.add_argument("--quantize-gpu", type=int, default=0, choices=[0, 1, 2, 3, 4], help="Auto-quantize GPU float buffers with TurboQuant (0=off, 1-4=bits)")
@@ -209,7 +220,9 @@ def main():
         printer = MIRPrinter()
         mir_text = printer.print_module(mir_module)
         
-        mir_path = os.path.splitext(args.out or "output.ll")[0] + ".mir"
+        mir_base = args.out or DEFAULT_LL_PATH
+        mir_path = os.path.splitext(mir_base)[0] + ".mir"
+        _ensure_parent_dir(mir_path)
         with open(mir_path, "w", encoding="utf-8") as f:
             f.write(mir_text)
         print(f"[MIR] Emitted to '{mir_path}' (opt={args.opt}, folded={optimizer.stats['constant_folded']}, eliminated={optimizer.stats['dead_eliminated']}, propagated={optimizer.stats['copies_propagated']})")
@@ -262,16 +275,18 @@ def main():
         return
 
     if args.emit == "ll":
-        out_path = args.out or "output.ll"
+        out_path = args.out or DEFAULT_LL_PATH
+        _ensure_parent_dir(out_path)
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(llvm_ir)
         print(f"\n[SUCCESS] LLVM IR compiled to '{out_path}'")
         if args.target == "native" and not args.run_jit:
-            print("To run (requires clang): clang output.ll -o output.exe && ./output.exe")
+            print(f"To run (requires clang): clang {out_path} -o output.exe && ./output.exe")
         return
 
     # emit spv
-    out_path = args.out or "output.spv"
+    out_path = args.out or DEFAULT_SPV_PATH
+    _ensure_parent_dir(out_path)
     try:
         from spirv_backend import emit_spirv_from_llvm_ir
         emit_spirv_from_llvm_ir(
@@ -286,6 +301,7 @@ def main():
         print(f"\n[SUCCESS] SPIR-V emitted to '{out_path}'")
     except Exception as e:
         ll_fallback = os.path.splitext(out_path)[0] + ".ll"
+        _ensure_parent_dir(ll_fallback)
         with open(ll_fallback, "w", encoding="utf-8") as f:
              f.write(llvm_ir)
         print(f"[SPIR-V EMIT ERROR] {e}")

@@ -46,9 +46,9 @@ def main() -> int:
 
     if has_llc or has_translator:
         print("OK: Required tools found. You can run:")
-        print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out output.spv")
+        print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out artifacts/build/output.spv")
         if found.get("spirv-val"):
-            print("  spirv-val output.spv")
+            print("  spirv-val artifacts/build/output.spv")
         if found.get("spirv-as"):
             print("\nNote: For `--spirv-env vulkan`, `spirv-as` enables an optional patch to add VariablePointers capabilities when needed.")
         return 0
@@ -59,7 +59,7 @@ def main() -> int:
     print("- Fallback: Install LLVM tools so `llvm-as` is available in PATH, and SPIRV-LLVM-Translator so `llvm-spirv` is available.")
     print("- (Optional) Install SPIR-V Tools for `spirv-val`/`spirv-dis`.")
     print("\nAfter installing, re-run this script and then run:")
-    print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out output.spv")
+    print("  python bootstrap\\main.py examples\\gpu_dispatch.nxl --target spirv --emit spv --out artifacts/build/output.spv")
     return 2
 
 

@@ -1497,6 +1497,10 @@ class CodeGen:
                 field_ptr = self.builder.bitcast(field_ptr, val.type.as_pointer())
             self.builder.store(val, field_ptr)
 
+    def _is_float(self, llvm_type):
+        """Check if type is f32 or f64."""
+        return isinstance(llvm_type, (ir.FloatType, ir.DoubleType))
+
     def _fmath(self, result):
         """Add fast-math flags to a float instruction."""
         result.flags.append('fast')
@@ -1519,7 +1523,7 @@ class CodeGen:
                 return self.builder.gep(left, [right], name="ptr_add")
             if isinstance(right.type, ir.PointerType):
                 return self.builder.gep(right, [left], name="ptr_add")
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self._fmath(self.builder.fadd(left, right, name="faddtmp"))
             return self._nsw(self.builder.add(left, right, name="addtmp"))
         elif node.op == 'MINUS':
@@ -1527,15 +1531,15 @@ class CodeGen:
                 # pointer - offset: gep with neg offset
                 neg_right = self.builder.neg(right, name="neg_offset")
                 return self.builder.gep(left, [neg_right], name="ptr_sub")
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self._fmath(self.builder.fsub(left, right, name="fsubtmp"))
             return self._nsw(self.builder.sub(left, right, name="subtmp"))
         elif node.op == 'STAR':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self._fmath(self.builder.fmul(left, right, name="fmultmp"))
             return self._nsw(self.builder.mul(left, right, name="multmp"))
         elif node.op == 'SLASH':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self._fmath(self.builder.fdiv(left, right, name="fdivtmp"))
             # Strength reduction: x / 2^n => x >> n (for positive power-of-2 constants)
             if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
@@ -1543,7 +1547,7 @@ class CodeGen:
                 return self.builder.ashr(left, ir.Constant(left.type, shift), name="divsr")
             return self.builder.sdiv(left, right, name="divtmp")
         elif node.op == 'PERCENT':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self._fmath(self.builder.frem(left, right, name="fremtmp"))
             # Strength reduction: x % 2^n => x & (2^n - 1) (for positive power-of-2 constants)
             if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
@@ -1565,33 +1569,33 @@ class CodeGen:
         elif node.op == 'SHR':
             return self.builder.ashr(left, right, name="shrtmp")
         elif node.op == 'EQEQ':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('==', left, right, name="feqtmp")
             # Handle pointer == 0 comparison
             if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
                 right = ir.Constant(left.type, None) # Convert 0 to null pointer
             return self.builder.icmp_signed('==', left, right, name="eqtmp")
         elif node.op == 'NEQ':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('!=', left, right, name="fneqtmp")
             # Handle pointer != 0 comparison
             if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
                 right = ir.Constant(left.type, None) # Convert 0 to null pointer
             return self.builder.icmp_signed('!=', left, right, name="neqtmp")
         elif node.op == 'LT':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('<', left, right, name="flttmp")
             return self.builder.icmp_signed('<', left, right, name="lttmp")
         elif node.op == 'GT':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('>', left, right, name="fgttmp")
             return self.builder.icmp_signed('>', left, right, name="gttmp")
         elif node.op == 'LTE':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('<=', left, right, name="fltettmp")
             return self.builder.icmp_signed('<=', left, right, name="ltetmp")
         elif node.op == 'GTE':
-            if left.type == ir.FloatType():
+            if self._is_float(left.type):
                 return self.builder.fcmp_ordered('>=', left, right, name="fgtetmp")
             return self.builder.icmp_signed('>=', left, right, name="gtetmp")
         else:
@@ -1999,6 +2003,9 @@ class CodeGen:
             # Int to int
             if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
                 if val.type.width < target_ty.width:
+                    # u8 (i8) is unsigned in NexaLang → zero-extend
+                    if val.type.width == 8:
+                        return self.builder.zext(val, target_ty)
                     return self.builder.sext(val, target_ty)
                 elif val.type.width > target_ty.width:
                     return self.builder.trunc(val, target_ty)

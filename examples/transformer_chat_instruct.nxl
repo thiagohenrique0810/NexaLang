@@ -1,0 +1,1025 @@
+# transformer_chat_instruct.nxl — Chat Instrucional em Português
+#
+# Carrega pesos de model_v5_ft.bin (8L/8H/D384/T512, ~14.6M params)
+# Formato: [P] pergunta\n[R] resposta
+#   2. Pensamento: gera tokens silenciosos antes de responder
+#   3. Salva pesos atualizados ao sair
+#
+# Compile:
+#   python3 bootstrap/main.py examples/transformer_chat_v5_pt.nxl --emit ll --opt 3
+#   clang artifacts/build/output.ll -o chat_v5_pt -lm -O2 -framework Accelerate
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn printf(fmt: *u8, ...) -> i32;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fwrite(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fclose(stream: *u8) -> i32;
+    fn expf(x: f32) -> f32;
+    fn logf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+    fn putchar(c: i32) -> i32;
+    fn fflush(stream: *u8) -> i32;
+    fn getchar() -> i32;
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32, m: i32, n: i32, k: i32,
+                   alpha: f32, A: *f32, lda: i32, B: *f32, ldb: i32,
+                   beta: f32, C: *f32, ldc: i32);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+fn alloc_f32(n: i32) -> *f32 {
+    let buf: *f32 = cast::<*f32>(malloc(n * 4));
+    for i in 0..n { buf[i] = 0.0; }
+    return buf;
+}
+
+fn zero_buf(buf: *f32, n: i32) {
+    for i in 0..n { buf[i] = 0.0; }
+}
+
+fn copy_buf(dst: *f32, src: *f32, n: i32) {
+    for i in 0..n { dst[i] = src[i]; }
+}
+
+fn ptr_at(base: *f32, offset: i32) -> *f32 {
+    return cast::<*f32>(cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset * 4)));
+}
+
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# LayerNorm
+# ═══════════════════════════════════════════════════════════════════════
+
+fn layer_norm_fwd(x: *f32, gamma: *f32, beta: *f32, out: *f32,
+                  mean_buf: *f32, rstd_buf: *f32, T: i32, D: i32) {
+    let eps: f32 = 0.00001;
+    for t in 0..T {
+        let base: i32 = t * D;
+        let mut m: f32 = 0.0;
+        for d in 0..D { m = m + x[base + d]; }
+        m = m / cast::<f32>(D);
+        mean_buf[t] = m;
+        let mut v: f32 = 0.0;
+        for d in 0..D {
+            let diff: f32 = x[base + d] - m;
+            v = v + diff * diff;
+        }
+        v = v / cast::<f32>(D);
+        let rstd: f32 = 1.0 / sqrtf(v + eps);
+        rstd_buf[t] = rstd;
+        for d in 0..D {
+            out[base + d] = gamma[d] * (x[base + d] - m) * rstd + beta[d];
+        }
+    }
+}
+
+fn layer_norm_bwd(d_out: *f32, x: *f32, gamma: *f32,
+                  mean_buf: *f32, rstd_buf: *f32,
+                  d_x: *f32, d_gamma: *f32, d_beta: *f32, T: i32, D: i32) {
+    let inv_D: f32 = 1.0 / cast::<f32>(D);
+    for t in 0..T {
+        let base: i32 = t * D;
+        let m: f32 = mean_buf[t];
+        let rstd: f32 = rstd_buf[t];
+        for d in 0..D {
+            let xhat: f32 = (x[base + d] - m) * rstd;
+            d_gamma[d] = d_gamma[d] + d_out[base + d] * xhat;
+            d_beta[d] = d_beta[d] + d_out[base + d];
+        }
+        let mut sum_dxhat: f32 = 0.0;
+        let mut sum_dxhat_xhat: f32 = 0.0;
+        for d in 0..D {
+            let dxhat: f32 = d_out[base + d] * gamma[d];
+            let xhat: f32 = (x[base + d] - m) * rstd;
+            sum_dxhat = sum_dxhat + dxhat;
+            sum_dxhat_xhat = sum_dxhat_xhat + dxhat * xhat;
+        }
+        for d in 0..D {
+            let dxhat: f32 = d_out[base + d] * gamma[d];
+            let xhat: f32 = (x[base + d] - m) * rstd;
+            d_x[base + d] = d_x[base + d] + rstd * (dxhat - inv_D * sum_dxhat - xhat * inv_D * sum_dxhat_xhat);
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Softmax
+# ═══════════════════════════════════════════════════════════════════════
+
+fn softmax_rows(x: *f32, out: *f32, rows: i32, cols: i32) {
+    for r in 0..rows {
+        let base: i32 = r * cols;
+        let mut mx: f32 = x[base];
+        for c in 1..cols {
+            if (x[base + c] > mx) { mx = x[base + c]; }
+        }
+        let mut sum: f32 = 0.0;
+        for c in 0..cols {
+            out[base + c] = expf(x[base + c] - mx);
+            sum = sum + out[base + c];
+        }
+        let inv: f32 = 1.0 / sum;
+        for c in 0..cols { out[base + c] = out[base + c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Self-Attention (BLAS accelerated)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn attention_fwd(Q: *f32, K: *f32, V: *f32, out: *f32,
+                 attn_scores: *f32, attn_probs: *f32, T: i32, HD: i32) {
+    let scale: f32 = 1.0 / sqrtf(cast::<f32>(HD));
+    cblas_sgemm(101, 111, 112, T, T, HD, scale, Q, HD, K, HD, 0.0, attn_scores, T);
+    for i in 0..T {
+        for j in 0..T {
+            if (j > i) { attn_scores[i * T + j] = 0.0 - 100000.0; }
+        }
+    }
+    softmax_rows(attn_scores, attn_probs, T, T);
+    cblas_sgemm(101, 111, 111, T, HD, T, 1.0, attn_probs, T, V, HD, 0.0, out, HD);
+}
+
+fn attention_bwd(Q: *f32, K: *f32, V: *f32, attn_probs: *f32, d_out: *f32,
+                 d_Q: *f32, d_K: *f32, d_V: *f32,
+                 d_attn_probs: *f32, d_attn_scores: *f32, T: i32, HD: i32) {
+    let scale: f32 = 1.0 / sqrtf(cast::<f32>(HD));
+    cblas_sgemm(101, 111, 112, T, T, HD, 1.0, d_out, HD, V, HD, 0.0, d_attn_probs, T);
+    cblas_sgemm(101, 112, 111, T, HD, T, 1.0, attn_probs, T, d_out, HD, 1.0, d_V, HD);
+    for i in 0..T {
+        let mut dotsum: f32 = 0.0;
+        for j in 0..T { dotsum = dotsum + attn_probs[i * T + j] * d_attn_probs[i * T + j]; }
+        for j in 0..T {
+            d_attn_scores[i * T + j] = attn_probs[i * T + j] * (d_attn_probs[i * T + j] - dotsum);
+        }
+    }
+    cblas_sgemm(101, 111, 111, T, HD, T, scale, d_attn_scores, T, K, HD, 1.0, d_Q, HD);
+    cblas_sgemm(101, 112, 111, T, HD, T, scale, d_attn_scores, T, Q, HD, 1.0, d_K, HD);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Linear (BLAS accelerated)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn linear_fwd(x: *f32, W: *f32, b: *f32, out: *f32, T: i32, in_dim: i32, out_dim: i32) {
+    cblas_sgemm(101, 111, 111, T, out_dim, in_dim, 1.0, x, in_dim, W, out_dim, 0.0, out, out_dim);
+    for t in 0..T {
+        for o in 0..out_dim { out[t * out_dim + o] = out[t * out_dim + o] + b[o]; }
+    }
+}
+
+fn linear_bwd(x: *f32, W: *f32, d_out: *f32, d_x: *f32, d_W: *f32, d_b: *f32,
+              T: i32, in_dim: i32, out_dim: i32) {
+    for t in 0..T {
+        for o in 0..out_dim { d_b[o] = d_b[o] + d_out[t * out_dim + o]; }
+    }
+    cblas_sgemm(101, 112, 111, in_dim, out_dim, T, 1.0, x, in_dim, d_out, out_dim, 1.0, d_W, out_dim);
+    cblas_sgemm(101, 111, 112, T, in_dim, out_dim, 1.0, d_out, out_dim, W, out_dim, 1.0, d_x, in_dim);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# GELU
+# ═══════════════════════════════════════════════════════════════════════
+
+fn gelu_fwd(x: *f32, out: *f32, n: i32) {
+    for i in 0..n {
+        let s: f32 = 0.0 - 1.702 * x[i];
+        let sig: f32 = 1.0 / (1.0 + expf(s));
+        out[i] = x[i] * sig;
+    }
+}
+
+fn gelu_bwd(pre_act: *f32, d_out: *f32, d_in: *f32, n: i32) {
+    for i in 0..n {
+        let s: f32 = 0.0 - 1.702 * pre_act[i];
+        let sig: f32 = 1.0 / (1.0 + expf(s));
+        let grad: f32 = sig * (1.0 + 1.702 * pre_act[i] * (1.0 - sig));
+        d_in[i] = d_in[i] + d_out[i] * grad;
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Residual, CE Loss
+# ═══════════════════════════════════════════════════════════════════════
+
+fn residual_add(x: *f32, residual: *f32, out: *f32, n: i32) {
+    for i in 0..n { out[i] = x[i] + residual[i]; }
+}
+
+fn ce_loss_fwd(logits: *f32, probs: *f32, targets: *u8, T: i32, V: i32) -> f32 {
+    softmax_rows(logits, probs, T, V);
+    let mut loss: f32 = 0.0;
+    for t in 0..T {
+        let target: i32 = cast::<i32>(targets[t]);
+        let mut p: f32 = probs[t * V + target];
+        if (p < 0.0000001) { p = 0.0000001; }
+        loss = loss - logf(p);
+    }
+    return loss / cast::<f32>(T);
+}
+
+fn ce_loss_bwd(probs: *f32, targets: *u8, d_logits: *f32, T: i32, V: i32) {
+    let inv_T: f32 = 1.0 / cast::<f32>(T);
+    for t in 0..T {
+        let target: i32 = cast::<i32>(targets[t]);
+        for c in 0..V { d_logits[t * V + c] = probs[t * V + c] * inv_T; }
+        d_logits[t * V + target] = d_logits[t * V + target] - inv_T;
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# SGD with gradient clipping (online learning)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn sgd_update(param: *f32, grad: *f32, n: i32, lr: f32) {
+    let neg_one: f32 = 0.0 - 1.0;
+    for i in 0..n {
+        let mut g: f32 = grad[i];
+        if (g > 1.0) { g = 1.0; }
+        if (g < neg_one) { g = neg_one; }
+        param[i] = param[i] - lr * g;
+        grad[i] = 0.0;
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sampling
+# ═══════════════════════════════════════════════════════════════════════
+
+fn sample_from_probs(probs: *f32, v: i32, seed: i32) -> i32 {
+    let state: i32 = xorshift32(seed);
+    let r: f32 = cast::<f32>(state & 2147483647) / cast::<f32>(2147483647);
+    let mut cumsum: f32 = 0.0;
+    for i in 0..v {
+        cumsum = cumsum + probs[i];
+        if (cumsum >= r) { return i; }
+    }
+    return v - 1;
+}
+
+fn top_k_filter(probs: *f32, V: i32, k: i32) {
+    let temp: *f32 = alloc_f32(V);
+    copy_buf(temp, probs, V);
+    let neg_inf: f32 = 0.0 - 999999.0;
+    let mut threshold: f32 = 0.0;
+    for pass in 0..k {
+        let mut max_val: f32 = neg_inf;
+        let mut max_idx: i32 = 0;
+        for c in 0..V {
+            if (temp[c] > max_val) { max_val = temp[c]; max_idx = c; }
+        }
+        threshold = max_val;
+        temp[max_idx] = neg_inf;
+    }
+    free(cast::<*u8>(temp));
+    let mut rsum: f32 = 0.0;
+    for c in 0..V {
+        if (probs[c] < threshold) { probs[c] = 0.0; }
+        else { rsum = rsum + probs[c]; }
+    }
+    if (rsum > 0.0) {
+        let inv: f32 = 1.0 / rsum;
+        for c in 0..V { probs[c] = probs[c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Input helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+fn read_line(buf: *u8, max_len: i32) -> i32 {
+    let mut len: i32 = 0;
+    for i in 0..max_len {
+        let c: i32 = getchar();
+        if (c == 10) { return len; }
+        if (c < 0) {
+            if (len == 0) { return 0 - 1; }
+            return len;
+        }
+        buf[len] = cast::<u8>(c);
+        len = len + 1;
+    }
+    return len;
+}
+
+fn is_quit(buf: *u8, len: i32) -> i32 {
+    # "q"
+    if (len == 1) {
+        if (cast::<i32>(buf[0]) == 113) { return 1; }
+    }
+    # "quit"
+    if (len == 4) {
+        if (cast::<i32>(buf[0]) == 113) {
+            if (cast::<i32>(buf[1]) == 117) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 116) { return 1; }
+                }
+            }
+        }
+        # "sair"
+        if (cast::<i32>(buf[0]) == 115) {
+            if (cast::<i32>(buf[1]) == 97) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 114) { return 1; }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Forward pass (full transformer)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn transformer_forward(ctx: *u8, T: i32, D: i32, H: i32, HD: i32, FF: i32, N: i32, V: i32,
+    tok_emb: *f32, pos_emb: *f32,
+    all_Wq: *f32, all_bq: *f32, all_Wk: *f32, all_bk: *f32,
+    all_Wv: *f32, all_bv: *f32, all_Wo: *f32, all_bo: *f32,
+    all_ln1g: *f32, all_ln1b: *f32, all_Wf1: *f32, all_bf1: *f32,
+    all_Wf2: *f32, all_bf2: *f32, all_ln2g: *f32, all_ln2b: *f32,
+    ln_f_g: *f32, ln_f_b: *f32, W_out: *f32, b_out: *f32,
+    x_emb: *f32, all_q: *f32, all_k: *f32, all_v: *f32,
+    all_ao: *f32, all_r1: *f32, all_l1o: *f32, all_l1m: *f32, all_l1s: *f32,
+    all_f1o: *f32, all_f1a: *f32, all_r2: *f32, all_l2o: *f32,
+    all_l2m: *f32, all_l2s: *f32, all_ap: *f32,
+    lin_buf: *f32, scr1: *f32, scr2: *f32,
+    hq: *f32, hk: *f32, hv: *f32, ho: *f32,
+    as_buf: *f32, ap_buf: *f32,
+    lfo: *f32, lfm: *f32, lfs: *f32, logits: *f32) {
+
+    for t in 0..T {
+        let tok: i32 = cast::<i32>(ctx[t]);
+        for d in 0..D { x_emb[t * D + d] = tok_emb[tok * D + d] + pos_emb[t * D + d]; }
+    }
+
+    for layer in 0..N {
+        let oTD: i32 = layer * T * D;
+        let oDD: i32 = layer * D * D;
+        let oD: i32 = layer * D;
+        let oTF: i32 = layer * T * FF;
+        let oDF: i32 = layer * D * FF;
+        let oFD: i32 = layer * FF * D;
+        let oF: i32 = layer * FF;
+        let oT: i32 = layer * T;
+        let oHTT: i32 = layer * H * T * T;
+
+        if (layer == 0) { copy_buf(lin_buf, x_emb, T * D); }
+        else { copy_buf(lin_buf, ptr_at(all_l2o, (layer - 1) * T * D), T * D); }
+
+        linear_fwd(lin_buf, ptr_at(all_Wq, oDD), ptr_at(all_bq, oD), ptr_at(all_q, oTD), T, D, D);
+        linear_fwd(lin_buf, ptr_at(all_Wk, oDD), ptr_at(all_bk, oD), ptr_at(all_k, oTD), T, D, D);
+        linear_fwd(lin_buf, ptr_at(all_Wv, oDD), ptr_at(all_bv, oD), ptr_at(all_v, oTD), T, D, D);
+
+        let qp: *f32 = ptr_at(all_q, oTD);
+        let kp: *f32 = ptr_at(all_k, oTD);
+        let vp: *f32 = ptr_at(all_v, oTD);
+        let aop: *f32 = ptr_at(all_ao, oTD);
+
+        for h in 0..H {
+            let ho2: i32 = h * HD;
+            for t in 0..T { for d in 0..HD {
+                hq[t * HD + d] = qp[t * D + ho2 + d];
+                hk[t * HD + d] = kp[t * D + ho2 + d];
+                hv[t * HD + d] = vp[t * D + ho2 + d];
+            } }
+            attention_fwd(hq, hk, hv, ho, as_buf, ap_buf, T, HD);
+            copy_buf(ptr_at(all_ap, oHTT + h * T * T), ap_buf, T * T);
+            for t in 0..T { for d in 0..HD { aop[t * D + ho2 + d] = ho[t * HD + d]; } }
+        }
+
+        linear_fwd(aop, ptr_at(all_Wo, oDD), ptr_at(all_bo, oD), scr1, T, D, D);
+        residual_add(lin_buf, scr1, ptr_at(all_r1, oTD), T * D);
+        layer_norm_fwd(ptr_at(all_r1, oTD), ptr_at(all_ln1g, oD), ptr_at(all_ln1b, oD),
+                       ptr_at(all_l1o, oTD), ptr_at(all_l1m, oT), ptr_at(all_l1s, oT), T, D);
+        linear_fwd(ptr_at(all_l1o, oTD), ptr_at(all_Wf1, oDF), ptr_at(all_bf1, oF),
+                   ptr_at(all_f1o, oTF), T, D, FF);
+        gelu_fwd(ptr_at(all_f1o, oTF), ptr_at(all_f1a, oTF), T * FF);
+        linear_fwd(ptr_at(all_f1a, oTF), ptr_at(all_Wf2, oFD), ptr_at(all_bf2, oD), scr2, T, FF, D);
+        residual_add(ptr_at(all_l1o, oTD), scr2, ptr_at(all_r2, oTD), T * D);
+        layer_norm_fwd(ptr_at(all_r2, oTD), ptr_at(all_ln2g, oD), ptr_at(all_ln2b, oD),
+                       ptr_at(all_l2o, oTD), ptr_at(all_l2m, oT), ptr_at(all_l2s, oT), T, D);
+    }
+
+    let gll: *f32 = ptr_at(all_l2o, (N - 1) * T * D);
+    layer_norm_fwd(gll, ln_f_g, ln_f_b, lfo, lfm, lfs, T, D);
+    linear_fwd(lfo, W_out, b_out, logits, T, D, V);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Save weights helper
+# ═══════════════════════════════════════════════════════════════════════
+
+fn save_weights(path: *u8, V: i32, D: i32, H: i32, FF: i32, T: i32, N: i32,
+    tok_emb: *f32, pos_emb: *f32,
+    all_Wq: *f32, all_bq: *f32, all_Wk: *f32, all_bk: *f32,
+    all_Wv: *f32, all_bv: *f32, all_Wo: *f32, all_bo: *f32,
+    all_ln1g: *f32, all_ln1b: *f32, all_Wf1: *f32, all_bf1: *f32,
+    all_Wf2: *f32, all_bf2: *f32, all_ln2g: *f32, all_ln2b: *f32,
+    ln_f_g: *f32, ln_f_b: *f32, W_out: *f32, b_out: *f32) {
+    let sf: *u8 = fopen(path, "wb");
+    if (cast::<i64>(sf) != cast::<i64>(0)) {
+        let shdr: *i32 = cast::<*i32>(malloc(24));
+        shdr[0] = V; shdr[1] = D; shdr[2] = H; shdr[3] = FF; shdr[4] = T; shdr[5] = N;
+        fwrite(cast::<*u8>(shdr), cast::<i64>(4), cast::<i64>(6), sf);
+        free(cast::<*u8>(shdr));
+        fwrite(cast::<*u8>(tok_emb), cast::<i64>(4), cast::<i64>(V * D), sf);
+        fwrite(cast::<*u8>(pos_emb), cast::<i64>(4), cast::<i64>(T * D), sf);
+        fwrite(cast::<*u8>(all_Wq), cast::<i64>(4), cast::<i64>(N * D * D), sf);
+        fwrite(cast::<*u8>(all_bq), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_Wk), cast::<i64>(4), cast::<i64>(N * D * D), sf);
+        fwrite(cast::<*u8>(all_bk), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_Wv), cast::<i64>(4), cast::<i64>(N * D * D), sf);
+        fwrite(cast::<*u8>(all_bv), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_Wo), cast::<i64>(4), cast::<i64>(N * D * D), sf);
+        fwrite(cast::<*u8>(all_bo), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_ln1g), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_ln1b), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_Wf1), cast::<i64>(4), cast::<i64>(N * D * FF), sf);
+        fwrite(cast::<*u8>(all_bf1), cast::<i64>(4), cast::<i64>(N * FF), sf);
+        fwrite(cast::<*u8>(all_Wf2), cast::<i64>(4), cast::<i64>(N * FF * D), sf);
+        fwrite(cast::<*u8>(all_bf2), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_ln2g), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(all_ln2b), cast::<i64>(4), cast::<i64>(N * D), sf);
+        fwrite(cast::<*u8>(ln_f_g), cast::<i64>(4), cast::<i64>(D), sf);
+        fwrite(cast::<*u8>(ln_f_b), cast::<i64>(4), cast::<i64>(D), sf);
+        fwrite(cast::<*u8>(W_out), cast::<i64>(4), cast::<i64>(D * V), sf);
+        fwrite(cast::<*u8>(b_out), cast::<i64>(4), cast::<i64>(V), sf);
+        fclose(sf);
+        print("  Pesos salvos!");
+    } else {
+        print("  ERRO: Nao foi possivel salvar pesos");
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════════════════╗");
+    print("║   NexaLang Chat Instrucional (Fine-tuned)                  ║");
+    print("║   Formato [P] pergunta / [R] resposta                     ║");
+    print("║   Modelo: 8L/8H/D384/T512 ~14.6M params (Instruct FT)     ║");
+    print("║   Comandos: 'quit', 'q', ou 'sair' para sair              ║");
+    print("╚══════════════════════════════════════════════════════════════╝");
+    print("");
+
+    # ═══ LOAD MODEL ═══
+    print("Carregando modelo de model_v5_ft.bin...");
+    let mf: *u8 = fopen("model_v5_ft.bin", "rb");
+    if (cast::<i64>(mf) == cast::<i64>(0)) {
+        print("ERRO: model_v5_ft.bin nao encontrado. Fine-tune primeiro com transformer_finetune_v5.");
+        return 1;
+    }
+    let hdr: *i32 = cast::<*i32>(malloc(24));
+    fread(cast::<*u8>(hdr), cast::<i64>(4), cast::<i64>(6), mf);
+    let V: i32 = hdr[0];
+    let D: i32 = hdr[1];
+    let H: i32 = hdr[2];
+    let FF: i32 = hdr[3];
+    let T: i32 = hdr[4];
+    let N: i32 = hdr[5];
+    let HD: i32 = D / H;
+    free(cast::<*u8>(hdr));
+
+    print("  Arquitetura: V=");
+    print(V);
+    print("  D=");
+    print(D);
+    print("  H=");
+    print(H);
+    print("  N=");
+    print(N);
+    print("  T=");
+    print(T);
+
+    # ═══ WEIGHTS ═══
+    let tok_emb: *f32 = alloc_f32(V * D);
+    let pos_emb: *f32 = alloc_f32(T * D);
+    let all_Wq: *f32 = alloc_f32(N * D * D);
+    let all_bq: *f32 = alloc_f32(N * D);
+    let all_Wk: *f32 = alloc_f32(N * D * D);
+    let all_bk: *f32 = alloc_f32(N * D);
+    let all_Wv: *f32 = alloc_f32(N * D * D);
+    let all_bv: *f32 = alloc_f32(N * D);
+    let all_Wo: *f32 = alloc_f32(N * D * D);
+    let all_bo: *f32 = alloc_f32(N * D);
+    let all_ln1g: *f32 = alloc_f32(N * D);
+    let all_ln1b: *f32 = alloc_f32(N * D);
+    let all_Wf1: *f32 = alloc_f32(N * D * FF);
+    let all_bf1: *f32 = alloc_f32(N * FF);
+    let all_Wf2: *f32 = alloc_f32(N * FF * D);
+    let all_bf2: *f32 = alloc_f32(N * D);
+    let all_ln2g: *f32 = alloc_f32(N * D);
+    let all_ln2b: *f32 = alloc_f32(N * D);
+    let ln_f_g: *f32 = alloc_f32(D);
+    let ln_f_b: *f32 = alloc_f32(D);
+    let W_out: *f32 = alloc_f32(D * V);
+    let b_out: *f32 = alloc_f32(V);
+
+    fread(cast::<*u8>(tok_emb), cast::<i64>(4), cast::<i64>(V * D), mf);
+    fread(cast::<*u8>(pos_emb), cast::<i64>(4), cast::<i64>(T * D), mf);
+    fread(cast::<*u8>(all_Wq), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bq), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wk), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bk), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wv), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bv), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wo), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bo), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln1g), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln1b), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wf1), cast::<i64>(4), cast::<i64>(N * D * FF), mf);
+    fread(cast::<*u8>(all_bf1), cast::<i64>(4), cast::<i64>(N * FF), mf);
+    fread(cast::<*u8>(all_Wf2), cast::<i64>(4), cast::<i64>(N * FF * D), mf);
+    fread(cast::<*u8>(all_bf2), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln2g), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln2b), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(ln_f_g), cast::<i64>(4), cast::<i64>(D), mf);
+    fread(cast::<*u8>(ln_f_b), cast::<i64>(4), cast::<i64>(D), mf);
+    fread(cast::<*u8>(W_out), cast::<i64>(4), cast::<i64>(D * V), mf);
+    fread(cast::<*u8>(b_out), cast::<i64>(4), cast::<i64>(V), mf);
+    fclose(mf);
+    print("  Pesos carregados!");
+
+    # ═══ GRADIENT BUFFERS (for online learning) ═══
+    let d_tok_emb: *f32 = alloc_f32(V * D);
+    let d_pos_emb: *f32 = alloc_f32(T * D);
+    let d_all_Wq: *f32 = alloc_f32(N * D * D);
+    let d_all_bq: *f32 = alloc_f32(N * D);
+    let d_all_Wk: *f32 = alloc_f32(N * D * D);
+    let d_all_bk: *f32 = alloc_f32(N * D);
+    let d_all_Wv: *f32 = alloc_f32(N * D * D);
+    let d_all_bv: *f32 = alloc_f32(N * D);
+    let d_all_Wo: *f32 = alloc_f32(N * D * D);
+    let d_all_bo: *f32 = alloc_f32(N * D);
+    let d_all_ln1g: *f32 = alloc_f32(N * D);
+    let d_all_ln1b: *f32 = alloc_f32(N * D);
+    let d_all_Wf1: *f32 = alloc_f32(N * D * FF);
+    let d_all_bf1: *f32 = alloc_f32(N * FF);
+    let d_all_Wf2: *f32 = alloc_f32(N * FF * D);
+    let d_all_bf2: *f32 = alloc_f32(N * D);
+    let d_all_ln2g: *f32 = alloc_f32(N * D);
+    let d_all_ln2b: *f32 = alloc_f32(N * D);
+    let d_ln_f_g: *f32 = alloc_f32(D);
+    let d_ln_f_b: *f32 = alloc_f32(D);
+    let d_W_out: *f32 = alloc_f32(D * V);
+    let d_b_out: *f32 = alloc_f32(V);
+
+    # ═══ ACTIVATION BUFFERS ═══
+    let x_emb: *f32 = alloc_f32(T * D);
+    let all_q: *f32 = alloc_f32(N * T * D);
+    let all_k: *f32 = alloc_f32(N * T * D);
+    let all_v: *f32 = alloc_f32(N * T * D);
+    let all_ao: *f32 = alloc_f32(N * T * D);
+    let all_r1: *f32 = alloc_f32(N * T * D);
+    let all_l1o: *f32 = alloc_f32(N * T * D);
+    let all_l1m: *f32 = alloc_f32(N * T);
+    let all_l1s: *f32 = alloc_f32(N * T);
+    let all_f1o: *f32 = alloc_f32(N * T * FF);
+    let all_f1a: *f32 = alloc_f32(N * T * FF);
+    let all_r2: *f32 = alloc_f32(N * T * D);
+    let all_l2o: *f32 = alloc_f32(N * T * D);
+    let all_l2m: *f32 = alloc_f32(N * T);
+    let all_l2s: *f32 = alloc_f32(N * T);
+    let all_ap: *f32 = alloc_f32(N * H * T * T);
+
+    let lin_buf: *f32 = alloc_f32(T * D);
+    let scr1: *f32 = alloc_f32(T * D);
+    let scr2: *f32 = alloc_f32(T * D);
+    let hq: *f32 = alloc_f32(T * HD);
+    let hk: *f32 = alloc_f32(T * HD);
+    let hv: *f32 = alloc_f32(T * HD);
+    let ho: *f32 = alloc_f32(T * HD);
+    let as_buf: *f32 = alloc_f32(T * T);
+    let ap_buf: *f32 = alloc_f32(T * T);
+    let lfo: *f32 = alloc_f32(T * D);
+    let lfm: *f32 = alloc_f32(T);
+    let lfs: *f32 = alloc_f32(T);
+    let logits: *f32 = alloc_f32(T * V);
+    let probs: *f32 = alloc_f32(T * V);
+    let temp_buf: *f32 = alloc_f32(V);
+
+    # Backward scratch
+    let dl: *f32 = alloc_f32(T * V);
+    let dlfo: *f32 = alloc_f32(T * D);
+    let dlfi: *f32 = alloc_f32(T * D);
+    let dl2i: *f32 = alloc_f32(T * D);
+    let df2o: *f32 = alloc_f32(T * D);
+    let df1a: *f32 = alloc_f32(T * FF);
+    let df1o: *f32 = alloc_f32(T * FF);
+    let dl1i: *f32 = alloc_f32(T * D);
+    let dr1: *f32 = alloc_f32(T * D);
+    let dao: *f32 = alloc_f32(T * D);
+    let dq: *f32 = alloc_f32(T * D);
+    let dk: *f32 = alloc_f32(T * D);
+    let dv: *f32 = alloc_f32(T * D);
+    let dcur: *f32 = alloc_f32(T * D);
+    let lbwd: *f32 = alloc_f32(T * D);
+    let dhq: *f32 = alloc_f32(T * HD);
+    let dhk: *f32 = alloc_f32(T * HD);
+    let dhv: *f32 = alloc_f32(T * HD);
+    let dho: *f32 = alloc_f32(T * HD);
+    let dap: *f32 = alloc_f32(T * T);
+    let das: *f32 = alloc_f32(T * T);
+
+    # ═══ CHAT STATE ═══
+    let GEN_LEN: i32 = 300;
+    let THINK_LEN: i32 = 0;
+    let LEARN_STEPS: i32 = 0;
+    let LEARN_LR: f32 = 0.0001;
+    let TEMP: f32 = 0.8;
+    let THINK_TEMP: f32 = 0.5;
+    let TOP_K: i32 = 10;
+
+    let ctx: *u8 = malloc(T);
+    for i in 0..T { ctx[i] = cast::<u8>(0); }
+    let input_buf: *u8 = malloc(1024);
+    let train_input: *u8 = malloc(T);
+    let train_target: *u8 = malloc(T);
+    let mut rng: i32 = 42;
+    let mut total_learned: i32 = 0;
+
+    # Byte-level encoding: token_id == byte value (identity mapping for V=256)
+    let newline_tok: i32 = 10;
+
+    # ═══ PRIME CONTEXT with [P]/[R] examples ═══
+    # Push exemplar pairs to prime the model into instruction-following mode
+    # "[P] Ola!\n[R] Ola! Como posso ajudar?\n\n[P] Tudo bem?\n[R] Tudo bem sim! O que deseja saber?\n\n"
+    let prime: *u8 = malloc(256);
+    let mut pi: i32 = 0;
+    # [P] Ola!\n[R] Ola! Como posso ajudar?\n\n
+    prime[0] = cast::<u8>(91); prime[1] = cast::<u8>(80); prime[2] = cast::<u8>(93); prime[3] = cast::<u8>(32);
+    prime[4] = cast::<u8>(79); prime[5] = cast::<u8>(108); prime[6] = cast::<u8>(97); prime[7] = cast::<u8>(33);
+    prime[8] = cast::<u8>(10);
+    prime[9] = cast::<u8>(91); prime[10] = cast::<u8>(82); prime[11] = cast::<u8>(93); prime[12] = cast::<u8>(32);
+    # Ola! Como posso ajudar?
+    prime[13] = cast::<u8>(79); prime[14] = cast::<u8>(108); prime[15] = cast::<u8>(97); prime[16] = cast::<u8>(33);
+    prime[17] = cast::<u8>(32);
+    prime[18] = cast::<u8>(67); prime[19] = cast::<u8>(111); prime[20] = cast::<u8>(109); prime[21] = cast::<u8>(111);
+    prime[22] = cast::<u8>(32);
+    prime[23] = cast::<u8>(112); prime[24] = cast::<u8>(111); prime[25] = cast::<u8>(115); prime[26] = cast::<u8>(115);
+    prime[27] = cast::<u8>(111);
+    prime[28] = cast::<u8>(32);
+    prime[29] = cast::<u8>(97); prime[30] = cast::<u8>(106); prime[31] = cast::<u8>(117); prime[32] = cast::<u8>(100);
+    prime[33] = cast::<u8>(97); prime[34] = cast::<u8>(114); prime[35] = cast::<u8>(63);
+    prime[36] = cast::<u8>(10); prime[37] = cast::<u8>(10);
+    # [P] Tudo bem?\n[R] Tudo bem sim! O que deseja saber?\n\n
+    prime[38] = cast::<u8>(91); prime[39] = cast::<u8>(80); prime[40] = cast::<u8>(93); prime[41] = cast::<u8>(32);
+    # Tudo bem?
+    prime[42] = cast::<u8>(84); prime[43] = cast::<u8>(117); prime[44] = cast::<u8>(100); prime[45] = cast::<u8>(111);
+    prime[46] = cast::<u8>(32);
+    prime[47] = cast::<u8>(98); prime[48] = cast::<u8>(101); prime[49] = cast::<u8>(109); prime[50] = cast::<u8>(63);
+    prime[51] = cast::<u8>(10);
+    prime[52] = cast::<u8>(91); prime[53] = cast::<u8>(82); prime[54] = cast::<u8>(93); prime[55] = cast::<u8>(32);
+    # Tudo bem sim! O que deseja saber?
+    prime[56] = cast::<u8>(84); prime[57] = cast::<u8>(117); prime[58] = cast::<u8>(100); prime[59] = cast::<u8>(111);
+    prime[60] = cast::<u8>(32);
+    prime[61] = cast::<u8>(98); prime[62] = cast::<u8>(101); prime[63] = cast::<u8>(109);
+    prime[64] = cast::<u8>(32);
+    prime[65] = cast::<u8>(115); prime[66] = cast::<u8>(105); prime[67] = cast::<u8>(109); prime[68] = cast::<u8>(33);
+    prime[69] = cast::<u8>(32);
+    prime[70] = cast::<u8>(79); prime[71] = cast::<u8>(32);
+    prime[72] = cast::<u8>(113); prime[73] = cast::<u8>(117); prime[74] = cast::<u8>(101);
+    prime[75] = cast::<u8>(32);
+    prime[76] = cast::<u8>(100); prime[77] = cast::<u8>(101); prime[78] = cast::<u8>(115); prime[79] = cast::<u8>(101);
+    prime[80] = cast::<u8>(106); prime[81] = cast::<u8>(97);
+    prime[82] = cast::<u8>(32);
+    prime[83] = cast::<u8>(115); prime[84] = cast::<u8>(97); prime[85] = cast::<u8>(98); prime[86] = cast::<u8>(101);
+    prime[87] = cast::<u8>(114); prime[88] = cast::<u8>(63);
+    prime[89] = cast::<u8>(10); prime[90] = cast::<u8>(10);
+    let PRIME_LEN: i32 = 91;
+    for i in 0..PRIME_LEN {
+        for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+        ctx[T - 1] = prime[i];
+    }
+    free(prime);
+
+    print("");
+    print("Pronto! O modelo foi fine-tuned para conversar.");
+    print("  Formato: sua entrada -> [P] entrada / [R] resposta");
+    print("══════════════════════════════════════════════════════════════");
+
+    # ═══ CHAT LOOP ═══
+    for turn in 0..10000 {
+        print("");
+        # Print "> " prompt
+        putchar(62); putchar(32);
+        fflush(cast::<*u8>(0));
+
+        let input_len: i32 = read_line(input_buf, 1023);
+
+        if (input_len < 0) {
+            print("");
+            print("[SALVAR] Salvando pesos aprendidos...");
+            save_weights("model_v5_ft.bin", V, D, H, FF, T, N,
+                tok_emb, pos_emb, all_Wq, all_bq, all_Wk, all_bk,
+                all_Wv, all_bv, all_Wo, all_bo, all_ln1g, all_ln1b,
+                all_Wf1, all_bf1, all_Wf2, all_bf2, all_ln2g, all_ln2b,
+                ln_f_g, ln_f_b, W_out, b_out);
+            print("  Total de passos aprendidos:");
+            print(total_learned);
+            print("Ate logo!");
+            return 0;
+        }
+
+        if (is_quit(input_buf, input_len) == 1) {
+            print("");
+            print("[SALVAR] Salvando pesos aprendidos...");
+            save_weights("model_v5_ft.bin", V, D, H, FF, T, N,
+                tok_emb, pos_emb, all_Wq, all_bq, all_Wk, all_bk,
+                all_Wv, all_bv, all_Wo, all_bo, all_ln1g, all_ln1b,
+                all_Wf1, all_bf1, all_Wf2, all_bf2, all_ln2g, all_ln2b,
+                ln_f_g, ln_f_b, W_out, b_out);
+            print("  Total de passos aprendidos:");
+            print(total_learned);
+            print("Ate logo!");
+            return 0;
+        }
+
+        if (input_len > 0) {
+            # ══════════════════════════════════════════════════════════
+            # FASE 1: APRENDIZADO — aprende com a entrada do usuario
+            # ══════════════════════════════════════════════════════════
+            # Prepend "[P] " (bytes: 91=[ 80=P 93=] 32=space)
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(91);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(80);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(93);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(32);
+
+            # Encode user input bytes
+            for i in 0..input_len {
+                for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                ctx[T - 1] = input_buf[i];
+            }
+
+            # Append "\n[R] " (bytes: 10=\n 91=[ 82=R 93=] 32=space)
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(10);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(91);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(82);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(93);
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(32);
+
+            # Train: input = ctx[0..T-1], target = ctx[1..T]
+            for i in 0..(T - 1) { train_input[i] = ctx[i]; }
+            train_input[T - 1] = ctx[T - 1];
+            for i in 0..(T - 1) { train_target[i] = ctx[i + 1]; }
+            train_target[T - 1] = ctx[T - 1];
+
+            for lstep in 0..LEARN_STEPS {
+                # Forward pass
+                transformer_forward(train_input, T, D, H, HD, FF, N, V,
+                    tok_emb, pos_emb,
+                    all_Wq, all_bq, all_Wk, all_bk, all_Wv, all_bv, all_Wo, all_bo,
+                    all_ln1g, all_ln1b, all_Wf1, all_bf1, all_Wf2, all_bf2,
+                    all_ln2g, all_ln2b, ln_f_g, ln_f_b, W_out, b_out,
+                    x_emb, all_q, all_k, all_v, all_ao, all_r1, all_l1o, all_l1m, all_l1s,
+                    all_f1o, all_f1a, all_r2, all_l2o, all_l2m, all_l2s, all_ap,
+                    lin_buf, scr1, scr2, hq, hk, hv, ho, as_buf, ap_buf,
+                    lfo, lfm, lfs, logits);
+
+                let loss: f32 = ce_loss_fwd(logits, probs, train_target, T, V);
+
+                # Backward pass
+                zero_buf(dl, T * V);
+                zero_buf(dlfo, T * D);
+                zero_buf(dlfi, T * D);
+
+                ce_loss_bwd(probs, train_target, dl, T, V);
+
+                let ll_out: *f32 = ptr_at(all_l2o, (N - 1) * T * D);
+                linear_bwd(lfo, W_out, dl, dlfo, d_W_out, d_b_out, T, D, V);
+                layer_norm_bwd(dlfo, ll_out, ln_f_g, lfm, lfs, dlfi, d_ln_f_g, d_ln_f_b, T, D);
+
+                copy_buf(dcur, dlfi, T * D);
+
+                for rev in 0..N {
+                    let layer: i32 = N - 1 - rev;
+                    let oTD: i32 = layer * T * D;
+                    let oDD: i32 = layer * D * D;
+                    let oD: i32 = layer * D;
+                    let oTF: i32 = layer * T * FF;
+                    let oDF: i32 = layer * D * FF;
+                    let oFD: i32 = layer * FF * D;
+                    let oF: i32 = layer * FF;
+                    let oT: i32 = layer * T;
+                    let oHTT: i32 = layer * H * T * T;
+
+                    if (layer == 0) { copy_buf(lbwd, x_emb, T * D); }
+                    else { copy_buf(lbwd, ptr_at(all_l2o, (layer - 1) * T * D), T * D); }
+
+                    zero_buf(dl2i, T * D);
+                    layer_norm_bwd(dcur, ptr_at(all_r2, oTD), ptr_at(all_ln2g, oD),
+                                   ptr_at(all_l2m, oT), ptr_at(all_l2s, oT),
+                                   dl2i, ptr_at(d_all_ln2g, oD), ptr_at(d_all_ln2b, oD), T, D);
+
+                    copy_buf(df2o, dl2i, T * D);
+                    zero_buf(df1a, T * FF);
+                    linear_bwd(ptr_at(all_f1a, oTF), ptr_at(all_Wf2, oFD), df2o,
+                               df1a, ptr_at(d_all_Wf2, oFD), ptr_at(d_all_bf2, oD), T, FF, D);
+
+                    zero_buf(df1o, T * FF);
+                    gelu_bwd(ptr_at(all_f1o, oTF), df1a, df1o, T * FF);
+
+                    zero_buf(dl1i, T * D);
+                    linear_bwd(ptr_at(all_l1o, oTD), ptr_at(all_Wf1, oDF), df1o,
+                               dl1i, ptr_at(d_all_Wf1, oDF), ptr_at(d_all_bf1, oF), T, D, FF);
+
+                    for i in 0..(T * D) { dl1i[i] = dl1i[i] + dl2i[i]; }
+
+                    zero_buf(dr1, T * D);
+                    layer_norm_bwd(dl1i, ptr_at(all_r1, oTD), ptr_at(all_ln1g, oD),
+                                   ptr_at(all_l1m, oT), ptr_at(all_l1s, oT),
+                                   dr1, ptr_at(d_all_ln1g, oD), ptr_at(d_all_ln1b, oD), T, D);
+
+                    zero_buf(dao, T * D);
+                    linear_bwd(ptr_at(all_ao, oTD), ptr_at(all_Wo, oDD), dr1,
+                               dao, ptr_at(d_all_Wo, oDD), ptr_at(d_all_bo, oD), T, D, D);
+
+                    zero_buf(dq, T * D);
+                    zero_buf(dk, T * D);
+                    zero_buf(dv, T * D);
+                    let qp: *f32 = ptr_at(all_q, oTD);
+                    let kp: *f32 = ptr_at(all_k, oTD);
+                    let vp: *f32 = ptr_at(all_v, oTD);
+
+                    for h in 0..H {
+                        let ho2: i32 = h * HD;
+                        for t in 0..T { for d in 0..HD {
+                            dho[t * HD + d] = dao[t * D + ho2 + d];
+                            hq[t * HD + d] = qp[t * D + ho2 + d];
+                            hk[t * HD + d] = kp[t * D + ho2 + d];
+                            hv[t * HD + d] = vp[t * D + ho2 + d];
+                        } }
+                        copy_buf(ap_buf, ptr_at(all_ap, oHTT + h * T * T), T * T);
+                        zero_buf(dhq, T * HD);
+                        zero_buf(dhk, T * HD);
+                        zero_buf(dhv, T * HD);
+                        zero_buf(dap, T * T);
+                        zero_buf(das, T * T);
+                        attention_bwd(hq, hk, hv, ap_buf, dho, dhq, dhk, dhv, dap, das, T, HD);
+                        for t in 0..T { for d in 0..HD {
+                            dq[t * D + ho2 + d] = dq[t * D + ho2 + d] + dhq[t * HD + d];
+                            dk[t * D + ho2 + d] = dk[t * D + ho2 + d] + dhk[t * HD + d];
+                            dv[t * D + ho2 + d] = dv[t * D + ho2 + d] + dhv[t * HD + d];
+                        } }
+                    }
+
+                    zero_buf(dcur, T * D);
+                    linear_bwd(lbwd, ptr_at(all_Wq, oDD), dq, dcur,
+                               ptr_at(d_all_Wq, oDD), ptr_at(d_all_bq, oD), T, D, D);
+                    linear_bwd(lbwd, ptr_at(all_Wk, oDD), dk, dcur,
+                               ptr_at(d_all_Wk, oDD), ptr_at(d_all_bk, oD), T, D, D);
+                    linear_bwd(lbwd, ptr_at(all_Wv, oDD), dv, dcur,
+                               ptr_at(d_all_Wv, oDD), ptr_at(d_all_bv, oD), T, D, D);
+                    for i in 0..(T * D) { dcur[i] = dcur[i] + dr1[i]; }
+                }
+
+                # Embedding gradients
+                for t in 0..T {
+                    let tok: i32 = cast::<i32>(train_input[t]);
+                    for d in 0..D {
+                        d_tok_emb[tok * D + d] = d_tok_emb[tok * D + d] + dcur[t * D + d];
+                        d_pos_emb[t * D + d] = d_pos_emb[t * D + d] + dcur[t * D + d];
+                    }
+                }
+
+                # SGD update all parameters
+                sgd_update(tok_emb, d_tok_emb, V * D, LEARN_LR);
+                sgd_update(pos_emb, d_pos_emb, T * D, LEARN_LR);
+                sgd_update(all_Wq, d_all_Wq, N * D * D, LEARN_LR);
+                sgd_update(all_bq, d_all_bq, N * D, LEARN_LR);
+                sgd_update(all_Wk, d_all_Wk, N * D * D, LEARN_LR);
+                sgd_update(all_bk, d_all_bk, N * D, LEARN_LR);
+                sgd_update(all_Wv, d_all_Wv, N * D * D, LEARN_LR);
+                sgd_update(all_bv, d_all_bv, N * D, LEARN_LR);
+                sgd_update(all_Wo, d_all_Wo, N * D * D, LEARN_LR);
+                sgd_update(all_bo, d_all_bo, N * D, LEARN_LR);
+                sgd_update(all_ln1g, d_all_ln1g, N * D, LEARN_LR);
+                sgd_update(all_ln1b, d_all_ln1b, N * D, LEARN_LR);
+                sgd_update(all_Wf1, d_all_Wf1, N * D * FF, LEARN_LR);
+                sgd_update(all_bf1, d_all_bf1, N * FF, LEARN_LR);
+                sgd_update(all_Wf2, d_all_Wf2, N * FF * D, LEARN_LR);
+                sgd_update(all_bf2, d_all_bf2, N * D, LEARN_LR);
+                sgd_update(all_ln2g, d_all_ln2g, N * D, LEARN_LR);
+                sgd_update(all_ln2b, d_all_ln2b, N * D, LEARN_LR);
+                sgd_update(ln_f_g, d_ln_f_g, D, LEARN_LR);
+                sgd_update(ln_f_b, d_ln_f_b, D, LEARN_LR);
+                sgd_update(W_out, d_W_out, D * V, LEARN_LR);
+                sgd_update(b_out, d_b_out, V, LEARN_LR);
+
+                total_learned = total_learned + 1;
+                putchar(46);
+                fflush(cast::<*u8>(0));
+            }
+
+            # ══════════════════════════════════════════════════════════
+            # FASE 2: PENSAMENTO — gera tokens silenciosos
+            # ══════════════════════════════════════════════════════════
+
+            for g in 0..THINK_LEN {
+                transformer_forward(ctx, T, D, H, HD, FF, N, V,
+                    tok_emb, pos_emb,
+                    all_Wq, all_bq, all_Wk, all_bk, all_Wv, all_bv, all_Wo, all_bo,
+                    all_ln1g, all_ln1b, all_Wf1, all_bf1, all_Wf2, all_bf2,
+                    all_ln2g, all_ln2b, ln_f_g, ln_f_b, W_out, b_out,
+                    x_emb, all_q, all_k, all_v, all_ao, all_r1, all_l1o, all_l1m, all_l1s,
+                    all_f1o, all_f1a, all_r2, all_l2o, all_l2m, all_l2s, all_ap,
+                    lin_buf, scr1, scr2, hq, hk, hv, ho, as_buf, ap_buf,
+                    lfo, lfm, lfs, logits);
+
+                let last_pos: i32 = (T - 1) * V;
+                for c in 0..V { temp_buf[c] = logits[last_pos + c] / THINK_TEMP; }
+                softmax_rows(temp_buf, probs, 1, V);
+                top_k_filter(probs, V, TOP_K);
+                rng = xorshift32(rng);
+                let think_tok: i32 = sample_from_probs(probs, V, rng);
+                rng = xorshift32(rng + think_tok);
+
+                for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                ctx[T - 1] = cast::<u8>(think_tok);
+
+                if (g % 8 == 0) {
+                    putchar(46);
+                    fflush(cast::<*u8>(0));
+                }
+            }
+
+            # ══════════════════════════════════════════════════════════
+            # FASE 3: GERAR RESPOSTA — saida visivel
+            # ══════════════════════════════════════════════════════════
+            print("");
+            let mut prev_tok: i32 = 0;
+            let mut prev_prev_tok: i32 = 0;
+            let mut done: i32 = 0;
+
+            for g in 0..GEN_LEN {
+                if (done == 0) {
+                    transformer_forward(ctx, T, D, H, HD, FF, N, V,
+                        tok_emb, pos_emb,
+                        all_Wq, all_bq, all_Wk, all_bk, all_Wv, all_bv, all_Wo, all_bo,
+                        all_ln1g, all_ln1b, all_Wf1, all_bf1, all_Wf2, all_bf2,
+                        all_ln2g, all_ln2b, ln_f_g, ln_f_b, W_out, b_out,
+                        x_emb, all_q, all_k, all_v, all_ao, all_r1, all_l1o, all_l1m, all_l1s,
+                        all_f1o, all_f1a, all_r2, all_l2o, all_l2m, all_l2s, all_ap,
+                        lin_buf, scr1, scr2, hq, hk, hv, ho, as_buf, ap_buf,
+                        lfo, lfm, lfs, logits);
+
+                    let last_pos: i32 = (T - 1) * V;
+                    for c in 0..V { temp_buf[c] = logits[last_pos + c] / TEMP; }
+                    softmax_rows(temp_buf, probs, 1, V);
+                    top_k_filter(probs, V, TOP_K);
+                    rng = xorshift32(rng);
+                    let next_tok: i32 = sample_from_probs(probs, V, rng);
+                    rng = xorshift32(rng + next_tok);
+
+                    # Byte-level: token_id IS the byte value, output directly
+                    putchar(next_tok);
+
+                    for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                    ctx[T - 1] = cast::<u8>(next_tok);
+
+                    # Stop on double newline
+                    if (next_tok == newline_tok) {
+                        if (prev_tok == newline_tok) { done = 1; }
+                    }
+                    # Stop on [P] — model starting new prompt (91=[ 80=P 93=])
+                    if (prev_prev_tok == 91) {
+                        if (prev_tok == 80) {
+                            if (next_tok == 93) { done = 1; }
+                        }
+                    }
+                    prev_prev_tok = prev_tok;
+                    prev_tok = next_tok;
+                }
+            }
+            fflush(cast::<*u8>(0));
+            print("");
+            print("──────────────────────────────────────────────────────────────");
+        }
+    }
+
+    return 0;
+}

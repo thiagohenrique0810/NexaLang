@@ -1,8 +1,29 @@
 # Build / scratch outputs
 dev/artifacts/
 build/
+artifacts/
 logs/
 projects-test/
+
+# Local data caches
+*.db
+
+# Generated model weights/checkpoints
+/model*.bin
+/tinyllama*.bin
+/bpe_merges*.bin
+/artifacts/models/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Generated training datasets / caches
+/data/**/*.bin
+/data/**/*-idx*-ubyte
+/data/**/vocab.bin
+/data/**/train.bin
+/data/**/val.bin
 
 # Artifacts
 *.ll

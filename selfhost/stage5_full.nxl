@@ -1558,7 +1558,7 @@ fn sema_analyze(prog: *Program, a: *Arena) -> SemaContext {
 }
 
 fn emit_ll(prog: *Program) {
-    let out: string = "dev/artifacts/output.ll";
+    let out: string = "artifacts/build/output.ll";
     fs::write_file(out, "; ModuleID = 'selfhost'\n", 24);
     fs::append_file(out, "declare i32 @printf(i8*, ...)\n", 30);
     fs::append_file(out, "@fmt_int = private constant [4 x i8] c\"%d\\0A\\00\"\n", 47);
@@ -1630,7 +1630,7 @@ fn emit_ll(prog: *Program) {
     }
     
     # Globals handling omitted for now (Print(Str) will be no-op)
-    print("Emitted LLVM IR to dev/artifacts/output.ll");
+    print("Emitted LLVM IR to artifacts/build/output.ll");
 }
 # --- FFI for CLI Arguments ---
 extern "C" {

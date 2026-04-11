@@ -1,0 +1,331 @@
+# xor_train.nxl — Train a 2-layer MLP on XOR
+#
+# Proves the FULL ML pipeline in NexaLang:
+#   forward → loss → backward → SGD update → learning
+#
+# Architecture:
+#   Input (4×2) → Linear(2, 8) → ReLU → Linear(8, 1) → MSE Loss
+#
+# Expected: loss ~0.25 → <0.01 in ~2000 epochs
+# All weights are NexaLang heap-allocated f32 buffers.
+# Matrix multiply via Apple Accelerate BLAS (cblas_sgemm).
+# Backward pass is manually derived chain rule.
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32,
+                   m: i32, n: i32, k: i32,
+                   alpha: f32, A: *f32, lda: i32,
+                   B: *f32, ldb: i32,
+                   beta: f32, C: *f32, ldc: i32);
+    fn gettimeofday(tv: *u8, tz: *u8) -> i32;
+    fn fabsf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+fn alloc_f32(n: i32) -> *f32 {
+    let buf: *f32 = cast::<*f32>(malloc(n * 4));
+    for i in 0..n {
+        buf[i] = 0.0;
+    }
+    return buf;
+}
+
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+fn rand_init(data: *f32, n: i32, scale: f32, seed: i32) -> i32 {
+    let mut state: i32 = seed;
+    for i in 0..n {
+        state = xorshift32(state);
+        data[i] = (cast::<f32>(state & 2147483647) / cast::<f32>(2147483647) * 2.0 - 1.0) * scale;
+    }
+    return state;
+}
+
+struct Timer {
+    secs: i64,
+    usecs: i32
+}
+
+fn timer_now() -> Timer {
+    let tv: *u8 = malloc(16);
+    gettimeofday(tv, cast::<*u8>(0));
+    let secs: i64 = *cast::<*i64>(tv);
+    let usecs: i32 = *cast::<*i32>(cast::<*u8>(cast::<i64>(tv) + cast::<i64>(8)));
+    free(tv);
+    return Timer(secs, usecs);
+}
+
+fn elapsed_us(t1: Timer, t0: Timer) -> i64 {
+    let ds: i64 = t1.secs - t0.secs;
+    let du: i64 = cast::<i64>(t1.usecs - t0.usecs);
+    return ds * cast::<i64>(1000000) + du;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Matrix operations  (BLAS-backed)
+# ═══════════════════════════════════════════════════════════════════════
+
+# C = A @ B        A(m×k)  B(k×n)  C(m×n)
+fn matmul(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 111, 111, m, n, k, 1.0, A, k, B, n, 0.0, C, n);
+}
+
+# C = Aᵀ @ B       A stored(k×m)  B(k×n)  C(m×n)
+fn matmul_at(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 112, 111, m, n, k, 1.0, A, m, B, n, 0.0, C, n);
+}
+
+# C = A @ Bᵀ       A(m×k)  B stored(n×k)  C(m×n)
+fn matmul_bt(A: *f32, B: *f32, C: *f32, m: i32, n: i32, k: i32) {
+    cblas_sgemm(101, 111, 112, m, n, k, 1.0, A, k, B, k, 0.0, C, n);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Activation & loss functions
+# ═══════════════════════════════════════════════════════════════════════
+
+fn relu_fwd(x: *f32, out: *f32, n: i32) {
+    for i in 0..n {
+        if (x[i] > 0.0) {
+            out[i] = x[i];
+        } else {
+            out[i] = 0.0;
+        }
+    }
+}
+
+fn relu_bwd(pre_act: *f32, d_out: *f32, d_in: *f32, n: i32) {
+    for i in 0..n {
+        if (pre_act[i] > 0.0) {
+            d_in[i] = d_out[i];
+        } else {
+            d_in[i] = 0.0;
+        }
+    }
+}
+
+fn add_bias(out: *f32, bias: *f32, samples: i32, cols: i32) {
+    for s in 0..samples {
+        for j in 0..cols {
+            out[s * cols + j] = out[s * cols + j] + bias[j];
+        }
+    }
+}
+
+fn mse_loss(pred: *f32, target: *f32, n: i32) -> f32 {
+    let mut loss: f32 = 0.0;
+    for i in 0..n {
+        let d: f32 = pred[i] - target[i];
+        loss = loss + d * d;
+    }
+    return loss / cast::<f32>(n);
+}
+
+fn mse_grad(pred: *f32, target: *f32, d_pred: *f32, n: i32) {
+    let scale: f32 = 2.0 / cast::<f32>(n);
+    for i in 0..n {
+        d_pred[i] = (pred[i] - target[i]) * scale;
+    }
+}
+
+fn bias_grad(d_out: *f32, d_bias: *f32, samples: i32, cols: i32) {
+    for j in 0..cols {
+        d_bias[j] = 0.0;
+    }
+    for s in 0..samples {
+        for j in 0..cols {
+            d_bias[j] = d_bias[j] + d_out[s * cols + j];
+        }
+    }
+}
+
+fn sgd_update(param: *f32, grad: *f32, n: i32, lr: f32) {
+    for i in 0..n {
+        param[i] = param[i] - lr * grad[i];
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main — XOR Training
+# ═══════════════════════════════════════════════════════════════════════
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════╗");
+    print("║   NexaLang Neural Network — XOR Training        ║");
+    print("║   MLP(2→8→1) · BLAS matmul · Manual backprop   ║");
+    print("╚══════════════════════════════════════════════════╝");
+    print("");
+
+    # ── Dataset: XOR truth table ──────────────────────────────────────
+    # X is 4×2 (4 samples, 2 features)
+    let X: *f32 = alloc_f32(8);
+    X[0] = 0.0;
+    X[1] = 0.0;
+    X[2] = 0.0;
+    X[3] = 1.0;
+    X[4] = 1.0;
+    X[5] = 0.0;
+    X[6] = 1.0;
+    X[7] = 1.0;
+
+    # Y is 4×1 (targets)
+    let Y: *f32 = alloc_f32(4);
+    Y[0] = 0.0;
+    Y[1] = 1.0;
+    Y[2] = 1.0;
+    Y[3] = 0.0;
+
+    # ── Hyperparameters ───────────────────────────────────────────────
+    let N: i32 = 4;
+    let D_IN: i32 = 2;
+    let D_HID: i32 = 8;
+    let D_OUT: i32 = 1;
+    let lr: f32 = 0.1;
+    let epochs: i32 = 3000;
+
+    # ── Model parameters (heap allocated) ─────────────────────────────
+    let W1: *f32 = alloc_f32(D_IN * D_HID);
+    let b1: *f32 = alloc_f32(D_HID);
+    let W2: *f32 = alloc_f32(D_HID * D_OUT);
+    let b2: *f32 = alloc_f32(D_OUT);
+
+    # Xavier init: scale = sqrt(2 / fan_in)
+    let mut seed: i32 = rand_init(W1, D_IN * D_HID, 0.7, 42);
+    seed = rand_init(W2, D_HID * D_OUT, 0.35, seed);
+
+    # ── Intermediate buffers ──────────────────────────────────────────
+    let h_pre: *f32 = alloc_f32(N * D_HID);
+    let h_act: *f32 = alloc_f32(N * D_HID);
+    let y_pred: *f32 = alloc_f32(N * D_OUT);
+
+    # ── Gradient buffers ──────────────────────────────────────────────
+    let d_ypred: *f32 = alloc_f32(N * D_OUT);
+    let d_hact: *f32 = alloc_f32(N * D_HID);
+    let d_hpre: *f32 = alloc_f32(N * D_HID);
+    let d_W2: *f32 = alloc_f32(D_HID * D_OUT);
+    let d_b2: *f32 = alloc_f32(D_OUT);
+    let d_W1: *f32 = alloc_f32(D_IN * D_HID);
+    let d_b1: *f32 = alloc_f32(D_HID);
+
+    # ── Training loop ─────────────────────────────────────────────────
+    print("Training 3000 epochs...");
+    print("");
+
+    let t_start = timer_now();
+
+    for epoch in 0..epochs {
+        # ═══ FORWARD ═══
+        # h_pre = X @ W1 + b1         (4×2 @ 2×8 = 4×8)
+        matmul(X, W1, h_pre, N, D_HID, D_IN);
+        add_bias(h_pre, b1, N, D_HID);
+
+        # h_act = relu(h_pre)
+        relu_fwd(h_pre, h_act, N * D_HID);
+
+        # y_pred = h_act @ W2 + b2    (4×8 @ 8×1 = 4×1)
+        matmul(h_act, W2, y_pred, N, D_OUT, D_HID);
+        add_bias(y_pred, b2, N, D_OUT);
+
+        # ═══ LOSS ═══
+        let loss: f32 = mse_loss(y_pred, Y, N);
+
+        if (epoch % 500 == 0) {
+            print("  epoch:");
+            print(epoch);
+            print("  loss:");
+            print(loss);
+            print("");
+        }
+
+        # ═══ BACKWARD ═══
+        # ∂L/∂y_pred = 2(y_pred - Y) / N
+        mse_grad(y_pred, Y, d_ypred, N);
+
+        # ∂L/∂W2 = h_actᵀ @ d_ypred    (8×4 @ 4×1 = 8×1)
+        matmul_at(h_act, d_ypred, d_W2, D_HID, D_OUT, N);
+
+        # ∂L/∂b2 = Σ_s d_ypred[s]
+        bias_grad(d_ypred, d_b2, N, D_OUT);
+
+        # ∂L/∂h_act = d_ypred @ W2ᵀ   (4×1 @ 1×8 = 4×8)
+        matmul_bt(d_ypred, W2, d_hact, N, D_HID, D_OUT);
+
+        # ∂L/∂h_pre = d_hact ⊙ relu'(h_pre)
+        relu_bwd(h_pre, d_hact, d_hpre, N * D_HID);
+
+        # ∂L/∂W1 = Xᵀ @ d_hpre         (2×4 @ 4×8 = 2×8)
+        matmul_at(X, d_hpre, d_W1, D_IN, D_HID, N);
+
+        # ∂L/∂b1 = Σ_s d_hpre[s]
+        bias_grad(d_hpre, d_b1, N, D_HID);
+
+        # ═══ SGD UPDATE ═══
+        sgd_update(W1, d_W1, D_IN * D_HID, lr);
+        sgd_update(b1, d_b1, D_HID, lr);
+        sgd_update(W2, d_W2, D_HID * D_OUT, lr);
+        sgd_update(b2, d_b2, D_OUT, lr);
+    }
+
+    let t_end = timer_now();
+    let train_us = elapsed_us(t_end, t_start);
+
+    # ═══ FINAL INFERENCE ═══
+    matmul(X, W1, h_pre, N, D_HID, D_IN);
+    add_bias(h_pre, b1, N, D_HID);
+    relu_fwd(h_pre, h_act, N * D_HID);
+    matmul(h_act, W2, y_pred, N, D_OUT, D_HID);
+    add_bias(y_pred, b2, N, D_OUT);
+
+    let final_loss: f32 = mse_loss(y_pred, Y, N);
+
+    print("══════════════════════════════════════════════════");
+    print("  Training complete");
+    print("");
+    print("  0 XOR 0  →");
+    print(y_pred[0]);
+    print("  0 XOR 1  →");
+    print(y_pred[1]);
+    print("  1 XOR 0  →");
+    print(y_pred[2]);
+    print("  1 XOR 1  →");
+    print(y_pred[3]);
+    print("");
+    print("  Expected:   0, 1, 1, 0");
+    print("");
+    print("  Final loss:");
+    print(final_loss);
+    print("  Time (us):");
+    print(cast::<i32>(train_us));
+    print("══════════════════════════════════════════════════");
+
+    # ═══ CLEANUP ═══
+    free(cast::<*u8>(X));
+    free(cast::<*u8>(Y));
+    free(cast::<*u8>(W1));
+    free(cast::<*u8>(b1));
+    free(cast::<*u8>(W2));
+    free(cast::<*u8>(b2));
+    free(cast::<*u8>(h_pre));
+    free(cast::<*u8>(h_act));
+    free(cast::<*u8>(y_pred));
+    free(cast::<*u8>(d_ypred));
+    free(cast::<*u8>(d_hact));
+    free(cast::<*u8>(d_hpre));
+    free(cast::<*u8>(d_W2));
+    free(cast::<*u8>(d_b2));
+    free(cast::<*u8>(d_W1));
+    free(cast::<*u8>(d_b1));
+
+    return 0;
+}

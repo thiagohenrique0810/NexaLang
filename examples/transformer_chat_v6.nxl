@@ -1,0 +1,659 @@
+# transformer_chat_v6.nxl — Chat Instrucional v6 (BPE + Scale-up)
+#
+# Carrega pesos de model_v6_ft.bin (10L/8H/D512/T512, ~33M params)
+# BPE tokenizer: V=1024 (256 base + 768 merges)
+# Formato: [P] pergunta\n[R] resposta\n\n
+#
+# Compile:
+#   python3 bootstrap/main.py examples/transformer_chat_v6.nxl --emit ll --opt 3
+#   clang artifacts/build/output.ll -o chat_v6 -lm -O2 -framework Accelerate
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn printf(fmt: *u8, ...) -> i32;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fclose(stream: *u8) -> i32;
+    fn expf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+    fn putchar(c: i32) -> i32;
+    fn fflush(stream: *u8) -> i32;
+    fn getchar() -> i32;
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32, m: i32, n: i32, k: i32,
+                   alpha: f32, A: *f32, lda: i32, B: *f32, ldb: i32,
+                   beta: f32, C: *f32, ldc: i32);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+fn alloc_f32(n: i32) -> *f32 {
+    let buf: *f32 = cast::<*f32>(malloc(n * 4));
+    for i in 0..n { buf[i] = 0.0; }
+    return buf;
+}
+
+fn copy_buf(dst: *f32, src: *f32, n: i32) {
+    for i in 0..n { dst[i] = src[i]; }
+}
+
+fn ptr_at(base: *f32, offset: i32) -> *f32 {
+    return cast::<*f32>(cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset * 4)));
+}
+
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# LayerNorm
+# ═══════════════════════════════════════════════════════════════════════
+
+fn layer_norm_fwd(x: *f32, gamma: *f32, beta: *f32, out: *f32,
+                  mean_buf: *f32, rstd_buf: *f32, T: i32, D: i32) {
+    let eps: f32 = 0.00001;
+    for t in 0..T {
+        let base: i32 = t * D;
+        let mut m: f32 = 0.0;
+        for d in 0..D { m = m + x[base + d]; }
+        m = m / cast::<f32>(D);
+        mean_buf[t] = m;
+        let mut v: f32 = 0.0;
+        for d in 0..D {
+            let diff: f32 = x[base + d] - m;
+            v = v + diff * diff;
+        }
+        v = v / cast::<f32>(D);
+        let rstd: f32 = 1.0 / sqrtf(v + eps);
+        rstd_buf[t] = rstd;
+        for d in 0..D {
+            out[base + d] = gamma[d] * (x[base + d] - m) * rstd + beta[d];
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Softmax
+# ═══════════════════════════════════════════════════════════════════════
+
+fn softmax_rows(x: *f32, out: *f32, rows: i32, cols: i32) {
+    for r in 0..rows {
+        let base: i32 = r * cols;
+        let mut mx: f32 = x[base];
+        for c in 1..cols {
+            if (x[base + c] > mx) { mx = x[base + c]; }
+        }
+        let mut sum: f32 = 0.0;
+        for c in 0..cols {
+            out[base + c] = expf(x[base + c] - mx);
+            sum = sum + out[base + c];
+        }
+        let inv: f32 = 1.0 / sum;
+        for c in 0..cols { out[base + c] = out[base + c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Attention (BLAS)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn attention_fwd(Q: *f32, K: *f32, V: *f32, out: *f32,
+                 attn_scores: *f32, attn_probs: *f32, T: i32, HD: i32) {
+    let scale: f32 = 1.0 / sqrtf(cast::<f32>(HD));
+    cblas_sgemm(101, 111, 112, T, T, HD, scale, Q, HD, K, HD, 0.0, attn_scores, T);
+    for i in 0..T {
+        for j in 0..T {
+            if (j > i) { attn_scores[i * T + j] = 0.0 - 100000.0; }
+        }
+    }
+    softmax_rows(attn_scores, attn_probs, T, T);
+    cblas_sgemm(101, 111, 111, T, HD, T, 1.0, attn_probs, T, V, HD, 0.0, out, HD);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Linear (BLAS)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn linear_fwd(x: *f32, W: *f32, b: *f32, out: *f32, T: i32, in_dim: i32, out_dim: i32) {
+    cblas_sgemm(101, 111, 111, T, out_dim, in_dim, 1.0, x, in_dim, W, out_dim, 0.0, out, out_dim);
+    for t in 0..T {
+        for o in 0..out_dim { out[t * out_dim + o] = out[t * out_dim + o] + b[o]; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# GELU + Residual
+# ═══════════════════════════════════════════════════════════════════════
+
+fn gelu_fwd(x: *f32, out: *f32, n: i32) {
+    for i in 0..n {
+        let s: f32 = 0.0 - 1.702 * x[i];
+        let sig: f32 = 1.0 / (1.0 + expf(s));
+        out[i] = x[i] * sig;
+    }
+}
+
+fn residual_add(x: *f32, residual: *f32, out: *f32, n: i32) {
+    for i in 0..n { out[i] = x[i] + residual[i]; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sampling
+# ═══════════════════════════════════════════════════════════════════════
+
+fn sample_from_probs(probs: *f32, v: i32, seed: i32) -> i32 {
+    let state: i32 = xorshift32(seed);
+    let r: f32 = cast::<f32>(state & 2147483647) / cast::<f32>(2147483647);
+    let mut cumsum: f32 = 0.0;
+    for i in 0..v {
+        cumsum = cumsum + probs[i];
+        if (cumsum >= r) { return i; }
+    }
+    return v - 1;
+}
+
+fn top_k_filter(probs: *f32, V: i32, k: i32) {
+    let temp: *f32 = alloc_f32(V);
+    copy_buf(temp, probs, V);
+    let neg_inf: f32 = 0.0 - 999999.0;
+    let mut threshold: f32 = 0.0;
+    for pass in 0..k {
+        let mut max_val: f32 = neg_inf;
+        let mut max_idx: i32 = 0;
+        for c in 0..V {
+            if (temp[c] > max_val) { max_val = temp[c]; max_idx = c; }
+        }
+        threshold = max_val;
+        temp[max_idx] = neg_inf;
+    }
+    free(cast::<*u8>(temp));
+    let mut rsum: f32 = 0.0;
+    for c in 0..V {
+        if (probs[c] < threshold) { probs[c] = 0.0; }
+        else { rsum = rsum + probs[c]; }
+    }
+    if (rsum > 0.0) {
+        let inv: f32 = 1.0 / rsum;
+        for c in 0..V { probs[c] = probs[c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# BPE Encode: bytes -> BPE tokens
+# ═══════════════════════════════════════════════════════════════════════
+
+fn bpe_encode(input: *u8, input_len: i32, merge_a: *i32, merge_b: *i32,
+              num_merges: i32, output: *i32) -> i32 {
+    for i in 0..input_len { output[i] = cast::<i32>(input[i]); }
+    let mut len: i32 = input_len;
+    for m in 0..num_merges {
+        let a: i32 = merge_a[m];
+        let b: i32 = merge_b[m];
+        let new_tok: i32 = 256 + m;
+        let old_len: i32 = len;
+        let mut write: i32 = 0;
+        let mut skip: i32 = 0;
+        for i in 0..old_len {
+            if (skip == 1) { skip = 0; }
+            else {
+                if (i < old_len - 1) {
+                    if (output[i] == a) {
+                        if (output[i + 1] == b) {
+                            output[write] = new_tok;
+                            write = write + 1;
+                            skip = 1;
+                        } else {
+                            output[write] = output[i];
+                            write = write + 1;
+                        }
+                    } else {
+                        output[write] = output[i];
+                        write = write + 1;
+                    }
+                } else {
+                    output[write] = output[i];
+                    write = write + 1;
+                }
+            }
+        }
+        len = write;
+    }
+    return len;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Forward pass (full transformer, BPE i32 context)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn transformer_forward(ctx: *i32, T: i32, D: i32, H: i32, HD: i32, FF: i32, N: i32, V: i32,
+    tok_emb: *f32, pos_emb: *f32,
+    all_Wq: *f32, all_bq: *f32, all_Wk: *f32, all_bk: *f32,
+    all_Wv: *f32, all_bv: *f32, all_Wo: *f32, all_bo: *f32,
+    all_ln1g: *f32, all_ln1b: *f32, all_Wf1: *f32, all_bf1: *f32,
+    all_Wf2: *f32, all_bf2: *f32, all_ln2g: *f32, all_ln2b: *f32,
+    ln_f_g: *f32, ln_f_b: *f32, W_out: *f32, b_out: *f32,
+    x_emb: *f32, all_q: *f32, all_k: *f32, all_v: *f32,
+    all_ao: *f32, all_r1: *f32, all_l1o: *f32, all_l1m: *f32, all_l1s: *f32,
+    all_f1o: *f32, all_f1a: *f32, all_r2: *f32, all_l2o: *f32,
+    all_l2m: *f32, all_l2s: *f32, all_ap: *f32,
+    lin_buf: *f32, scr1: *f32, scr2: *f32,
+    hq: *f32, hk: *f32, hv: *f32, ho: *f32,
+    as_buf: *f32, ap_buf: *f32,
+    lfo: *f32, lfm: *f32, lfs: *f32, logits: *f32) {
+
+    for t in 0..T {
+        let tok: i32 = ctx[t];
+        for d in 0..D { x_emb[t * D + d] = tok_emb[tok * D + d] + pos_emb[t * D + d]; }
+    }
+
+    for layer in 0..N {
+        let oTD: i32 = layer * T * D;
+        let oDD: i32 = layer * D * D;
+        let oD: i32 = layer * D;
+        let oTF: i32 = layer * T * FF;
+        let oDF: i32 = layer * D * FF;
+        let oFD: i32 = layer * FF * D;
+        let oF: i32 = layer * FF;
+        let oT: i32 = layer * T;
+        let oHTT: i32 = layer * H * T * T;
+
+        if (layer == 0) { copy_buf(lin_buf, x_emb, T * D); }
+        else { copy_buf(lin_buf, ptr_at(all_l2o, (layer - 1) * T * D), T * D); }
+
+        linear_fwd(lin_buf, ptr_at(all_Wq, oDD), ptr_at(all_bq, oD), ptr_at(all_q, oTD), T, D, D);
+        linear_fwd(lin_buf, ptr_at(all_Wk, oDD), ptr_at(all_bk, oD), ptr_at(all_k, oTD), T, D, D);
+        linear_fwd(lin_buf, ptr_at(all_Wv, oDD), ptr_at(all_bv, oD), ptr_at(all_v, oTD), T, D, D);
+
+        let qp: *f32 = ptr_at(all_q, oTD);
+        let kp: *f32 = ptr_at(all_k, oTD);
+        let vp: *f32 = ptr_at(all_v, oTD);
+        let aop: *f32 = ptr_at(all_ao, oTD);
+
+        for h in 0..H {
+            let ho2: i32 = h * HD;
+            for t in 0..T { for d in 0..HD {
+                hq[t * HD + d] = qp[t * D + ho2 + d];
+                hk[t * HD + d] = kp[t * D + ho2 + d];
+                hv[t * HD + d] = vp[t * D + ho2 + d];
+            } }
+            attention_fwd(hq, hk, hv, ho, as_buf, ap_buf, T, HD);
+            copy_buf(ptr_at(all_ap, oHTT + h * T * T), ap_buf, T * T);
+            for t in 0..T { for d in 0..HD { aop[t * D + ho2 + d] = ho[t * HD + d]; } }
+        }
+
+        linear_fwd(aop, ptr_at(all_Wo, oDD), ptr_at(all_bo, oD), scr1, T, D, D);
+        residual_add(lin_buf, scr1, ptr_at(all_r1, oTD), T * D);
+        layer_norm_fwd(ptr_at(all_r1, oTD), ptr_at(all_ln1g, oD), ptr_at(all_ln1b, oD),
+                       ptr_at(all_l1o, oTD), ptr_at(all_l1m, oT), ptr_at(all_l1s, oT), T, D);
+
+        linear_fwd(ptr_at(all_l1o, oTD), ptr_at(all_Wf1, oDF), ptr_at(all_bf1, oF),
+                   ptr_at(all_f1o, oTF), T, D, FF);
+        gelu_fwd(ptr_at(all_f1o, oTF), ptr_at(all_f1a, oTF), T * FF);
+        linear_fwd(ptr_at(all_f1a, oTF), ptr_at(all_Wf2, oFD), ptr_at(all_bf2, oD), scr2, T, FF, D);
+
+        residual_add(ptr_at(all_l1o, oTD), scr2, ptr_at(all_r2, oTD), T * D);
+        layer_norm_fwd(ptr_at(all_r2, oTD), ptr_at(all_ln2g, oD), ptr_at(all_ln2b, oD),
+                       ptr_at(all_l2o, oTD), ptr_at(all_l2m, oT), ptr_at(all_l2s, oT), T, D);
+    }
+
+    let ll_out: *f32 = ptr_at(all_l2o, (N - 1) * T * D);
+    layer_norm_fwd(ll_out, ln_f_g, ln_f_b, lfo, lfm, lfs, T, D);
+    linear_fwd(lfo, W_out, b_out, logits, T, D, V);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Input helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+fn read_line(buf: *u8, max_len: i32) -> i32 {
+    let mut len: i32 = 0;
+    for i in 0..max_len {
+        let c: i32 = getchar();
+        if (c == 10) { return len; }
+        if (c < 0) {
+            if (len == 0) { return 0 - 1; }
+            return len;
+        }
+        buf[len] = cast::<u8>(c);
+        len = len + 1;
+    }
+    return len;
+}
+
+fn is_quit(buf: *u8, len: i32) -> i32 {
+    if (len == 1) {
+        if (cast::<i32>(buf[0]) == 113) { return 1; }
+    }
+    if (len == 4) {
+        if (cast::<i32>(buf[0]) == 113) {
+            if (cast::<i32>(buf[1]) == 117) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 116) { return 1; }
+                }
+            }
+        }
+        if (cast::<i32>(buf[0]) == 115) {
+            if (cast::<i32>(buf[1]) == 97) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 114) { return 1; }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════════════════╗");
+    print("║   NexaLang Transformer v6 — Chat Instrucional (BPE)       ║");
+    print("║   10-Layer, 8-Head, D=512, V=1024, ~33M params            ║");
+    print("║   BPE tokenizer (2.5x compression, ~1300 chars context)   ║");
+    print("╚══════════════════════════════════════════════════════════════╝");
+    print("");
+
+    let V: i32 = 1024;
+    let D: i32 = 512;
+    let H: i32 = 8;
+    let HD: i32 = 64;
+    let FF: i32 = 2048;
+    let T: i32 = 512;
+    let N: i32 = 10;
+
+    # ═══ LOAD BPE MERGES ═══
+    print("Carregando BPE merges...");
+    let bpe_f: *u8 = fopen("data/bpe_merges.bin", "rb");
+    if (cast::<i64>(bpe_f) == cast::<i64>(0)) {
+        print("ERRO: data/bpe_merges.bin nao encontrado.");
+        return 1;
+    }
+    let bpe_hdr: *i32 = cast::<*i32>(malloc(12));
+    fread(cast::<*u8>(bpe_hdr), cast::<i64>(4), cast::<i64>(3), bpe_f);
+    let num_merges: i32 = bpe_hdr[0];
+    let bpe_vocab: i32 = bpe_hdr[1];
+    let max_tok_len: i32 = bpe_hdr[2];
+    free(cast::<*u8>(bpe_hdr));
+    let bpe_merge_a: *i32 = cast::<*i32>(malloc(num_merges * 4));
+    let bpe_merge_b: *i32 = cast::<*i32>(malloc(num_merges * 4));
+    fread(cast::<*u8>(bpe_merge_a), cast::<i64>(4), cast::<i64>(num_merges), bpe_f);
+    fread(cast::<*u8>(bpe_merge_b), cast::<i64>(4), cast::<i64>(num_merges), bpe_f);
+    let decode_len: *i32 = cast::<*i32>(malloc(bpe_vocab * 4));
+    fread(cast::<*u8>(decode_len), cast::<i64>(4), cast::<i64>(bpe_vocab), bpe_f);
+    let decode_data: *u8 = malloc(bpe_vocab * max_tok_len);
+    fread(decode_data, cast::<i64>(1), cast::<i64>(bpe_vocab * max_tok_len), bpe_f);
+    fclose(bpe_f);
+    print("  BPE carregado.");
+
+    # ═══ LOAD MODEL WEIGHTS ═══
+    print("Carregando pesos de model_v6_ft.bin...");
+    let tok_emb: *f32 = alloc_f32(V * D);
+    let pos_emb: *f32 = alloc_f32(T * D);
+    let all_Wq: *f32 = alloc_f32(N * D * D);
+    let all_bq: *f32 = alloc_f32(N * D);
+    let all_Wk: *f32 = alloc_f32(N * D * D);
+    let all_bk: *f32 = alloc_f32(N * D);
+    let all_Wv: *f32 = alloc_f32(N * D * D);
+    let all_bv: *f32 = alloc_f32(N * D);
+    let all_Wo: *f32 = alloc_f32(N * D * D);
+    let all_bo: *f32 = alloc_f32(N * D);
+    let all_ln1g: *f32 = alloc_f32(N * D);
+    let all_ln1b: *f32 = alloc_f32(N * D);
+    let all_Wf1: *f32 = alloc_f32(N * D * FF);
+    let all_bf1: *f32 = alloc_f32(N * FF);
+    let all_Wf2: *f32 = alloc_f32(N * FF * D);
+    let all_bf2: *f32 = alloc_f32(N * D);
+    let all_ln2g: *f32 = alloc_f32(N * D);
+    let all_ln2b: *f32 = alloc_f32(N * D);
+    let ln_f_g: *f32 = alloc_f32(D);
+    let ln_f_b: *f32 = alloc_f32(D);
+    let W_out: *f32 = alloc_f32(D * V);
+    let b_out: *f32 = alloc_f32(V);
+
+    let lf: *u8 = fopen("model_v6_ft.bin", "rb");
+    if (cast::<i64>(lf) == cast::<i64>(0)) {
+        print("ERRO: model_v6_ft.bin nao encontrado. Execute fine-tuning primeiro.");
+        return 1;
+    }
+    let lhdr: *i32 = cast::<*i32>(malloc(24));
+    fread(cast::<*u8>(lhdr), cast::<i64>(4), cast::<i64>(6), lf);
+    free(cast::<*u8>(lhdr));
+    fread(cast::<*u8>(tok_emb), cast::<i64>(4), cast::<i64>(V * D), lf);
+    fread(cast::<*u8>(pos_emb), cast::<i64>(4), cast::<i64>(T * D), lf);
+    fread(cast::<*u8>(all_Wq), cast::<i64>(4), cast::<i64>(N * D * D), lf);
+    fread(cast::<*u8>(all_bq), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_Wk), cast::<i64>(4), cast::<i64>(N * D * D), lf);
+    fread(cast::<*u8>(all_bk), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_Wv), cast::<i64>(4), cast::<i64>(N * D * D), lf);
+    fread(cast::<*u8>(all_bv), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_Wo), cast::<i64>(4), cast::<i64>(N * D * D), lf);
+    fread(cast::<*u8>(all_bo), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_ln1g), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_ln1b), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_Wf1), cast::<i64>(4), cast::<i64>(N * D * FF), lf);
+    fread(cast::<*u8>(all_bf1), cast::<i64>(4), cast::<i64>(N * FF), lf);
+    fread(cast::<*u8>(all_Wf2), cast::<i64>(4), cast::<i64>(N * FF * D), lf);
+    fread(cast::<*u8>(all_bf2), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_ln2g), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(all_ln2b), cast::<i64>(4), cast::<i64>(N * D), lf);
+    fread(cast::<*u8>(ln_f_g), cast::<i64>(4), cast::<i64>(D), lf);
+    fread(cast::<*u8>(ln_f_b), cast::<i64>(4), cast::<i64>(D), lf);
+    fread(cast::<*u8>(W_out), cast::<i64>(4), cast::<i64>(D * V), lf);
+    fread(cast::<*u8>(b_out), cast::<i64>(4), cast::<i64>(V), lf);
+    fclose(lf);
+    print("  Pesos carregados!");
+
+    # ═══ ACTIVATION BUFFERS (inference only) ═══
+    let x_emb: *f32 = alloc_f32(T * D);
+    let all_q: *f32 = alloc_f32(N * T * D);
+    let all_k: *f32 = alloc_f32(N * T * D);
+    let all_v: *f32 = alloc_f32(N * T * D);
+    let all_ao: *f32 = alloc_f32(N * T * D);
+    let all_r1: *f32 = alloc_f32(N * T * D);
+    let all_l1o: *f32 = alloc_f32(N * T * D);
+    let all_l1m: *f32 = alloc_f32(N * T);
+    let all_l1s: *f32 = alloc_f32(N * T);
+    let all_f1o: *f32 = alloc_f32(N * T * FF);
+    let all_f1a: *f32 = alloc_f32(N * T * FF);
+    let all_r2: *f32 = alloc_f32(N * T * D);
+    let all_l2o: *f32 = alloc_f32(N * T * D);
+    let all_l2m: *f32 = alloc_f32(N * T);
+    let all_l2s: *f32 = alloc_f32(N * T);
+    let all_ap: *f32 = alloc_f32(N * H * T * T);
+    let lin_buf: *f32 = alloc_f32(T * D);
+    let scr1: *f32 = alloc_f32(T * D);
+    let scr2: *f32 = alloc_f32(T * D);
+    let hq: *f32 = alloc_f32(T * HD);
+    let hk: *f32 = alloc_f32(T * HD);
+    let hv: *f32 = alloc_f32(T * HD);
+    let ho: *f32 = alloc_f32(T * HD);
+    let as_buf: *f32 = alloc_f32(T * T);
+    let ap_buf: *f32 = alloc_f32(T * T);
+    let lfo: *f32 = alloc_f32(T * D);
+    let lfm: *f32 = alloc_f32(T);
+    let lfs: *f32 = alloc_f32(T);
+    let logits: *f32 = alloc_f32(T * V);
+    let probs: *f32 = alloc_f32(T * V);
+    let temp_buf: *f32 = alloc_f32(V);
+
+    # ═══ CHAT STATE ═══
+    let GEN_LEN: i32 = 300;
+    let TEMP: f32 = 0.7;
+    let TOP_K: i32 = 8;
+
+    let ctx: *i32 = cast::<*i32>(malloc(T * 4));
+    for i in 0..T { ctx[i] = 0; }
+    let input_buf: *u8 = malloc(1024);
+    let prompt_buf: *u8 = malloc(2048);
+    let bpe_buf: *i32 = cast::<*i32>(malloc(2048 * 4));
+    let mut rng: i32 = 42;
+
+    # ═══ PRIME CONTEXT with BPE-encoded [P]/[R] examples ═══
+    # Build prime text as bytes: "[P] Ola!\n[R] Ola! Como posso ajudar?\n\n[P] Tudo bem?\n[R] Tudo bem sim! O que deseja saber?\n\n"
+    let prime: *u8 = malloc(256);
+    let mut pi: i32 = 0;
+    # [P] Ola!\n
+    prime[0] = cast::<u8>(91); prime[1] = cast::<u8>(80); prime[2] = cast::<u8>(93); prime[3] = cast::<u8>(32);
+    prime[4] = cast::<u8>(79); prime[5] = cast::<u8>(108); prime[6] = cast::<u8>(97); prime[7] = cast::<u8>(33);
+    prime[8] = cast::<u8>(10);
+    # [R] Ola! Como posso ajudar?\n\n
+    prime[9] = cast::<u8>(91); prime[10] = cast::<u8>(82); prime[11] = cast::<u8>(93); prime[12] = cast::<u8>(32);
+    prime[13] = cast::<u8>(79); prime[14] = cast::<u8>(108); prime[15] = cast::<u8>(97); prime[16] = cast::<u8>(33);
+    prime[17] = cast::<u8>(32);
+    prime[18] = cast::<u8>(67); prime[19] = cast::<u8>(111); prime[20] = cast::<u8>(109); prime[21] = cast::<u8>(111);
+    prime[22] = cast::<u8>(32);
+    prime[23] = cast::<u8>(112); prime[24] = cast::<u8>(111); prime[25] = cast::<u8>(115); prime[26] = cast::<u8>(115);
+    prime[27] = cast::<u8>(111); prime[28] = cast::<u8>(32);
+    prime[29] = cast::<u8>(97); prime[30] = cast::<u8>(106); prime[31] = cast::<u8>(117); prime[32] = cast::<u8>(100);
+    prime[33] = cast::<u8>(97); prime[34] = cast::<u8>(114); prime[35] = cast::<u8>(63);
+    prime[36] = cast::<u8>(10); prime[37] = cast::<u8>(10);
+    # [P] Tudo bem?\n
+    prime[38] = cast::<u8>(91); prime[39] = cast::<u8>(80); prime[40] = cast::<u8>(93); prime[41] = cast::<u8>(32);
+    prime[42] = cast::<u8>(84); prime[43] = cast::<u8>(117); prime[44] = cast::<u8>(100); prime[45] = cast::<u8>(111);
+    prime[46] = cast::<u8>(32);
+    prime[47] = cast::<u8>(98); prime[48] = cast::<u8>(101); prime[49] = cast::<u8>(109); prime[50] = cast::<u8>(63);
+    prime[51] = cast::<u8>(10);
+    # [R] Tudo bem sim! O que deseja saber?\n\n
+    prime[52] = cast::<u8>(91); prime[53] = cast::<u8>(82); prime[54] = cast::<u8>(93); prime[55] = cast::<u8>(32);
+    prime[56] = cast::<u8>(84); prime[57] = cast::<u8>(117); prime[58] = cast::<u8>(100); prime[59] = cast::<u8>(111);
+    prime[60] = cast::<u8>(32);
+    prime[61] = cast::<u8>(98); prime[62] = cast::<u8>(101); prime[63] = cast::<u8>(109);
+    prime[64] = cast::<u8>(32);
+    prime[65] = cast::<u8>(115); prime[66] = cast::<u8>(105); prime[67] = cast::<u8>(109); prime[68] = cast::<u8>(33);
+    prime[69] = cast::<u8>(32);
+    prime[70] = cast::<u8>(79); prime[71] = cast::<u8>(32);
+    prime[72] = cast::<u8>(113); prime[73] = cast::<u8>(117); prime[74] = cast::<u8>(101);
+    prime[75] = cast::<u8>(32);
+    prime[76] = cast::<u8>(100); prime[77] = cast::<u8>(101); prime[78] = cast::<u8>(115); prime[79] = cast::<u8>(101);
+    prime[80] = cast::<u8>(106); prime[81] = cast::<u8>(97);
+    prime[82] = cast::<u8>(32);
+    prime[83] = cast::<u8>(115); prime[84] = cast::<u8>(97); prime[85] = cast::<u8>(98); prime[86] = cast::<u8>(101);
+    prime[87] = cast::<u8>(114); prime[88] = cast::<u8>(63);
+    prime[89] = cast::<u8>(10); prime[90] = cast::<u8>(10);
+    let PRIME_LEN: i32 = 91;
+
+    # BPE-encode the prime text
+    let prime_bpe: *i32 = cast::<*i32>(malloc(256 * 4));
+    let prime_bpe_len: i32 = bpe_encode(prime, PRIME_LEN, bpe_merge_a, bpe_merge_b, num_merges, prime_bpe);
+
+    # Push prime BPE tokens into context
+    for i in 0..prime_bpe_len {
+        for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+        ctx[T - 1] = prime_bpe[i];
+    }
+    free(prime);
+    free(cast::<*u8>(prime_bpe));
+
+    print("");
+    print("Pronto! Modelo v6 carregado (BPE + 33M params).");
+    print("  Digite sua mensagem e pressione Enter.");
+    print("  Digite 'q', 'quit' ou 'sair' para encerrar.");
+    print("══════════════════════════════════════════════════════════════");
+
+    # ═══ CHAT LOOP ═══
+    for turn in 0..10000 {
+        print("");
+        putchar(62); putchar(32);
+        fflush(cast::<*u8>(0));
+
+        let input_len: i32 = read_line(input_buf, 1023);
+
+        if (input_len < 0) {
+            print("");
+            print("Ate logo!");
+            return 0;
+        }
+
+        if (is_quit(input_buf, input_len) == 1) {
+            print("");
+            print("Ate logo!");
+            return 0;
+        }
+
+        if (input_len > 0) {
+            # Build prompt bytes: "[P] " + input + "\n[R] "
+            let mut pb_len: i32 = 0;
+            # [P]<space>
+            prompt_buf[0] = cast::<u8>(91); prompt_buf[1] = cast::<u8>(80);
+            prompt_buf[2] = cast::<u8>(93); prompt_buf[3] = cast::<u8>(32);
+            pb_len = 4;
+            # user input bytes
+            for i in 0..input_len {
+                prompt_buf[pb_len] = input_buf[i];
+                pb_len = pb_len + 1;
+            }
+            # \n[R]<space>
+            prompt_buf[pb_len] = cast::<u8>(10); pb_len = pb_len + 1;
+            prompt_buf[pb_len] = cast::<u8>(91); pb_len = pb_len + 1;
+            prompt_buf[pb_len] = cast::<u8>(82); pb_len = pb_len + 1;
+            prompt_buf[pb_len] = cast::<u8>(93); pb_len = pb_len + 1;
+            prompt_buf[pb_len] = cast::<u8>(32); pb_len = pb_len + 1;
+
+            # BPE-encode the prompt
+            let prompt_ntoks: i32 = bpe_encode(prompt_buf, pb_len, bpe_merge_a, bpe_merge_b, num_merges, bpe_buf);
+
+            # Push BPE tokens into context (sliding window)
+            for i in 0..prompt_ntoks {
+                for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                ctx[T - 1] = bpe_buf[i];
+            }
+
+            # ══ GENERATE RESPONSE ══
+            let mut prev_byte: i32 = 0;
+            let mut done: i32 = 0;
+
+            for g in 0..GEN_LEN {
+                if (done == 0) {
+                    transformer_forward(ctx, T, D, H, HD, FF, N, V,
+                        tok_emb, pos_emb,
+                        all_Wq, all_bq, all_Wk, all_bk, all_Wv, all_bv, all_Wo, all_bo,
+                        all_ln1g, all_ln1b, all_Wf1, all_bf1, all_Wf2, all_bf2,
+                        all_ln2g, all_ln2b, ln_f_g, ln_f_b, W_out, b_out,
+                        x_emb, all_q, all_k, all_v, all_ao, all_r1, all_l1o, all_l1m, all_l1s,
+                        all_f1o, all_f1a, all_r2, all_l2o, all_l2m, all_l2s, all_ap,
+                        lin_buf, scr1, scr2, hq, hk, hv, ho, as_buf, ap_buf,
+                        lfo, lfm, lfs, logits);
+
+                    let last_pos: i32 = (T - 1) * V;
+                    for c in 0..V { temp_buf[c] = logits[last_pos + c] / TEMP; }
+                    softmax_rows(temp_buf, probs, 1, V);
+                    top_k_filter(probs, V, TOP_K);
+
+                    rng = xorshift32(rng);
+                    let next_tok: i32 = sample_from_probs(probs, V, rng);
+                    rng = xorshift32(rng + next_tok);
+
+                    # BPE decode: output bytes for this token
+                    let tok_base: i32 = next_tok * max_tok_len;
+                    let tok_len: i32 = decode_len[next_tok];
+                    for b in 0..tok_len {
+                        let byte_val: i32 = cast::<i32>(decode_data[tok_base + b]);
+                        putchar(byte_val);
+
+                        # Stop on double newline
+                        if (byte_val == 10) {
+                            if (prev_byte == 10) { done = 1; }
+                        }
+                        prev_byte = byte_val;
+                    }
+                    fflush(cast::<*u8>(0));
+
+                    # Push token into context
+                    for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                    ctx[T - 1] = next_tok;
+                }
+            }
+            print("──────────────────────────────────────────────────────────────");
+        }
+    }
+
+    return 0;
+}

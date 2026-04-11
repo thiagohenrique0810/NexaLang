@@ -12,8 +12,8 @@
 #
 # Build & Run:
 #   nxc build examples/product_server.nxl --no-link
-#   clang dev/artifacts/output.ll -lsqlite3 -O2 -o dev/artifacts/product_server
-#   ./dev/artifacts/product_server
+#   clang artifacts/build/output.ll -lsqlite3 -O2 -o artifacts/build/bin/product_server
+#   ./artifacts/build/bin/product_server
 #
 # Testar com Postman ou curl:
 #   curl http://localhost:8080/products

@@ -1,0 +1,559 @@
+# transformer_chat.nxl — Interactive Chat with NexaLang Transformer v3
+#
+# Loads pre-trained weights from model_v3.bin and vocab from data/text/train.bin
+# Interactive: type a prompt, model continues it. Type 'quit' or 'q' to exit.
+#
+# Compile:
+#   python3 bootstrap/main.py examples/transformer_chat.nxl --emit ll --opt 3
+#   clang artifacts/build/output.ll -o chat -lm -O2 -framework Accelerate
+
+extern "C" {
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8);
+    fn printf(fmt: *u8, ...) -> i32;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(ptr: *u8, size: i64, nmemb: i64, stream: *u8) -> i64;
+    fn fclose(stream: *u8) -> i32;
+    fn expf(x: f32) -> f32;
+    fn sqrtf(x: f32) -> f32;
+    fn putchar(c: i32) -> i32;
+    fn fflush(stream: *u8) -> i32;
+    fn getchar() -> i32;
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32, m: i32, n: i32, k: i32,
+                   alpha: f32, A: *f32, lda: i32, B: *f32, ldb: i32,
+                   beta: f32, C: *f32, ldc: i32);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+fn alloc_f32(n: i32) -> *f32 {
+    let buf: *f32 = cast::<*f32>(malloc(n * 4));
+    for i in 0..n { buf[i] = 0.0; }
+    return buf;
+}
+
+fn copy_buf(dst: *f32, src: *f32, n: i32) {
+    for i in 0..n { dst[i] = src[i]; }
+}
+
+fn ptr_at(base: *f32, offset: i32) -> *f32 {
+    return cast::<*f32>(cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset * 4)));
+}
+
+fn xorshift32(state: i32) -> i32 {
+    let mut s: i32 = state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    return s;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Data loader (for vocab table)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn load_tokens(path: *u8, out_n: *i32, out_vocab: *i32, out_table: *u8) -> *u8 {
+    let f: *u8 = fopen(path, "rb");
+    if (cast::<i64>(f) == cast::<i64>(0)) {
+        print("ERROR: cannot open file");
+        return cast::<*u8>(0);
+    }
+    let hdr: *i32 = cast::<*i32>(malloc(8));
+    fread(cast::<*u8>(hdr), cast::<i64>(4), cast::<i64>(2), f);
+    let n: i32 = hdr[0];
+    let v: i32 = hdr[1];
+    *out_n = n;
+    *out_vocab = v;
+    free(cast::<*u8>(hdr));
+    let tokens: *u8 = malloc(n);
+    fread(tokens, cast::<i64>(1), cast::<i64>(n), f);
+    fread(out_table, cast::<i64>(1), cast::<i64>(v), f);
+    fclose(f);
+    return tokens;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# LayerNorm (forward only)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn layer_norm_fwd(x: *f32, gamma: *f32, beta: *f32, out: *f32,
+                  mean_buf: *f32, rstd_buf: *f32, T: i32, D: i32) {
+    let eps: f32 = 0.00001;
+    for t in 0..T {
+        let base: i32 = t * D;
+        let mut m: f32 = 0.0;
+        for d in 0..D { m = m + x[base + d]; }
+        m = m / cast::<f32>(D);
+        mean_buf[t] = m;
+        let mut v: f32 = 0.0;
+        for d in 0..D {
+            let diff: f32 = x[base + d] - m;
+            v = v + diff * diff;
+        }
+        v = v / cast::<f32>(D);
+        let rstd: f32 = 1.0 / sqrtf(v + eps);
+        rstd_buf[t] = rstd;
+        for d in 0..D {
+            out[base + d] = gamma[d] * (x[base + d] - m) * rstd + beta[d];
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Softmax (per-row)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn softmax_rows(x: *f32, out: *f32, rows: i32, cols: i32) {
+    for r in 0..rows {
+        let base: i32 = r * cols;
+        let mut mx: f32 = x[base];
+        for c in 1..cols {
+            if (x[base + c] > mx) { mx = x[base + c]; }
+        }
+        let mut sum: f32 = 0.0;
+        for c in 0..cols {
+            out[base + c] = expf(x[base + c] - mx);
+            sum = sum + out[base + c];
+        }
+        let inv: f32 = 1.0 / sum;
+        for c in 0..cols { out[base + c] = out[base + c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Self-Attention (forward only, BLAS accelerated)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn attention_fwd(Q: *f32, K: *f32, V: *f32, out: *f32,
+                 attn_scores: *f32, attn_probs: *f32, T: i32, HD: i32) {
+    let scale: f32 = 1.0 / sqrtf(cast::<f32>(HD));
+    cblas_sgemm(101, 111, 112, T, T, HD, scale, Q, HD, K, HD, 0.0, attn_scores, T);
+    for i in 0..T {
+        for j in 0..T {
+            if (j > i) { attn_scores[i * T + j] = 0.0 - 100000.0; }
+        }
+    }
+    softmax_rows(attn_scores, attn_probs, T, T);
+    cblas_sgemm(101, 111, 111, T, HD, T, 1.0, attn_probs, T, V, HD, 0.0, out, HD);
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Linear (forward only, BLAS accelerated)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn linear_fwd(x: *f32, W: *f32, b: *f32, out: *f32, T: i32, in_dim: i32, out_dim: i32) {
+    cblas_sgemm(101, 111, 111, T, out_dim, in_dim, 1.0, x, in_dim, W, out_dim, 0.0, out, out_dim);
+    for t in 0..T {
+        for o in 0..out_dim { out[t * out_dim + o] = out[t * out_dim + o] + b[o]; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# GELU (forward only)
+# ═══════════════════════════════════════════════════════════════════════
+
+fn gelu_fwd(x: *f32, out: *f32, n: i32) {
+    for i in 0..n {
+        let s: f32 = 0.0 - 1.702 * x[i];
+        let sig: f32 = 1.0 / (1.0 + expf(s));
+        out[i] = x[i] * sig;
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Residual
+# ═══════════════════════════════════════════════════════════════════════
+
+fn residual_add(x: *f32, residual: *f32, out: *f32, n: i32) {
+    for i in 0..n { out[i] = x[i] + residual[i]; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sampling
+# ═══════════════════════════════════════════════════════════════════════
+
+fn sample_from_probs(probs: *f32, v: i32, seed: i32) -> i32 {
+    let state: i32 = xorshift32(seed);
+    let r: f32 = cast::<f32>(state & 2147483647) / cast::<f32>(2147483647);
+    let mut cumsum: f32 = 0.0;
+    for i in 0..v {
+        cumsum = cumsum + probs[i];
+        if (cumsum >= r) { return i; }
+    }
+    return v - 1;
+}
+
+fn top_k_filter(probs: *f32, V: i32, k: i32) {
+    let temp: *f32 = alloc_f32(V);
+    copy_buf(temp, probs, V);
+    let neg_inf: f32 = 0.0 - 999999.0;
+    let mut threshold: f32 = 0.0;
+    for pass in 0..k {
+        let mut max_val: f32 = neg_inf;
+        let mut max_idx: i32 = 0;
+        for c in 0..V {
+            if (temp[c] > max_val) { max_val = temp[c]; max_idx = c; }
+        }
+        threshold = max_val;
+        temp[max_idx] = neg_inf;
+    }
+    free(cast::<*u8>(temp));
+    let mut rsum: f32 = 0.0;
+    for c in 0..V {
+        if (probs[c] < threshold) { probs[c] = 0.0; }
+        else { rsum = rsum + probs[c]; }
+    }
+    if (rsum > 0.0) {
+        let inv: f32 = 1.0 / rsum;
+        for c in 0..V { probs[c] = probs[c] * inv; }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Input helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+fn read_line(buf: *u8, max_len: i32) -> i32 {
+    let mut len: i32 = 0;
+    for i in 0..max_len {
+        let c: i32 = getchar();
+        if (c == 10) { return len; }
+        if (c < 0) {
+            if (len == 0) { return 0 - 1; }
+            return len;
+        }
+        buf[len] = cast::<u8>(c);
+        len = len + 1;
+    }
+    return len;
+}
+
+fn is_quit(buf: *u8, len: i32) -> i32 {
+    if (len == 1) {
+        if (cast::<i32>(buf[0]) == 113) { return 1; }
+    }
+    if (len == 4) {
+        if (cast::<i32>(buf[0]) == 113) {
+            if (cast::<i32>(buf[1]) == 117) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 116) { return 1; }
+                }
+            }
+        }
+        if (cast::<i32>(buf[0]) == 115) {
+            if (cast::<i32>(buf[1]) == 97) {
+                if (cast::<i32>(buf[2]) == 105) {
+                    if (cast::<i32>(buf[3]) == 114) { return 1; }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    print("╔══════════════════════════════════════════════════════════════╗");
+    print("║   NexaLang Transformer Chat                                ║");
+    print("║   Model: 4-Layer, 4-Head, D=128, ~820K params             ║");
+    print("║   Type text, model continues it (Shakespeare style)       ║");
+    print("║   Commands: 'quit', 'q', or 'sair' to exit                ║");
+    print("╚══════════════════════════════════════════════════════════════╝");
+    print("");
+
+    # ═══ LOAD VOCAB ═══
+    let p_n: *i32 = cast::<*i32>(malloc(4));
+    let p_v: *i32 = cast::<*i32>(malloc(4));
+    let vocab_table: *u8 = malloc(256);
+    let train_tokens: *u8 = load_tokens("data/text/train.bin", p_n, p_v, vocab_table);
+    if (cast::<i64>(train_tokens) == cast::<i64>(0)) {
+        print("ERROR: data/text/train.bin not found.");
+        return 1;
+    }
+    let V_file: i32 = *p_v;
+    free(train_tokens);
+    free(cast::<*u8>(p_n));
+    free(cast::<*u8>(p_v));
+
+    # ═══ LOAD MODEL ═══
+    print("Loading model from model_v3.bin...");
+    let mf: *u8 = fopen("model_v3.bin", "rb");
+    if (cast::<i64>(mf) == cast::<i64>(0)) {
+        print("ERROR: model_v3.bin not found. Train first with transformer_lm_v3.");
+        return 1;
+    }
+    let hdr: *i32 = cast::<*i32>(malloc(24));
+    fread(cast::<*u8>(hdr), cast::<i64>(4), cast::<i64>(6), mf);
+    let V: i32 = hdr[0];
+    let D: i32 = hdr[1];
+    let H: i32 = hdr[2];
+    let FF: i32 = hdr[3];
+    let T: i32 = hdr[4];
+    let N: i32 = hdr[5];
+    let HD: i32 = D / H;
+    free(cast::<*u8>(hdr));
+
+    print("  V:");
+    print(V);
+    print("  D:");
+    print(D);
+    print("  H:");
+    print(H);
+    print("  FF:");
+    print(FF);
+    print("  T:");
+    print(T);
+    print("  N:");
+    print(N);
+
+    # Build reverse vocab: ASCII char -> token_id
+    let rev_vocab: *i32 = cast::<*i32>(malloc(256 * 4));
+    for i in 0..256 { rev_vocab[i] = 0; }
+    for i in 0..V { rev_vocab[cast::<i32>(vocab_table[i])] = i; }
+    let newline_tok: i32 = rev_vocab[10];
+
+    # ═══ ALLOCATE & LOAD WEIGHTS ═══
+    let tok_emb: *f32 = alloc_f32(V * D);
+    let pos_emb: *f32 = alloc_f32(T * D);
+    let all_Wq: *f32 = alloc_f32(N * D * D);
+    let all_bq: *f32 = alloc_f32(N * D);
+    let all_Wk: *f32 = alloc_f32(N * D * D);
+    let all_bk: *f32 = alloc_f32(N * D);
+    let all_Wv: *f32 = alloc_f32(N * D * D);
+    let all_bv: *f32 = alloc_f32(N * D);
+    let all_Wo: *f32 = alloc_f32(N * D * D);
+    let all_bo: *f32 = alloc_f32(N * D);
+    let all_ln1g: *f32 = alloc_f32(N * D);
+    let all_ln1b: *f32 = alloc_f32(N * D);
+    let all_Wf1: *f32 = alloc_f32(N * D * FF);
+    let all_bf1: *f32 = alloc_f32(N * FF);
+    let all_Wf2: *f32 = alloc_f32(N * FF * D);
+    let all_bf2: *f32 = alloc_f32(N * D);
+    let all_ln2g: *f32 = alloc_f32(N * D);
+    let all_ln2b: *f32 = alloc_f32(N * D);
+    let ln_f_g: *f32 = alloc_f32(D);
+    let ln_f_b: *f32 = alloc_f32(D);
+    let W_out: *f32 = alloc_f32(D * V);
+    let b_out: *f32 = alloc_f32(V);
+
+    fread(cast::<*u8>(tok_emb), cast::<i64>(4), cast::<i64>(V * D), mf);
+    fread(cast::<*u8>(pos_emb), cast::<i64>(4), cast::<i64>(T * D), mf);
+    fread(cast::<*u8>(all_Wq), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bq), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wk), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bk), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wv), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bv), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wo), cast::<i64>(4), cast::<i64>(N * D * D), mf);
+    fread(cast::<*u8>(all_bo), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln1g), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln1b), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_Wf1), cast::<i64>(4), cast::<i64>(N * D * FF), mf);
+    fread(cast::<*u8>(all_bf1), cast::<i64>(4), cast::<i64>(N * FF), mf);
+    fread(cast::<*u8>(all_Wf2), cast::<i64>(4), cast::<i64>(N * FF * D), mf);
+    fread(cast::<*u8>(all_bf2), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln2g), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(all_ln2b), cast::<i64>(4), cast::<i64>(N * D), mf);
+    fread(cast::<*u8>(ln_f_g), cast::<i64>(4), cast::<i64>(D), mf);
+    fread(cast::<*u8>(ln_f_b), cast::<i64>(4), cast::<i64>(D), mf);
+    fread(cast::<*u8>(W_out), cast::<i64>(4), cast::<i64>(D * V), mf);
+    fread(cast::<*u8>(b_out), cast::<i64>(4), cast::<i64>(V), mf);
+    fclose(mf);
+    print("  Weights loaded!");
+    print("");
+
+    # ═══ ACTIVATION BUFFERS ═══
+    let x_emb: *f32 = alloc_f32(T * D);
+    let all_q: *f32 = alloc_f32(N * T * D);
+    let all_k: *f32 = alloc_f32(N * T * D);
+    let all_v: *f32 = alloc_f32(N * T * D);
+    let all_ao: *f32 = alloc_f32(N * T * D);
+    let all_r1: *f32 = alloc_f32(N * T * D);
+    let all_l1o: *f32 = alloc_f32(N * T * D);
+    let all_l1m: *f32 = alloc_f32(N * T);
+    let all_l1s: *f32 = alloc_f32(N * T);
+    let all_f1o: *f32 = alloc_f32(N * T * FF);
+    let all_f1a: *f32 = alloc_f32(N * T * FF);
+    let all_r2: *f32 = alloc_f32(N * T * D);
+    let all_l2o: *f32 = alloc_f32(N * T * D);
+    let all_l2m: *f32 = alloc_f32(N * T);
+    let all_l2s: *f32 = alloc_f32(N * T);
+
+    let lin_buf: *f32 = alloc_f32(T * D);
+    let scr1: *f32 = alloc_f32(T * D);
+    let scr2: *f32 = alloc_f32(T * D);
+    let hq: *f32 = alloc_f32(T * HD);
+    let hk: *f32 = alloc_f32(T * HD);
+    let hv: *f32 = alloc_f32(T * HD);
+    let ho: *f32 = alloc_f32(T * HD);
+    let as_buf: *f32 = alloc_f32(T * T);
+    let ap_buf: *f32 = alloc_f32(T * T);
+    let lfo: *f32 = alloc_f32(T * D);
+    let lfm: *f32 = alloc_f32(T);
+    let lfs: *f32 = alloc_f32(T);
+    let logits: *f32 = alloc_f32(T * V);
+    let probs: *f32 = alloc_f32(T * V);
+    let temp_buf: *f32 = alloc_f32(V);
+
+    # ═══ CHAT STATE ═══
+    let GEN_LEN: i32 = 300;
+    let TEMP: f32 = 0.8;
+    let TOP_K: i32 = 10;
+
+    let ctx: *u8 = malloc(T);
+    for i in 0..T { ctx[i] = cast::<u8>(0); }
+    let input_buf: *u8 = malloc(1024);
+    let mut rng: i32 = 42;
+
+    print("Ready! Type your prompt (Shakespeare-style works best).");
+    print("Examples: 'ROMEO:', 'To be or not', 'My lord,'");
+    print("══════════════════════════════════════════════════════════════");
+
+    # ═══ CHAT LOOP ═══
+    for turn in 0..10000 {
+        print("");
+        putchar(62); putchar(32);
+        fflush(cast::<*u8>(0));
+
+        let input_len: i32 = read_line(input_buf, 1023);
+
+        # EOF (Ctrl+D)
+        if (input_len < 0) {
+            print("");
+            print("Goodbye!");
+            return 0;
+        }
+
+        # Quit commands
+        if (is_quit(input_buf, input_len) == 1) {
+            print("");
+            print("Goodbye!");
+            return 0;
+        }
+
+        if (input_len > 0) {
+            # Encode input chars into context window
+            for i in 0..input_len {
+                for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                let ch: i32 = cast::<i32>(input_buf[i]);
+                ctx[T - 1] = cast::<u8>(rev_vocab[ch]);
+            }
+            # Add newline separator
+            for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+            ctx[T - 1] = cast::<u8>(newline_tok);
+
+            print("");
+
+            # ══════════════════════════════════════════════════════════
+            # GENERATE RESPONSE
+            # ══════════════════════════════════════════════════════════
+            let mut prev_tok: i32 = newline_tok;
+            let mut done: i32 = 0;
+
+            for g in 0..GEN_LEN {
+                if (done == 0) {
+                    # ── Embedding ──
+                    for t in 0..T {
+                        let tok: i32 = cast::<i32>(ctx[t]);
+                        for d in 0..D {
+                            x_emb[t * D + d] = tok_emb[tok * D + d] + pos_emb[t * D + d];
+                        }
+                    }
+
+                    # ── Transformer Layers ──
+                    for layer in 0..N {
+                        let oTD: i32 = layer * T * D;
+                        let oDD: i32 = layer * D * D;
+                        let oD: i32 = layer * D;
+                        let oTF: i32 = layer * T * FF;
+                        let oDF: i32 = layer * D * FF;
+                        let oFD: i32 = layer * FF * D;
+                        let oF: i32 = layer * FF;
+                        let oT: i32 = layer * T;
+
+                        if (layer == 0) { copy_buf(lin_buf, x_emb, T * D); }
+                        else { copy_buf(lin_buf, ptr_at(all_l2o, (layer - 1) * T * D), T * D); }
+
+                        linear_fwd(lin_buf, ptr_at(all_Wq, oDD), ptr_at(all_bq, oD),
+                                   ptr_at(all_q, oTD), T, D, D);
+                        linear_fwd(lin_buf, ptr_at(all_Wk, oDD), ptr_at(all_bk, oD),
+                                   ptr_at(all_k, oTD), T, D, D);
+                        linear_fwd(lin_buf, ptr_at(all_Wv, oDD), ptr_at(all_bv, oD),
+                                   ptr_at(all_v, oTD), T, D, D);
+
+                        let qp: *f32 = ptr_at(all_q, oTD);
+                        let kp: *f32 = ptr_at(all_k, oTD);
+                        let vp: *f32 = ptr_at(all_v, oTD);
+                        let aop: *f32 = ptr_at(all_ao, oTD);
+
+                        for h in 0..H {
+                            let ho2: i32 = h * HD;
+                            for t in 0..T { for d in 0..HD {
+                                hq[t * HD + d] = qp[t * D + ho2 + d];
+                                hk[t * HD + d] = kp[t * D + ho2 + d];
+                                hv[t * HD + d] = vp[t * D + ho2 + d];
+                            } }
+                            attention_fwd(hq, hk, hv, ho, as_buf, ap_buf, T, HD);
+                            for t in 0..T { for d in 0..HD {
+                                aop[t * D + ho2 + d] = ho[t * HD + d];
+                            } }
+                        }
+
+                        linear_fwd(aop, ptr_at(all_Wo, oDD), ptr_at(all_bo, oD), scr1, T, D, D);
+                        residual_add(lin_buf, scr1, ptr_at(all_r1, oTD), T * D);
+                        layer_norm_fwd(ptr_at(all_r1, oTD), ptr_at(all_ln1g, oD),
+                                       ptr_at(all_ln1b, oD), ptr_at(all_l1o, oTD),
+                                       ptr_at(all_l1m, oT), ptr_at(all_l1s, oT), T, D);
+                        linear_fwd(ptr_at(all_l1o, oTD), ptr_at(all_Wf1, oDF),
+                                   ptr_at(all_bf1, oF), ptr_at(all_f1o, oTF), T, D, FF);
+                        gelu_fwd(ptr_at(all_f1o, oTF), ptr_at(all_f1a, oTF), T * FF);
+                        linear_fwd(ptr_at(all_f1a, oTF), ptr_at(all_Wf2, oFD),
+                                   ptr_at(all_bf2, oD), scr2, T, FF, D);
+                        residual_add(ptr_at(all_l1o, oTD), scr2, ptr_at(all_r2, oTD), T * D);
+                        layer_norm_fwd(ptr_at(all_r2, oTD), ptr_at(all_ln2g, oD),
+                                       ptr_at(all_ln2b, oD), ptr_at(all_l2o, oTD),
+                                       ptr_at(all_l2m, oT), ptr_at(all_l2s, oT), T, D);
+                    }
+
+                    # ── Final LayerNorm + Logits ──
+                    let gll: *f32 = ptr_at(all_l2o, (N - 1) * T * D);
+                    layer_norm_fwd(gll, ln_f_g, ln_f_b, lfo, lfm, lfs, T, D);
+                    linear_fwd(lfo, W_out, b_out, logits, T, D, V);
+
+                    # ── Sample with temperature + top-k ──
+                    let last_pos: i32 = (T - 1) * V;
+                    for c in 0..V { temp_buf[c] = logits[last_pos + c] / TEMP; }
+                    softmax_rows(temp_buf, probs, 1, V);
+                    top_k_filter(probs, V, TOP_K);
+                    rng = xorshift32(rng);
+                    let next_tok: i32 = sample_from_probs(probs, V, rng);
+                    rng = xorshift32(rng + next_tok);
+
+                    # Print character
+                    let ch: i32 = cast::<i32>(vocab_table[next_tok]);
+                    putchar(ch);
+
+                    # Update context
+                    for j in 0..(T - 1) { ctx[j] = ctx[j + 1]; }
+                    ctx[T - 1] = cast::<u8>(next_tok);
+
+                    # Stop at double newline (paragraph break)
+                    if (next_tok == newline_tok) {
+                        if (prev_tok == newline_tok) { done = 1; }
+                    }
+                    prev_tok = next_tok;
+                }
+            }
+            fflush(cast::<*u8>(0));
+            print("");
+            print("──────────────────────────────────────────────────────────────");
+        }
+    }
+
+    return 0;
+}

@@ -107,7 +107,7 @@ nxpkg init meu_projeto
 nxc run examples/hello.nxl
 
 # Compilar para binário nativo otimizado
-nxc build main.nxl --opt O3 --out meu_programa.exe
+nxc build main.nxl --opt O3 --out artifacts/build/bin/meu_programa
 
 # Rodar todos os testes unitários
 nxc test meu_codigo.nxl</code></pre>
@@ -405,7 +405,7 @@ fn main() {
 
                 <h3>SPIR-V Backend</h3>
                 <p>O compilador pode gerar código SPIR-V para execução em GPUs compatíveis:</p>
-                <pre><code>python bootstrap/main.py examples/gpu_kernel.nxl --target spirv --emit spv --out kernel.spv</code></pre>
+                <pre><code>python bootstrap/main.py examples/gpu_kernel.nxl --target spirv --emit spv --out artifacts/build/kernel.spv</code></pre>
 
                 <div class="alert alert-info">
                     <strong>Suporte Vulkan:</strong> O compilador suporta ambiente Vulkan com <code>--spirv-env vulkan</code>.

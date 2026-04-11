@@ -81,9 +81,18 @@ def __nexa_gpu_dispatch(kernel_name_ptr, threads, arg_count, args_ptr):
 # --- JIT Engine ---
 
 def run_jit(llvm_ir):
-    llvm.initialize()
-    llvm.initialize_native_target()
-    llvm.initialize_native_asmprinter()
+    try:
+        llvm.initialize()
+    except RuntimeError:
+        pass
+    try:
+        llvm.initialize_native_target()
+    except RuntimeError:
+        pass
+    try:
+        llvm.initialize_native_asmprinter()
+    except RuntimeError:
+        pass
     
     target = llvm.Target.from_default_triple()
     target_machine = target.create_target_machine()
