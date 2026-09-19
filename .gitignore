@@ -9,6 +9,9 @@ projects-test/
 *.db
 .DS_Store
 
+# Reference PDFs: kept locally, mapped by docs/PLANOS_IMPLEMENTACAO_INDICE.md
+docs/*.pdf
+
 # Generated model weights/checkpoints
 /model*.bin
 /tinyllama*.bin
@@ -33,6 +36,13 @@ projects-test/
 *.spvasm
 *.o
 *.obj
+*.dylib
+*.so
+*.dll
+*.a
+*.exe
+runtime/test_tq
+runtime/test_regressions
 
 # Python
 __pycache__/
