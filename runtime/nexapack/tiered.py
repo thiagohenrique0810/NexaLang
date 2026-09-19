@@ -64,6 +64,11 @@ class TieredTransformerSession(PagedTransformerSession):
     def _allocate_page(self, codec="f32"):
         return _TieredPage(self._tier_plan.layout(codec))
 
+    def fork(self, **overrides):
+        # Aging re-encodes committed pages in place of the prefix, so a shared
+        # page would migrate for one sequence while another still reads it.
+        raise ValueError("Age tiers do not support derived sequences yet; use a homogeneous KV codec")
+
     def _make_plan(self, length, *, execution_context=None):
         self._configure_cache()
         if execution_context is None:

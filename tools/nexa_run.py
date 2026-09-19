@@ -59,6 +59,8 @@ def main(argv=None):
                         help="Private temporary cache for cold Q3 pages; requires --kv-policy age")
     parser.add_argument("--kv-reload-slots", type=int,
                         help="Cold pages kept resident between layers and calls (default: 1); requires --kv-backing-store")
+    parser.add_argument("--fork-tokens", type=token_list,
+                        help="Derive a second sequence from the finished prefix and append these IDs to it")
     parser.add_argument("--verify", action="store_true", help="Compare small-model logits with optional PyTorch oracle")
     parser.add_argument("--reference-checkpoint", type=Path, help="Also measure original-vs-Q4 quantization error")
     parser.add_argument("--include-logits", action="store_true")
@@ -91,6 +93,9 @@ def main(argv=None):
         parser.error("--kv-backing-store requires --kv-policy age")
     if args.kv_reload_slots is not None and (args.kv_backing_store is None or args.kv_reload_slots < 1):
         parser.error("--kv-reload-slots requires --kv-backing-store and at least one slot")
+    if args.fork_tokens is not None and (not args.kv_cache or args.kv_page_tokens is None
+                                         or args.kv_policy != "homogeneous"):
+        parser.error("--fork-tokens requires --kv-cache, --kv-page-tokens and the homogeneous KV policy")
     if (args.kv_bits is not None or args.kv_seed is not None) and args.kv_codec != "tq":
         parser.error("--kv-bits/--kv-seed require --kv-codec tq")
     if args.kv_bits is not None and not 1 <= args.kv_bits <= 8:
@@ -103,7 +108,9 @@ def main(argv=None):
                     and args.report.resolve().is_relative_to(source.resolve())):
                 raise ValueError("Reports must be written outside model and checkpoint directories")
         steps = len(args.decode_tokens or ()) or args.generate
-        capacity = args.max_sequence_length if args.max_sequence_length is not None else len(args.tokens) + steps
+        forked = len(args.fork_tokens or ())
+        capacity = (args.max_sequence_length if args.max_sequence_length is not None
+                    else len(args.tokens) + steps + forked)
         session_type = TransformerSession
         session_options = {}
         if args.kv_cache:
@@ -212,6 +219,30 @@ def main(argv=None):
                     report["run_totals"][name] = sum(step["io"][name] for step in step_reports)
                 for name in ("kv_backing_read_seconds", "kv_backing_write_seconds"):
                     report["run_totals"][name] = sum(step["timing"][name] for step in step_reports)
+            if args.fork_tokens:
+                # A derived sequence continues this prefix without copying its
+                # complete pages; both sequences stay independent afterwards.
+                derived = session.fork()
+                try:
+                    adoption = derived.report()["kv_prefix_adoption"]
+                    appended = derived.append(args.fork_tokens)
+                    memory = derived.report()["memory"]
+                    digest = hashlib.sha256()
+                    for row in appended:
+                        for value in row:
+                            digest.update(struct.pack("<f", value))
+                    report["derived_sequence"] = {
+                        "prefix_adoption": adoption, "token_ids": list(derived.token_ids),
+                        "appended_token_ids": list(args.fork_tokens),
+                        "logits_sha256": digest.hexdigest(), "logits_scope": "appended_chunk",
+                        "kv_shared_page_count": memory["kv_shared_page_count"],
+                        "kv_shared_allocation_bytes": memory["kv_shared_allocation_bytes"],
+                        "kv_owned_allocation_bytes": memory["kv_owned_allocation_bytes"],
+                        "managed_buffers_peak_bound_bytes": memory["managed_buffers_peak_bound_bytes"],
+                        "scope": "second sequence sharing the complete pages of this prefix",
+                    }
+                finally:
+                    derived.close()
             if args.verify:
                 sys.path.insert(0, str(ROOT / "tests"))
                 if args.kv_policy == "age":

@@ -129,6 +129,19 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Décimo quarto incremento implementado e validado:** sequências derivadas com
+prefixo compartilhado no executor paginado homogêneo. `fork()` retém as páginas
+completas do prefixo — imutáveis, com contagem de referências — e copia apenas a
+página parcial, de modo que cada sequência mantém escrita exclusiva sobre a
+própria cauda. Uma escrita que alcance página compartilhada é rejeitada antes de
+tocar bytes. Reset, prefill substituto e close de qualquer sequência, em qualquer
+ordem, preservam as demais. Com prompt de 256 tokens e dois ramos, o KV residente
+somado caiu de 45.662 B para 24.174 B e a amostra local de ~0,63 s para ~0,04 s,
+com logits idênticos aos de sequências independentes. Tiers por idade e backing
+store recusam `fork` e ficaram em M4.06b. Passaram **558 regressões + 110 testes
+bootstrap = 668 testes**, sem falhas ou skips. Checklist: **33 concluídos e 107
+pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -145,7 +158,17 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: critérios de qualidade e importância por página, M4.05d.**
+**Próxima tarefa: M4.06b — sequências derivadas sob tiers e backing store.**
+A recodificação por idade substitui páginas do prefixo, então uma página
+compartilhada migraria para uma sequência enquanto outra ainda a lê; definir se a
+migração é privada, adiada ou compartilhada antes de implementar. Incluir
+cancelamento de uma chamada em andamento e limites por processo, hoje
+inexistentes: cada sessão admite o próprio orçamento e o compartilhamento reduz
+residência real sem reduzir a reserva.
+
+**Também pendente: critérios de qualidade e importância por página, M4.05d.**
+Depende de qualidade medida em checkpoint treinado (LLM.04b) e da calibração
+M6.01, porque selecionar páginas por importância altera logits.
 O número de slots é hoje um parâmetro do operador, sem política que decida
 quantos admitir nem quais páginas priorizar. Definir importância por página e
 budgets por camada exige a calibração de M6.01 e comparação contra idade
@@ -161,7 +184,8 @@ Use os guias de [importação](NEXALM_IMPORTACAO.md) e
 [KV Q3](NEXALM_KV_Q3_CPU.md), [KV TQ](NEXALM_KV_TQ_CPU.md) e
 [tiers CPU](NEXALM_KV_TIERS_CPU.md),
 [backing store CPU](NEXALM_KV_BACKING_CPU.md) e
-[reuso de páginas cold](NEXALM_KV_RELOAD_CPU.md) para
+[reuso de páginas cold](NEXALM_KV_RELOAD_CPU.md) e
+[sequências derivadas](NEXALM_KV_SEQUENCIAS_CPU.md) para
 reproduzir os incrementos atuais.
 O [guia TurboQuant MSE](TURBOQUANT_MSE_CPU.md) descreve o estado menor e os contratos
 de compatibilidade; o [guia TQ portátil](NEXAPACK_TQ_V1.md) especifica o codec
@@ -530,7 +554,13 @@ transferidos e limite máximo documentados.
   custo/orçamento sem descartar contexto causal. Importância por página e budgets
   por camada exigem calibração em M6.01 e comparação com idade uniforme
   (Blueprint pp.9–10, P16–19; p.15, §7.3). Prefetch e leitura assíncrona incluídos.
-- [ ] M4.06 Contexto máximo, múltiplas sequências, prefixos e liberação/cancelamento.
+- [x] M4.06a Múltiplas sequências no executor paginado homogêneo: prefixo
+  compartilhado por contagem de referências, cópia apenas da página parcial,
+  escrita em página compartilhada rejeitada, capacidade por sequência e
+  liberação em qualquer ordem; logits idênticos e residência somada medida.
+- [ ] M4.06b Sequências derivadas sob tiers/backing store, cancelamento de uma
+  chamada em andamento, limites e admissão conjunta por processo, e reuso de
+  prefixo entre sessões que não derivam uma da outra.
 
 **Gate M4:** melhoria de bytes/token comprovada no cache usado pela atenção,
 com qualidade, latência e temporários contabilizados.
@@ -1088,6 +1118,39 @@ Décimo primeiro incremento:
   acrescentadas na mesma revisão aumentam a contagem, sem equivaler a percentual
   de conclusão ou prazo. Próximo incremento técnico: M4.05d.
 
+## Registro do décimo quarto incremento — sequências derivadas
+
+- Concluído M4.06a: `PagedTransformerSession.fork()` e `_adopt_prefix` no
+  executor paginado homogêneo (F32/Q4/Q3/TQ). A derivada admite o próprio
+  orçamento antes de reter ou copiar qualquer página, exige o mesmo manifesto e
+  um layout idêntico — inclusive bits/seed/codebook TQ — e recusa um prefixo
+  maior que a própria capacidade.
+- `_KVPage` passa a contar referências. Páginas completas são retidas, não
+  copiadas; a página parcial é copiada, no máximo uma por adoção. `release`
+  devolve uma referência e só libera a alocação com o último dono, então reset,
+  prefill substituto e close de qualquer sequência preservam as demais.
+- Escrita em página compartilhada é rejeitada antes de tocar bytes, com prefixo
+  e relatório preservados; é defesa em profundidade, já que a adoção copia a
+  página parcial exatamente para que esse caso não ocorra.
+- Relatórios separam `kv_shared_page_count`, `kv_shared_allocation_bytes` e
+  `kv_owned_allocation_bytes`, e a adoção publica `kv_prefix_adoption` com
+  tokens herdados, páginas compartilhadas/copiadas e bytes copiados. Bytes
+  compartilhados existem uma vez no processo; somar sequências os conta duas vezes.
+- Prova D64, prompt de 256 tokens em chunks de 32, páginas de 16, KV Q4 G32,
+  dois ramos de 4 tokens: logits idênticos aos de sequências independentes; KV
+  residente somado 45.662 B contra 24.174 B; amostra local ~0,63 s contra
+  ~0,04 s, porque o prompt é executado uma vez. Não é benchmark repetido.
+- Tiers por idade e backing store recusam `fork` explicitamente e ficaram em
+  M4.06b, junto de cancelamento em andamento e admissão conjunta por processo.
+- Validação macOS ARM64/Python 3.14.5: **558 regressões + 110 bootstrap = 668
+  testes, zero falhas e zero skips**. Os 11 novos cobrem equivalência por codec,
+  divergência sem contaminar bytes, sobrevivência a reset/prefill/close em
+  qualquer ordem, escrita rejeitada, layout/capacidade, falha de adoção,
+  relatórios, fork de fork, recusa dos tiers e a CLI.
+- Guia: [sequências derivadas](NEXALM_KV_SEQUENCIAS_CPU.md). Checklist:
+  **33 concluídos e 107 pendentes**; M4.06 foi dividido preservando o restante.
+  Próximo incremento técnico: M4.06b.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1126,6 +1189,10 @@ python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3 --decode-tok
 # Reuso de páginas cold entre passagens, camadas e chamadas.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3 --decode-tokens 5,7 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-backing-store artifacts/kv-store/reuso --kv-reload-slots 4 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/kv-reload-tiny.json
 python3 -m unittest discover -s tests -p 'test_reload_cache_regressions.py' -v
+
+# Sequência derivada que continua o prefixo sem recomputá-lo.
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/kv-sequencias-tiny.json
+python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_offloaded*regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_kv_store_regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_streaming_kv_kernels_regressions.py' -v
@@ -1315,11 +1382,23 @@ Décimo terceiro incremento acrescenta:
   e `test_offloaded_kv_lifecycle_regressions.py`.
 - `docs/NEXALM_KV_RELOAD_CPU.md`: política, ownership, memória, métricas e limites.
 
+Décimo quarto incremento acrescenta:
+
+- `runtime/nexapack/paged.py`: contagem de referências em `_KVPage`, `fork`,
+  `_adopt_prefix`, rejeição de escrita em página compartilhada e campos de
+  residência compartilhada/própria no relatório.
+- `runtime/nexapack/tiered.py`: recusa explícita de sequências derivadas.
+- `tools/nexa_run.py --fork-tokens` e bloco `derived_sequence` no relatório.
+- `tests/test_paged_sequences_regressions.py`: equivalência por codec,
+  isolamento de bytes, ownership, limites, falhas, relatórios e CLI.
+- `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
 Limites atuais: DSL e pipeline de modelos separados de nxc; executor C scalar
 orquestrado em Python, uma sequência, baseline por recomputação e KV incremental
 opcional F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
 por idade em RAM, com backing store opcional para evicção/recarga de cold Q3 CPU.
-Páginas cold podem ser reutilizadas em slots admitidos. Pesos Q3/TQ, TQ misto,
+Páginas cold podem ser reutilizadas em slots admitidos, e sequências derivadas
+compartilham o prefixo paginado homogêneo. Pesos Q3/TQ, TQ misto,
 promoção de precisão, prefetch, múltiplas sequências e compartilhamento de
 prefixos permanecem pendentes. O cache privado CPU não implementa residência
 GPU de experts, roteamento condicional ou Plastic Learning.

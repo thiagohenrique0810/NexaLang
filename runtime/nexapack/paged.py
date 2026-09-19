@@ -19,17 +19,38 @@ from .tq_kv import TQKVContext, TQKernelDispatch, tq_kv_memory
 
 
 class _KVPage:
+    """One page allocation, owned by one sequence or shared by several.
+
+    Only complete pages are ever shared: append writes into the newest partial
+    page or into fresh ones, so a shared page is immutable for every owner.
+    """
     def __init__(self, allocation_bytes):
         self.arena = (ctypes.c_uint8 * allocation_bytes)()
+        self._references = 1
         try:
             self.address = (ctypes.addressof(self.arena) + ALIGNMENT - 1) & -ALIGNMENT
         except BaseException:
             self.release()
             raise
 
+    @property
+    def shared(self):
+        return self._references > 1
+
+    def retain(self):
+        if not self.address:
+            raise ValueError("A released KV page cannot be shared")
+        self._references += 1
+        return self
+
     def release(self):
         # Saved tracebacks can retain the page object. Explicitly detach its
         # owner so a failed transaction never keeps physical pages resident.
+        # A shared page only loses its allocation with its last owner.
+        if self._references > 1:
+            self._references -= 1
+            return
+        self._references = 0
         self.address = 0
         self.arena = None
 
@@ -112,6 +133,83 @@ class PagedTransformerSession(IncrementalTransformerSession):
             # well as a position-zero prefill before expanding any step plan.
             self._cache_plan.allocation_limit_bytes(self.max_chunk_length)
 
+    def _fork_options(self):
+        """Everything a derived sequence needs to reproduce this exact layout."""
+        packed = self.kv_codec in ("q4", "q3")
+        return {"memory_budget": self.budget, "reserve_bytes": self.reserve,
+                "max_sequence_length": self.max_sequence_length, "tile_rows": self.tile_rows,
+                "page_tokens": self.page_tokens, "max_chunk_length": self._requested_chunk_length,
+                "kv_codec": self.kv_codec, "kv_group_size": self.kv_group_size if packed else None,
+                "kv_bits": self._kv_bits if self.kv_codec == "tq" else None,
+                "kv_seed": self._kv_seed if self.kv_codec == "tq" else None,
+                "kv_codebook_f32le": self.kv_codebook_f32le if self.kv_codec == "tq" else None}
+
+    def fork(self, **overrides):
+        """Derive a sequence continuing this committed prefix.
+
+        Complete pages are shared, not copied; the partial page is copied so
+        both sequences keep exclusive write access to their own tail. The new
+        session admits its own budget before any page is retained or copied,
+        and the two sequences are independent afterwards: either can append,
+        reset or close in any order.
+        """
+        self._check_open()
+        if not self._tokens:
+            raise ValueError("fork requires a committed prefix")
+        child = type(self)(self.path, **{**self._fork_options(), **overrides})
+        try:
+            child._adopt_prefix(self)
+        except BaseException:
+            child.close()
+            raise
+        return child
+
+    def _adopt_prefix(self, parent):
+        if not isinstance(parent, PagedTransformerSession) or type(self) is not type(parent):
+            raise ValueError("A prefix can only be adopted from the same paged executor")
+        if self._pages or self._tokens:
+            raise ValueError("Only a session without its own prefix can adopt one")
+        parent._check_open()
+        self._check_open()
+        self._configure_cache()
+        if self.kv_codec == "tq":
+            self._ensure_tq_context()
+        if (self._manifest_sha256 != parent._manifest_sha256
+                or self._cache_plan.to_json(indent=None) != parent._cache_plan.to_json(indent=None)):
+            raise ValueError("A derived sequence requires the same bundle and KV page layout")
+        if len(parent._tokens) > self.max_sequence_length:
+            raise ValueError("The inherited prefix exceeds this sequence's context capacity")
+        # Pages before the newest partial one hold only committed tokens.
+        complete = parent.cache_length // self.page_tokens
+        pages, copied = [], 0
+        try:
+            for index, page in enumerate(parent._pages):
+                if index < complete:
+                    pages.append(page.retain())
+                    continue
+                copy = self._allocate_page()
+                try:
+                    pages.append(copy)
+                except BaseException:
+                    copy.release()
+                    raise
+                ctypes.memmove(copy.address, page.address, self._cache_plan.page_extent_bytes)
+                copied += 1
+            graph, plan = self._make_plan(self.max_sequence_length)
+            self._tokens, self._pages = parent._tokens, pages
+            report = self._report(graph, plan, executed=False)
+        except BaseException:
+            self._tokens, self._pages = (), []
+            for page in pages:
+                page.release()
+            raise
+        # A report for a sequence that has not executed yet has no io block;
+        # adoption costs are stated separately from executed KV traffic.
+        report["kv_prefix_adoption"] = {"inherited_tokens": len(self._tokens),
+                                        "shared_pages": len(pages) - copied, "copied_pages": copied,
+                                        "copied_bytes": copied * self._cache_plan.page_extent_bytes}
+        self._last_report = report
+
     def _tq_memory(self):
         return tq_kv_memory(self.config.head_dim, self.kv_bits)
 
@@ -186,6 +284,10 @@ class PagedTransformerSession(IncrementalTransformerSession):
                 if (not page.address or offset + size > self._cache_plan.page_extent_bytes
                         or source_offset + source_size > ctypes.sizeof(source)):
                     raise ValueError("Paged KV write exceeds the planned source or page")
+                if page.shared:
+                    # Defense in depth: adoption copies the partial page, so a
+                    # write must never reach a page another sequence reads.
+                    raise ValueError("A shared prefix page is immutable; new tokens need an owned page")
                 if self.kv_codec != "f32":
                     inputs = (ctypes.c_float * (source_size // 4)).from_address(ctypes.addressof(source) + source_offset)
                     packed = (ctypes.c_uint8 * size).from_address(page.address + offset)
@@ -260,6 +362,10 @@ class PagedTransformerSession(IncrementalTransformerSession):
         if context is not None:
             report["execution_plan"] = context.to_dict()
         memory = report["memory"]
+        # Shared pages are resident once for the whole process; each sequence
+        # still admits its own conservative reservation, which does not shrink.
+        resident = self._pending_pages if self._pending_pages is not None else self._pages
+        shared = sum(getattr(page, "shared", False) for page in resident if page is not None)
         memory.update({"scope": "managed CPU workspace, resident/staged KV pages, pointer tables and reader scratch; excludes RSS/VRAM",
                        "kv_page_tokens": self.page_tokens, "kv_page_payload_bytes": self._cache_plan.page_payload_bytes,
                        "kv_page_allocation_bytes": allocation, "kv_resident_page_count": pages,
@@ -272,6 +378,9 @@ class PagedTransformerSession(IncrementalTransformerSession):
                        "kv_valid_prefix_f32_bytes": total * self.config.num_hidden_layers * 2 * self._cache_plan.kv_width * 4,
                        "kv_encoded_bytes_per_token": self.config.num_hidden_layers * 2 * self._cache_plan.token_bytes,
                        "kv_f32_bytes_per_token": self.config.num_hidden_layers * 2 * self._cache_plan.kv_width * 4,
+                       "kv_shared_page_count": shared,
+                       "kv_shared_allocation_bytes": shared * allocation,
+                       "kv_owned_allocation_bytes": (len(resident) - shared) * allocation,
                        "kv_full_dequantized_buffer_bytes": 0,
                        "kv_page_table_bytes": sum(plan.allocations[name].size_bytes
                                                   for name in ("__key_pages", "__value_pages")),

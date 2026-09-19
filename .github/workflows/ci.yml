@@ -110,3 +110,6 @@ jobs:
 
       - name: Execute cold KV reuse with several reload slots
         run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3 --decode-tokens 5,7 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-backing-store artifacts/kv-store/ci-slots --kv-reload-slots 4 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-reload-slots.json
+
+      - name: Execute a derived sequence sharing the paged prefix
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/ci-kv-sequences.json
