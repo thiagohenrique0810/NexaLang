@@ -153,6 +153,20 @@ store continua recusando `fork` e ficou em M4.06c, junto de cancelamento em
 andamento e admissão conjunta. Passaram **564 regressões + 110 testes bootstrap =
 674 testes**, sem falhas ou skips. Checklist: **34 concluídos e 107 pendentes**.
 
+**Décimo sexto incremento implementado e validado:** NexaTokenizer V1, BPE
+byte-level determinístico, e execução a partir de texto. Os 256 primeiros IDs
+são bytes, então não há token desconhecido e o round-trip é exato; os especiais
+ocupam IDs próprios e **nunca** são produzidos por texto, de modo que um prompt
+não confiável não forja um papel de diálogo. A segmentação separa dígitos,
+espaços e classes de caractere, e nenhum merge cruza essa fronteira. O treino é
+reproduzível — empate resolvido pelos bytes do par, identidade do corpus
+independente da ordem dos documentos — e o asset é verificado por SHA-256 no
+carregamento. `nexa_run.py --prompt ... --tokenizer DIR` executa prefill/decode
+nativos e devolve o texto gerado, exigindo `vocab_size` igual ao do modelo.
+Passaram **583 regressões + 110 testes bootstrap = 693 testes**, sem falhas ou
+skips. Falta congelar 32768 com corpus real (LLM.02c2). Checklist: **35
+concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -169,7 +183,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.06c — sequências derivadas sob backing store, cancelamento
+**Próxima tarefa: M5.01 com um modelo real.** Com o tokenizer pronto, falta
+importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
+revisão/hash em M0.08 e medir prefill/decode e qualidade sem PyTorch. Sem
+modelo baixado no repositório: registrar origem, revisão e hashes.
+
+**Também pendente: M4.06c — sequências derivadas sob backing store, cancelamento
 e admissão conjunta.** Páginas cold são arquivos de um store privado que os
 remove ao fechar; compartilhá-las exige propriedade por referência sobre os
 arquivos, ou uma cópia explícita, antes de permitir `fork`. Cancelar uma chamada
@@ -225,8 +244,13 @@ inferência. A ordem abaixo complementa M0–M9; não duplica uma implementaçã
 - [ ] LLM.02b TRAIN-001: filtros de qualidade/PII/segredos/spam, idioma/domínio,
   dedup exato/aproximado, split antes
   do packing e decontaminação; mistura PT/EN/código/matemática e repetições medidas.
-- [ ] LLM.02c TRAIN-001: tokenizer 32768 congelado, corpus de treino e assets com
-  hashes, IDs especiais e validação de cobertura/round-trip e eficiência por domínio.
+- [x] LLM.02c1 TRAIN-001: tokenizer BPE byte-level determinístico, asset
+  versionado com SHA-256, IDs especiais que texto não produz, segmentação
+  declarada, round-trip byte-exato, métricas por domínio e execução a partir
+  de texto no runner.
+- [ ] LLM.02c2 TRAIN-001: congelar 32768 com o corpus real da mistura, medir
+  eficiência por idioma e linguagem de programação, registrar hash do corpus de
+  treino do tokenizer e a estratégia de migração antes do modelo base.
 - [ ] LLM.02d TRAIN-001: contrato .nxd versionado, shards/checksums/publicação
   atômica e reader/dataloader com memória limitada, máscaras e retomada verificadas.
 - [ ] LLM.03a TRAIN-002: trainer PyTorch consome configuração R0, prova pequena de
@@ -582,6 +606,8 @@ com qualidade, latência e temporários contabilizados.
 ## M5 — prova de modelo completo e ABI (PDF páginas 17/19)
 
 - [ ] M5.01 Modelo fixo 250–500M, batch 1, tokenizer, prefill e decode sem PyTorch.
+  Tokenizer e caminho texto→IDs→execução→texto estão em LLM.02c1; falta o modelo
+  real importado, sua fixação em M0.08 e a medição de qualidade.
 - [ ] M5.02 Modelo ~1B sob 512 MB, pesos streamados e KV comprimido.
 - [ ] M5.03 Matriz de provas A–E: 250–500M, 1B, 1–3B offload, modelo próprio,
   e escalabilidade em 8/24 GB; registrar hardware e configurações.
@@ -1188,6 +1214,32 @@ Décimo primeiro incremento:
 - Guia: [sequências derivadas](NEXALM_KV_SEQUENCIAS_CPU.md). Checklist:
   **34 concluídos e 107 pendentes**. Próximo incremento técnico: M4.06c.
 
+## Registro do décimo sexto incremento — tokenizer
+
+- Concluído LLM.02c1: `runtime/nexapack/tokenizer.py` (formato, encode/decode,
+  métricas), `compiler/tokenizer_trainer.py` (treino determinístico) e
+  `tools/nexa_tokenizer.py` (train/inspect/encode/decode).
+- Formato `NexaTokenizer` V1: `manifest.json` com formato, versão, segmentação,
+  especiais, identidade do corpus e SHA-256 de cada arquivo; `vocab.bin`
+  (NEXATOKV) e `merges.bin` (NEXATOKM) little-endian. O carregamento rejeita
+  versão/modelo/segmentação diferentes, checksum ou tamanho divergente, magic
+  inválido, truncamento, bytes sobrando, merge fora do vocabulário e ID especial
+  que não corresponde à entrada.
+- Propriedade de segurança verificada: nenhum texto produz um token especial.
+  `<|system|>` num prompt vira bytes literais; papéis só entram por
+  prefix/suffix explícitos ou `--bos`.
+- `nexa_run.py --prompt TEXTO --tokenizer DIR [--bos]` substitui `--tokens`,
+  valida `vocab_size` contra o modelo e acrescenta `prompt`, `tokenizer` (com
+  hashes), `generated_text` e `decoded_text` ao relatório. Os modos de KV
+  existentes continuam disponíveis nesse caminho.
+- Validação macOS ARM64/Python 3.14.5: **583 regressões + 110 bootstrap = 693
+  testes, zero falhas e zero skips**. Os 19 novos cobrem determinismo e
+  independência de ordem, corpus insuficiente, round-trip byte-exato com fuzz
+  determinístico, especiais, segmentação, merges que não cruzam fronteira,
+  métricas, dez mutações de asset, CLI e a integração texto→modelo→texto.
+- Guia: [tokenizer](NEXALM_TOKENIZER.md). Checklist: **35 concluídos e 107
+  pendentes**; LLM.02c foi dividido preservando o congelamento em LLM.02c2.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1230,6 +1282,12 @@ python3 -m unittest discover -s tests -p 'test_reload_cache_regressions.py' -v
 # Sequência derivada que continua o prefixo sem recomputá-lo.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/kv-sequencias-tiny.json
 python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
+
+# Tokenizer: treino determinístico, verificação e execução a partir de texto.
+python3 tools/nexa_tokenizer.py train --corpus CORPUS --out artifacts/tokenizers/demo --vocab-size 400
+python3 tools/nexa_tokenizer.py inspect artifacts/tokenizers/demo --samples SAMPLES.json
+python3 tools/nexa_run.py MODELO --prompt "O NexaLang compila" --tokenizer artifacts/tokenizers/demo --bos --generate 4 --kv-cache --kv-page-tokens 2 --max-sequence-length 48 --tile-rows 4 --memory-budget 8MiB
+python3 -m unittest discover -s tests -p 'test_tokenizer_regressions.py' -v
 
 # Sequência derivada sob a política de idade, com migração privada.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-hot-pages 1 --kv-warm-pages 1 --kv-group-size 3 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 7,2
@@ -1437,6 +1495,15 @@ Décimo quarto incremento acrescenta:
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
+Décimo sexto incremento acrescenta:
+
+- `runtime/nexapack/tokenizer.py`, `compiler/tokenizer_trainer.py` e
+  `tools/nexa_tokenizer.py`: formato, treino, codec, métricas e CLI.
+- `tools/nexa_run.py --prompt/--tokenizer/--bos` e campos de texto no relatório.
+- `tests/test_tokenizer_regressions.py` e `vocab_size`/`max_position_embeddings`
+  parametrizáveis na fixture de bundle.
+- `docs/NEXALM_TOKENIZER.md`: formato, segmentação, reprodutibilidade e limites.
+
 Limites atuais: DSL e pipeline de modelos separados de nxc; executor C scalar
 orquestrado em Python, uma sequência, baseline por recomputação e KV incremental
 opcional F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
@@ -1446,5 +1513,7 @@ compartilham o prefixo paginado, homogêneo ou por idade. Pesos Q3/TQ, TQ misto,
 promoção de precisão, prefetch, múltiplas sequências e compartilhamento de
 prefixos permanecem pendentes. O cache privado CPU não implementa residência
 GPU de experts, roteamento condicional ou Plastic Learning.
-Forward/logits validados em pesos sintéticos pequenos; tokenizer, treinamento,
+Há tokenizer byte-level com execução a partir de texto, ainda sem vocabulário
+congelado em corpus real.
+Forward/logits validados em pesos sintéticos pequenos; treinamento,
 qualidade de modelo real, KernelIR/backend GPU, qint na sintaxe e Omni permanecem pendentes.

@@ -32,11 +32,12 @@ def f32(value):
     return struct.unpack('<f', struct.pack('<f', value))[0]
 
 
-def random_bundle(path, *, layers=1, heads=2, kv_heads=1, tied=True, seed=728, zero_layers=False):
-    config = ModelConfig(name=f'forward_fixture_{seed}', vocab_size=13, hidden_size=heads * 4,
+def random_bundle(path, *, layers=1, heads=2, kv_heads=1, tied=True, seed=728, zero_layers=False,
+                  vocab_size=13, max_position_embeddings=12):
+    config = ModelConfig(name=f'forward_fixture_{seed}', vocab_size=vocab_size, hidden_size=heads * 4,
                          intermediate_size=heads * 6, num_hidden_layers=layers,
                          num_attention_heads=heads, num_key_value_heads=kv_heads,
-                         max_position_embeddings=12, tie_word_embeddings=tied,
+                         max_position_embeddings=max_position_embeddings, tie_word_embeddings=tied,
                          rms_norm_eps=1e-5, rope_theta=10000.0)
     rng, values = random.Random(seed), {}
     for name, shape in config.required_tensor_shapes().items():

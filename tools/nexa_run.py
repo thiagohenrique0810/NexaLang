@@ -35,7 +35,10 @@ def token_list(text):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("--tokens", required=True, type=token_list)
+    parser.add_argument("--tokens", type=token_list, help="Prompt as explicit IDs; use --prompt for text")
+    parser.add_argument("--prompt", help="Prompt as text, encoded by --tokenizer")
+    parser.add_argument("--tokenizer", type=Path, help="NexaTokenizer asset directory")
+    parser.add_argument("--bos", action="store_true", help="Frame the encoded prompt with the tokenizer's <|bos|>")
     decode = parser.add_mutually_exclusive_group()
     decode.add_argument("--decode-tokens", type=token_list, help="Append these known IDs one by one")
     decode.add_argument("--generate", type=int, default=0, help="Generate this many IDs using deterministic argmax")
@@ -93,6 +96,12 @@ def main(argv=None):
         parser.error("--kv-backing-store requires --kv-policy age")
     if args.kv_reload_slots is not None and (args.kv_backing_store is None or args.kv_reload_slots < 1):
         parser.error("--kv-reload-slots requires --kv-backing-store and at least one slot")
+    if (args.tokens is None) == (args.prompt is None):
+        parser.error("pass exactly one of --tokens or --prompt")
+    if (args.prompt is not None) != (args.tokenizer is not None):
+        parser.error("--prompt requires --tokenizer, and --tokenizer is only used with --prompt")
+    if args.bos and args.prompt is None:
+        parser.error("--bos requires --prompt")
     if args.fork_tokens is not None and (not args.kv_cache or args.kv_page_tokens is None
                                          or args.kv_backing_store is not None):
         parser.error("--fork-tokens requires --kv-cache and --kv-page-tokens, and no --kv-backing-store")
@@ -107,6 +116,14 @@ def main(argv=None):
             if (source is not None and args.report is not None
                     and args.report.resolve().is_relative_to(source.resolve())):
                 raise ValueError("Reports must be written outside model and checkpoint directories")
+        tokenizer = None
+        if args.prompt is not None:
+            from runtime.nexapack.tokenizer import NexaTokenizer
+            tokenizer = NexaTokenizer.load(args.tokenizer)
+            frame = ("<|bos|>",) if args.bos else ()
+            args.tokens = tokenizer.encode(args.prompt, prefix=frame)
+            if not args.tokens:
+                raise ValueError("The encoded prompt is empty")
         steps = len(args.decode_tokens or ()) or args.generate
         forked = len(args.fork_tokens or ())
         capacity = (args.max_sequence_length if args.max_sequence_length is not None
@@ -142,6 +159,10 @@ def main(argv=None):
         with session_type(args.bundle, memory_budget=args.memory_budget,
                                 max_sequence_length=capacity, tile_rows=args.tile_rows,
                                 reserve_bytes=args.reserve, **session_options) as session:
+            if tokenizer is not None and tokenizer.vocab_size != session.config.vocab_size:
+                # A prompt encoded by another vocabulary would silently index
+                # the wrong embeddings instead of failing.
+                raise ValueError("Tokenizer vocabulary differs from the model's vocab_size")
             if len(args.tokens) + steps > session.max_sequence_length:
                 raise ValueError("Requested prompt and decode exceed the sequence capacity")
             for token in (args.decode_tokens or ()):
@@ -192,6 +213,17 @@ def main(argv=None):
             report["logits_sha256"] = all_logits.hexdigest()
             report["logits_scope"] = "full_context"
             report["logits_shape"] = [len(session.token_ids), session.config.vocab_size]
+            if tokenizer is not None:
+                identity = tokenizer.manifest
+                report["tokenizer"] = {
+                    "path": str(args.tokenizer), "format": identity["format"], "version": identity["version"],
+                    "vocab_size": identity["vocab_size"], "segmentation": identity["segmentation"],
+                    "files": {name: entry["sha256"] for name, entry in identity["files"].items()},
+                    "framed_with_bos": args.bos}
+                report["prompt"] = args.prompt
+                report["prompt_bytes"] = len(args.prompt.encode("utf-8"))
+                report["generated_text"] = tokenizer.decode(generated, skip_special=True) if generated else ""
+                report["decoded_text"] = tokenizer.decode(list(session.token_ids), skip_special=True)
             report.update({"input_token_ids": args.tokens, "appended_token_ids": generated,
                            "generation": "provided_ids" if args.decode_tokens else "greedy_argmax",
                            "tokenizer_executed": False, "steps": step_reports,
