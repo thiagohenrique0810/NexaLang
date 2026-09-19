@@ -6,84 +6,107 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+
 jobs:
   test:
     name: Tests (${{ matrix.os }} / Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.11', '3.12']
-        exclude:
-          - os: windows-latest
-            python-version: '3.11'
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Build TurboQuant runtime (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          cd runtime
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            gcc -O2 -shared -fPIC -o libturboquant.so turboquant.c -lm
-          else
-            gcc -O2 -shared -fPIC -o libturboquant.dylib turboquant.c -lm
-          fi
-
-      - name: Build TurboQuant runtime (Windows)
+      - name: Configure Windows native toolchain
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: pwsh
         run: |
-          cd runtime
-          gcc -O2 -shared -o turboquant.dll turboquant.c -lm 2>nul || echo TurboQuant build skipped on Windows
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'MSVC build tools were not found' }
+          $vcvars = Join-Path $installation 'VC/Auxiliary/Build/vcvars64.bat'
+          cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
+            if ($_ -match '^(PATH|INCLUDE|LIB|LIBPATH)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
 
-      - name: Run tests
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Check native compiler
+        run: clang --version
+
+      - name: Build host runtime from source
+        run: python runtime/build_runtime.py
+
+      - name: Run bootstrap suite
         run: python tests/run_tests.py
 
-      - name: Lint bootstrap compiler
-        run: |
-          python -c "
-          import sys; sys.path.insert(0, 'bootstrap')
-          from lexer import Lexer
-          from n_parser import Parser
-          from semantic import SemanticAnalyzer
+      - name: Run behavioral and sanitizer regressions
+        run: python -m unittest discover -s tests -p "test_*regressions.py" -v
 
-          # Compile all examples that should succeed
-          import os
-          skip = ['associated_types_fail.nxl']
-          examples_dir = 'examples'
-          passed = 0
-          failed = 0
-          for f in sorted(os.listdir(examples_dir)):
-              if not f.endswith('.nxl') or f in skip:
-                  continue
-              path = os.path.join(examples_dir, f)
-              try:
-                  src = open(path).read()
-                  tokens = Lexer(src).tokenize()
-                  ast = Parser(tokens).parse()
-                  sa = SemanticAnalyzer()
-                  sa.analyze(ast)
-                  passed += 1
-              except Exception as e:
-                  # Some examples intentionally test error paths
-                  if 'error' in f.lower() or 'fail' in f.lower() or 'dead_code' in f:
-                      passed += 1
-                  else:
-                      print(f'WARN: {f}: {e}')
-                      failed += 1
-          print(f'Examples: {passed} parsed, {failed} unexpected failures')
-          if failed > 0:
-              sys.exit(1)
-          "
+      - name: Compile examples and verify expected errors
+        run: python tests/check_examples.py
+
+      - name: Execute packed weights larger than the managed CPU arena
+        run: python tools/nexa_bench.py --generate-demo --pack artifacts/models/ci-q4.nxp --rows 2048 --cols 128 --tile-rows 32 --memory-budget 96KiB --verify --report artifacts/reports/ci-q4.json --csv artifacts/reports/ci-q4.csv
+
+      - name: Convert and inspect portable TQ vectors
+        run: |
+          python -c "from pathlib import Path; import struct; p = Path('artifacts/models/ci-tq.f32'); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(struct.pack('<8f', 0, 1, -2, 3, -4, 5, -6, 7) * 16)"
+          python tools/nexa_convert.py artifacts/models/ci-tq.f32 --out artifacts/models/ci-tq.nxp --rows 16 --cols 8 --codec tq --bits 3 --seed 42 --block-rows 4 --memory-budget 96KiB
+          python tools/nexa_inspect.py artifacts/models/ci-tq.nxp --verify
+
+      - name: Compile architecture and import a tiny local checkpoint
+        run: |
+          python tools/nexa_model.py models/nexalm512/architecture.nxl --out artifacts/reports/model-definitions.json
+          python tests/model_checkpoint_fixture.py --out artifacts/checkpoints/ci-tiny
+          python tools/nexa_convert.py --checkpoint artifacts/checkpoints/ci-tiny --out artifacts/models/ci-tiny --group-size 4 --block-rows 3
+          python tools/nexa_inspect.py artifacts/models/ci-tiny --verify
+          python tools/nexa_bench.py --bundle artifacts/models/ci-tiny --tensor lm_head.weight --memory-budget 96KiB --verify --report artifacts/reports/ci-bundle-q4.json
+
+      - name: Execute native Transformer prefill and decode
+        run: |
+          python tools/nexa_model.py models/nexalm512/architecture.nxl --sequence-length 4 --out artifacts/reports/transformer-graphs.json
+          python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3 --decode-tokens 5,7 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-forward.json
+
+      - name: Execute incremental KV and chunked prefill
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-f32.json
+
+      - name: Execute on-demand paged KV
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-paged.json
+
+      - name: Execute packed Q4 KV attention
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-q4.json
+
+      - name: Execute packed Q3 KV attention
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec q3 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-q3.json
+
+      - name: Execute paged TQ KV attention with planned scratch
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec tq --kv-bits 3 --kv-seed 42 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-tq.json
+
+      - name: Execute transactional hot warm cold KV page aging
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3 --decode-tokens 5,7 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-hot-pages 1 --kv-warm-pages 1 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-tiers.json
+
+      - name: Check changed whitespace
+        run: git diff --check
+
+      - name: Execute cold KV eviction and bounded reload
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3 --decode-tokens 5,7 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-backing-store artifacts/kv-store/ci --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-offloaded.json
+
+      - name: Execute cold KV reuse with several reload slots
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3 --decode-tokens 5,7 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-backing-store artifacts/kv-store/ci-slots --kv-reload-slots 4 --kv-group-size 3 --prefill-chunk-size 2 --memory-budget 96KiB --tile-rows 3 --report artifacts/reports/ci-kv-reload-slots.json

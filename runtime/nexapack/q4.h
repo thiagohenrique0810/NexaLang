@@ -1,0 +1,75 @@
+#ifndef NEXA_NEXAPACK_Q4_H
+#define NEXA_NEXAPACK_Q4_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef _WIN32
+#define NEXA_Q4_API __declspec(dllexport)
+#else
+#define NEXA_Q4_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Rows are independent. Each group occupies 4 + ceil(group_size / 2) bytes:
+ * a little-endian IEEE binary32 scale, then low-nibble-first signed Q4 values.
+ * Valid values are -7..7; the two's-complement -8 code is reserved/invalid.
+ * Scale must be finite and nonnegative. A zero scale requires all-zero values.
+ * All padding (including the spare nibble of odd group sizes) must be zero.
+ * Shape and group size are supplied by the enclosing model/container format.
+ */
+enum nexa_q4_status {
+    NEXA_Q4_OK = 0,
+    NEXA_Q4_INVALID_ARGUMENT = -1,
+    NEXA_Q4_BUFFER_TOO_SMALL = -2,
+    NEXA_Q4_OVERFLOW = -3,
+    NEXA_Q4_INVALID_DATA = -4,
+    NEXA_Q4_NUMERIC_RANGE = -5
+};
+
+/* Zero dimensions/group sizes and size_t overflow return zero. */
+NEXA_Q4_API size_t nexa_q4_row_size(size_t cols, size_t group_size);
+NEXA_Q4_API size_t nexa_q4_size(size_t rows, size_t cols, size_t group_size);
+
+/* Quantize weights[rows, cols], using max(abs(group))/7 rounded to float32.
+ * Values are divided by that stored scale, rounded half away from zero and
+ * clamped to [-7,7]. A nonzero group whose scale underflows to zero is rejected.
+ * weight_count is a count of floats; packed_bytes is a count of bytes.
+ * Input and output buffers must not overlap. No allocation is performed.
+ */
+NEXA_Q4_API int nexa_q4_quantize(
+    const float *weights, size_t weight_count,
+    size_t rows, size_t cols, size_t group_size,
+    uint8_t *packed, size_t packed_bytes);
+
+/* Compute inputs[batch,cols] @ weights[rows,cols]^T -> output[batch,rows].
+ * The packed values are consumed directly, with double-precision accumulation;
+ * no decoded matrix, workspace, or heap allocation is used. Counts of input
+ * and output elements are float counts, not byte counts. Output must not
+ * overlap inputs or packed weights. All dimensions must be positive.
+ * Nonfinite inputs, malformed packed data and float32 output overflow fail.
+ * Callers must discard output on error: numeric errors may leave partial data.
+ * Buffers may have excess capacity; bytes/elements beyond the shape are unused.
+ */
+NEXA_Q4_API int nexa_q4_matmul(
+    const float *inputs, size_t input_count, size_t batch,
+    const uint8_t *packed, size_t packed_bytes,
+    size_t rows, size_t cols, size_t group_size,
+    float *output, size_t output_count);
+
+/* Decode exactly one already selected packed row to output[cols]. The caller
+ * reads/selects the embedding row; no complete matrix or heap is allocated.
+ * Applies the same packed metadata, padding and finite-range checks as matmul.
+ * Output must not overlap packed. Discard output on error.
+ */
+NEXA_Q4_API int nexa_q4_decode_row(
+    const uint8_t *packed, size_t packed_bytes, size_t cols, size_t group_size,
+    float *output, size_t output_count);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -1,0 +1,45 @@
+# Canonical declarative model definitions, compiled by compiler.model_definition.
+# This DSL is separate from executable Nexa source accepted by nxc.
+# Generated config fixtures in configs/ are checked against these definitions.
+
+model NexaLM512_R0 {
+    vocab_size: 32768;
+    hidden_size: 768;
+    layers: 16;
+    attention {
+        query_heads: 12;
+        kv_heads: 4;
+        head_dim: 64;
+        position: rope;
+    }
+    ffn {
+        hidden_size: 2048;
+        activation: swiglu;
+    }
+    norm: rmsnorm;
+    context: 2048;
+    tied_embeddings: true;
+    rope_theta: 10000;
+    rms_norm_eps: 0.00001;
+}
+
+model NexaLM512_v1 {
+    vocab_size: 32768;
+    hidden_size: 1024;
+    layers: 32;
+    attention {
+        query_heads: 16;
+        kv_heads: 4;
+        head_dim: 64;
+        position: rope;
+    }
+    ffn {
+        hidden_size: 2816;
+        activation: swiglu;
+    }
+    norm: rmsnorm;
+    context: 2048;
+    tied_embeddings: true;
+    rope_theta: 10000;
+    rms_norm_eps: 0.00001;
+}

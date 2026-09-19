@@ -13,15 +13,13 @@ import ctypes
 from pathlib import Path
 
 import numpy as np
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class TurboQuant:
     def __init__(self, lib_path: Path, dim: int, bits: int = 3, seed: int = 42):
         self.lib = ctypes.CDLL(str(lib_path))
-        self.lib.tq_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        self.lib.tq_create.restype = ctypes.c_void_p
+        self.lib.tq_create_mse.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self.lib.tq_create_mse.restype = ctypes.c_void_p
         self.lib.tq_destroy.argtypes = [ctypes.c_void_p]
         self.lib.tq_destroy.restype = None
         self.lib.tq_quantize_packed.argtypes = [
@@ -30,20 +28,22 @@ class TurboQuant:
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_int,
         ]
-        self.lib.tq_quantize_packed.restype = None
+        self.lib.tq_quantize_packed.restype = ctypes.c_int
         self.lib.tq_dequantize_packed.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
         ]
-        self.lib.tq_dequantize_packed.restype = None
+        self.lib.tq_dequantize_packed.restype = ctypes.c_int
+        self.lib.tq_packed_size.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.tq_packed_size.restype = ctypes.c_size_t
 
         self.dim = dim
         self.bits = bits
-        self.ctx = self.lib.tq_create(dim, bits, seed)
+        self.ctx = self.lib.tq_create_mse(dim, bits, seed)
         if not self.ctx:
-            raise RuntimeError("tq_create failed (dim must be power-of-two, bits in [1..8])")
+            raise RuntimeError("tq_create_mse failed (dim must be power-of-two, bits in [1..8], allocation required)")
 
     def close(self) -> None:
         if self.ctx:
@@ -52,38 +52,48 @@ class TurboQuant:
 
     def roundtrip(self, x: np.ndarray) -> tuple[np.ndarray, float, int]:
         # x shape: [n_vec, dim], dtype float32
+        if not self.ctx:
+            raise RuntimeError("TurboQuant context is closed")
+        x = np.ascontiguousarray(x, dtype=np.float32)
         n_vec, dim = x.shape
         if dim != self.dim:
             raise ValueError(f"dim mismatch: got {dim}, expected {self.dim}")
 
-        total_bits = n_vec * dim * self.bits
-        packed_size = (total_bits + 7) // 8
+        if not 0 < n_vec <= 2**31 - 1:
+            raise ValueError("Vector count must fit a positive C int")
+        packed_size = self.lib.tq_packed_size(self.ctx, n_vec)
+        if not packed_size:
+            raise ValueError("Invalid packed buffer size")
 
         packed = np.zeros((packed_size,), dtype=np.uint8)
         out = np.zeros_like(x, dtype=np.float32)
 
-        self.lib.tq_quantize_packed(
+        status = self.lib.tq_quantize_packed(
             self.ctx,
             x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             n_vec,
         )
-        self.lib.tq_dequantize_packed(
+        if status:
+            raise RuntimeError(f"TurboQuant compression failed: {status}")
+        status = self.lib.tq_dequantize_packed(
             self.ctx,
             packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             n_vec,
         )
+        if status:
+            raise RuntimeError(f"TurboQuant decompression failed: {status}")
 
         mse = float(np.mean((x - out) ** 2))
         return out, mse, packed_size
 
 
 def resolve_runtime_lib(repo_root: Path) -> Path:
-    lib = repo_root / "runtime" / "libturboquant.dylib"
-    if not lib.exists():
-        raise FileNotFoundError(f"TurboQuant dylib not found: {lib}")
-    return lib
+    import sys
+    sys.path.insert(0, str(repo_root / "runtime"))
+    from build_runtime import build_runtime
+    return build_runtime("turboquant")
 
 
 def generate_with_tq_context(
@@ -94,6 +104,8 @@ def generate_with_tq_context(
     bits: int,
     max_new: int,
 ) -> tuple[str, int, int, int, float]:
+    import torch
+
     enc = tokenizer(text, return_tensors="pt")
     input_ids = enc["input_ids"]
     attn_mask = enc["attention_mask"]
@@ -133,6 +145,9 @@ def generate_with_tq_context(
 
 
 def main() -> int:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     ap.add_argument("--prompt", default="Explique em uma frase o que e NexaLang.")
