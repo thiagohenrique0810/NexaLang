@@ -113,3 +113,6 @@ jobs:
 
       - name: Execute a derived sequence sharing the paged prefix
         run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/ci-kv-sequences.json
+
+      - name: Execute a derived sequence under age tiers
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-hot-pages 1 --kv-warm-pages 1 --kv-group-size 3 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 7,2 --report artifacts/reports/ci-kv-tiered-sequences.json

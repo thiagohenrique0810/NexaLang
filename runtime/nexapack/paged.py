@@ -175,7 +175,7 @@ class PagedTransformerSession(IncrementalTransformerSession):
         if self.kv_codec == "tq":
             self._ensure_tq_context()
         if (self._manifest_sha256 != parent._manifest_sha256
-                or self._cache_plan.to_json(indent=None) != parent._cache_plan.to_json(indent=None)):
+                or self._layout_identity() != parent._layout_identity()):
             raise ValueError("A derived sequence requires the same bundle and KV page layout")
         if len(parent._tokens) > self.max_sequence_length:
             raise ValueError("The inherited prefix exceeds this sequence's context capacity")
@@ -197,9 +197,11 @@ class PagedTransformerSession(IncrementalTransformerSession):
                 copied += 1
             graph, plan = self._make_plan(self.max_sequence_length)
             self._tokens, self._pages = parent._tokens, pages
+            self._adopt_state(parent)
             report = self._report(graph, plan, executed=False)
         except BaseException:
             self._tokens, self._pages = (), []
+            self._adopt_state(None)
             for page in pages:
                 page.release()
             raise
@@ -209,6 +211,13 @@ class PagedTransformerSession(IncrementalTransformerSession):
                                         "shared_pages": len(pages) - copied, "copied_pages": copied,
                                         "copied_bytes": copied * self._cache_plan.page_extent_bytes}
         self._last_report = report
+
+    def _layout_identity(self):
+        """Canonical description of every layout an inherited page may use."""
+        return self._cache_plan.to_json(indent=None)
+
+    def _adopt_state(self, parent):
+        """Executor state an inherited prefix implies, before its first report."""
 
     def _tq_memory(self):
         return tq_kv_memory(self.config.head_dim, self.kv_bits)

@@ -81,6 +81,11 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         return graph, self._plan_workspace(length, requests, end, attention_length=2 * heads,
                                            extra_reserve=reserve)
 
+    def fork(self, **overrides):
+        # Cold pages are files owned by one session's private store, which
+        # removes them on close; sharing them needs its own ownership contract.
+        raise ValueError("A backing store does not support derived sequences yet; run without --kv-backing-store")
+
     def _ensure_store(self):
         if self._store is None:
             self._store = KVPageStore(self._backing_parent, identity=self._manifest_sha256)

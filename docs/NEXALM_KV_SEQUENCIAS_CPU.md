@@ -3,12 +3,12 @@
 O décimo quarto incremento acrescenta `fork()` ao executor paginado homogêneo
 (`--kv-cache --kv-page-tokens`, codecs F32/Q4/Q3/TQ) e a flag de evidência
 `--fork-tokens`. Uma sequência derivada continua um prefixo já calculado sem
-recomputá-lo e sem copiar suas páginas completas.
+recomputá-lo e sem copiar suas páginas completas. O décimo quinto estende isso
+à política de idade (`--kv-policy age`), com migração privada.
 
-Isso atende a parte de múltiplas sequências e prefixos de M4.06. Tiers por idade
-e backing store recusam `fork` explicitamente: a recodificação por idade
-substitui páginas do prefixo, e uma página compartilhada migraria para uma
-sequência enquanto outra ainda a lê. Esse caso ficou em M4.06b.
+O backing store continua recusando `fork` explicitamente: páginas cold são
+arquivos de um store privado que os remove ao fechar, e compartilhá-los exige
+um contrato de propriedade próprio. Esse caso ficou em M4.06c.
 
 ## Por que o compartilhamento é seguro
 
@@ -26,8 +26,23 @@ libera a alocação com o último dono, então `reset`, `prefill` substituto e
 profundidade, uma escrita que alcance uma página compartilhada é rejeitada antes
 de tocar bytes, com o prefixo e o relatório preservados.
 
+## Tiers por idade: migração privada
+
+Sob `--kv-policy age`, a derivada herda também os descritores do prefixo: os
+mesmos codecs, idades e identidades de layout. A recodificação por idade **cria
+uma página nova** e libera a de origem, então migrar é privado à sequência que
+migra: a página compartilhada continua válida e inalterada para as demais, que
+seguem com seus próprios codecs.
+
+O preço é que cada sequência pode pagar a mesma recodificação separadamente, e
+duas sequências que migram a mesma página lógica passam a ocupar duas páginas
+físicas. O ganho de compartilhamento cai conforme o prefixo envelhece de formas
+diferentes em cada ramo.
+
 A adoção exige o mesmo manifesto de modelo e um layout de página idêntico
-(codec, tamanho, grupo, bits/seed e codebook TQ). O contexto herdado precisa
+(codec, tamanho, grupo, bits/seed e codebook TQ). Sob tiers, a comparação inclui
+a política inteira: hot/warm e `group_size` não mudam o layout F32, mas decidem
+como uma página Q4/Q3 herdada é lida. O contexto herdado precisa
 caber na capacidade da sequência derivada. Uma falha durante a adoção devolve as
 referências retidas, libera as cópias e deixa o pai intacto.
 
@@ -90,15 +105,30 @@ python3 tools/nexa_run.py artifacts/models/nexalm-tiny \
   --report artifacts/reports/kv-sequencias-tiny.json
 ```
 
-Regressões: `python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v`.
+Sob tiers, troque o codec pela política, e o relatório mostra os codecs herdados:
+
+```bash
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny \
+  --tokens 1,3,5 --kv-cache --kv-page-tokens 1 --kv-policy age \
+  --kv-hot-pages 1 --kv-warm-pages 1 --kv-group-size 3 \
+  --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 7,2
+```
+
+Regressões:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
+python3 -m unittest discover -s tests -p 'test_tiered_sequences_regressions.py' -v
+```
 
 ## Limites
+
+Backing store, cancelamento assíncrono de uma chamada em andamento e admissão
+conjunta por processo permanecem em M4.06c.
 
 Uma sessão continua **uma sequência**, síncrona, sem uso concorrente; várias
 sequências são várias sessões que compartilham páginas, cada uma com sua arena e
 seu orçamento. Não há escalonador, batch, admissão conjunta nem deduplicação
 automática de prefixos entre sessões independentes: o compartilhamento é
-explícito, por `fork`. Tiers por idade, backing store, cancelamento assíncrono de
-uma chamada em andamento e limites globais por processo permanecem em M4.06b.
-O [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
+explícito, por `fork`. O [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
 próxima tarefa.

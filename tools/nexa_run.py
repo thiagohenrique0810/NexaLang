@@ -60,7 +60,7 @@ def main(argv=None):
     parser.add_argument("--kv-reload-slots", type=int,
                         help="Cold pages kept resident between layers and calls (default: 1); requires --kv-backing-store")
     parser.add_argument("--fork-tokens", type=token_list,
-                        help="Derive a second sequence from the finished prefix and append these IDs to it")
+                        help="Derive a second sequence from the finished prefix and append these IDs to it; requires paged KV without a backing store")
     parser.add_argument("--verify", action="store_true", help="Compare small-model logits with optional PyTorch oracle")
     parser.add_argument("--reference-checkpoint", type=Path, help="Also measure original-vs-Q4 quantization error")
     parser.add_argument("--include-logits", action="store_true")
@@ -94,8 +94,8 @@ def main(argv=None):
     if args.kv_reload_slots is not None and (args.kv_backing_store is None or args.kv_reload_slots < 1):
         parser.error("--kv-reload-slots requires --kv-backing-store and at least one slot")
     if args.fork_tokens is not None and (not args.kv_cache or args.kv_page_tokens is None
-                                         or args.kv_policy != "homogeneous"):
-        parser.error("--fork-tokens requires --kv-cache, --kv-page-tokens and the homogeneous KV policy")
+                                         or args.kv_backing_store is not None):
+        parser.error("--fork-tokens requires --kv-cache and --kv-page-tokens, and no --kv-backing-store")
     if (args.kv_bits is not None or args.kv_seed is not None) and args.kv_codec != "tq":
         parser.error("--kv-bits/--kv-seed require --kv-codec tq")
     if args.kv_bits is not None and not 1 <= args.kv_bits <= 8:

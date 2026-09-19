@@ -64,10 +64,25 @@ class TieredTransformerSession(PagedTransformerSession):
     def _allocate_page(self, codec="f32"):
         return _TieredPage(self._tier_plan.layout(codec))
 
-    def fork(self, **overrides):
-        # Aging re-encodes committed pages in place of the prefix, so a shared
-        # page would migrate for one sequence while another still reads it.
-        raise ValueError("Age tiers do not support derived sequences yet; use a homogeneous KV codec")
+    def _fork_options(self):
+        options = super()._fork_options()
+        # Tiers fix the codecs; the policy itself defines the page layouts.
+        for name in ("kv_codec", "kv_bits", "kv_seed", "kv_codebook_f32le"):
+            options.pop(name)
+        options.update({"hot_pages": self.policy.hot_pages, "warm_pages": self.policy.warm_pages,
+                        "kv_group_size": self.policy.group_size})
+        return options
+
+    def _layout_identity(self):
+        # The F32 layout alone ignores the policy and the packed group size,
+        # which decide how an inherited Q4/Q3 page is read back.
+        return self._tier_plan.to_json(indent=None)
+
+    def _adopt_state(self, parent):
+        # Aging re-encodes a page into a *new* one and releases the source, so
+        # a migration is private to the sequence performing it: the shared page
+        # stays valid, and each sequence may pay that re-encode separately.
+        self._page_descriptors = parent._page_descriptors if parent is not None else ()
 
     def _make_plan(self, length, *, execution_context=None):
         self._configure_cache()
@@ -128,6 +143,9 @@ class TieredTransformerSession(PagedTransformerSession):
         descriptors = transition.final_pages if transition is not None else self._page_descriptors
         total = transition.new_length if transition is not None else self.cache_length
         resident = sum(page.page_allocation_bytes for page in descriptors)
+        live = self._pending_pages if self._pending_pages is not None else self._pages
+        shared = [page for page in live if getattr(page, "shared", False)]
+        shared_bytes = sum(page.allocation_bytes for page in shared)
         payload = sum(self._tier_plan.layout(page.codec).page_payload_bytes for page in descriptors)
         valid_bytes = sum(page.valid_tokens * self._tier_plan.layout(page.codec).token_bytes *
                           self.config.num_hidden_layers * 2 for page in descriptors)
@@ -162,6 +180,11 @@ class TieredTransformerSession(PagedTransformerSession):
         memory.update({"scope": "managed CPU workspace, mixed KV pages/tables, migration buffers and reader scratch; excludes RSS/VRAM",
                        "kv_page_tokens": self.page_tokens, "kv_resident_page_count": len(descriptors),
                        "kv_resident_allocation_bytes": resident, "persistent_kv_bytes": payload,
+                       # Shared pages are resident once for the whole process;
+                       # summing sequences would count the same page twice.
+                       "kv_shared_page_count": len(shared),
+                       "kv_shared_allocation_bytes": shared_bytes,
+                       "kv_owned_allocation_bytes": resident - shared_bytes,
                        "kv_valid_prefix_bytes": valid_bytes,
                        "kv_valid_prefix_f32_bytes": total * self.config.num_hidden_layers * 2 * self._cache_plan.token_bytes,
                        "kv_f32_bytes_per_token": self.config.num_hidden_layers * 2 * self._cache_plan.token_bytes,
@@ -307,6 +330,7 @@ class TieredTransformerSession(PagedTransformerSession):
         report.update({"context_length": 0, "cache_length": 0, "cache_position_offset": 0, "kv_pages": []})
         memory = report["memory"]
         for name in ("kv_resident_page_count", "kv_resident_allocation_bytes", "persistent_kv_bytes",
+                     "kv_shared_page_count", "kv_shared_allocation_bytes", "kv_owned_allocation_bytes",
                      "kv_valid_prefix_bytes", "kv_valid_prefix_f32_bytes", "kv_transaction_peak_allocation_bytes",
                      "kv_attention_phase_pages_bytes", "kv_migration_phase_bound_bytes"):
             memory[name] = 0

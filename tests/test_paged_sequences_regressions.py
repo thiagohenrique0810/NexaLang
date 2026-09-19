@@ -226,23 +226,27 @@ class PagedSequenceRegressions(_PagedFixture):
                   "--max-sequence-length", "8", "--tile-rows", "3", "--memory-budget", "1MiB",
                   "--fork-tokens", "2,4"]
         unpaged = [*common, "--kv-cache"]
-        tiers = [*common, "--kv-cache", "--kv-page-tokens", "2", "--kv-policy", "age", "--kv-group-size", "4"]
-        for invalid in (unpaged, tiers):
+        offloaded = [*common, "--kv-cache", "--kv-page-tokens", "2", "--kv-policy", "age",
+                     "--kv-group-size", "4", "--kv-backing-store", str(self.directory / "cli-store")]
+        for invalid in (unpaged, offloaded):
             rejected = subprocess.run(invalid, capture_output=True, text=True, timeout=120)
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("--fork-tokens requires --kv-cache, --kv-page-tokens and the homogeneous KV policy",
+            self.assertIn("--fork-tokens requires --kv-cache and --kv-page-tokens, and no --kv-backing-store",
                           rejected.stderr)
             self.assertNotIn("Traceback", rejected.stderr)
 
-    def test_age_tiers_reject_derived_sequences(self):
-        from runtime.nexapack.tiered import TieredTransformerSession
-        with TieredTransformerSession(self.path, memory_budget="1MiB", max_sequence_length=8,
-                                      page_tokens=2, kv_group_size=4) as session:
+    def test_a_backing_store_rejects_derived_sequences(self):
+        from runtime.nexapack.offloaded import OffloadedTieredTransformerSession
+        with OffloadedTieredTransformerSession(self.path, kv_backing_store=self.directory / "store",
+                                               memory_budget="1MiB", max_sequence_length=8,
+                                               page_tokens=1, kv_group_size=4) as session:
             session.prefill([1, 3, 5])
             with self.assertRaises(ValueError) as failure:
                 session.fork()
+            # Cold files belong to one private store that deletes them on close.
             self.assertIn("derived sequences", str(failure.exception))
             self.assertEqual(session.token_ids, (1, 3, 5))
+            session.decode(7)
 
 
 if __name__ == "__main__":

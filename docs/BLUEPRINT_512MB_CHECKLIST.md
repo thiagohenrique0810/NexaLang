@@ -142,6 +142,17 @@ store recusam `fork` e ficaram em M4.06b. Passaram **558 regressões + 110 teste
 bootstrap = 668 testes**, sem falhas ou skips. Checklist: **33 concluídos e 107
 pendentes**.
 
+**Décimo quinto incremento implementado e validado:** sequências derivadas sob a
+política de idade. A derivada herda os descritores do prefixo e, como a
+recodificação cria uma página nova e libera a origem, migrar é privado à
+sequência que migra: a página compartilhada continua válida e inalterada para as
+demais. A validação de layout passou a comparar a política inteira — hot/warm e
+`group_size` não alteram o layout F32, mas decidem como uma página Q4/Q3 herdada
+é lida, e a comparação anterior aceitaria uma derivada incompatível. O backing
+store continua recusando `fork` e ficou em M4.06c, junto de cancelamento em
+andamento e admissão conjunta. Passaram **564 regressões + 110 testes bootstrap =
+674 testes**, sem falhas ou skips. Checklist: **34 concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -158,13 +169,13 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.06b — sequências derivadas sob tiers e backing store.**
-A recodificação por idade substitui páginas do prefixo, então uma página
-compartilhada migraria para uma sequência enquanto outra ainda a lê; definir se a
-migração é privada, adiada ou compartilhada antes de implementar. Incluir
-cancelamento de uma chamada em andamento e limites por processo, hoje
-inexistentes: cada sessão admite o próprio orçamento e o compartilhamento reduz
-residência real sem reduzir a reserva.
+**Próxima tarefa: M4.06c — sequências derivadas sob backing store, cancelamento
+e admissão conjunta.** Páginas cold são arquivos de um store privado que os
+remove ao fechar; compartilhá-las exige propriedade por referência sobre os
+arquivos, ou uma cópia explícita, antes de permitir `fork`. Cancelar uma chamada
+em andamento exige executá-la fora da thread que cancela; hoje só há rollback de
+falhas e interrupções. Admissão conjunta: cada sessão admite o próprio orçamento,
+e o compartilhamento reduz residência real sem reduzir a reserva.
 
 **Também pendente: critérios de qualidade e importância por página, M4.05d.**
 Depende de qualidade medida em checkpoint treinado (LLM.04b) e da calibração
@@ -558,9 +569,12 @@ transferidos e limite máximo documentados.
   compartilhado por contagem de referências, cópia apenas da página parcial,
   escrita em página compartilhada rejeitada, capacidade por sequência e
   liberação em qualquer ordem; logits idênticos e residência somada medida.
-- [ ] M4.06b Sequências derivadas sob tiers/backing store, cancelamento de uma
-  chamada em andamento, limites e admissão conjunta por processo, e reuso de
-  prefixo entre sessões que não derivam uma da outra.
+- [x] M4.06b Sequências derivadas sob a política de idade: descritores herdados,
+  migração privada sobre páginas compartilhadas, identidade de layout incluindo
+  política e group_size, e relatórios de residência compartilhada/própria.
+- [ ] M4.06c Sequências derivadas sob backing store, cancelamento de uma chamada
+  em andamento, limites e admissão conjunta por processo, e reuso de prefixo
+  entre sessões que não derivam uma da outra.
 
 **Gate M4:** melhoria de bytes/token comprovada no cache usado pela atenção,
 com qualidade, latência e temporários contabilizados.
@@ -1151,6 +1165,29 @@ Décimo primeiro incremento:
   **33 concluídos e 107 pendentes**; M4.06 foi dividido preservando o restante.
   Próximo incremento técnico: M4.06b.
 
+## Registro do décimo quinto incremento — sequências sob tiers
+
+- Concluído M4.06b: `TieredTransformerSession` aceita `fork`. A derivada herda
+  `_page_descriptors`, e a recodificação por idade permanece privada porque cria
+  a página de destino e apenas libera a origem compartilhada.
+- Correção de contrato: a identidade de layout usava só o plano F32, que ignora
+  hot/warm e `group_size`. Uma derivada com outra política seria aceita e leria
+  páginas Q4/Q3 herdadas com parâmetros errados. A comparação passou a usar o
+  plano de tiers completo; o executor homogêneo mantém seu próprio plano.
+- Relatórios de tiers ganharam `kv_shared_page_count`,
+  `kv_shared_allocation_bytes` e `kv_owned_allocation_bytes`, zerados no reset.
+  `--fork-tokens` passou a aceitar `--kv-policy age` e continua recusando
+  `--kv-backing-store`.
+- Custo registrado: cada sequência pode pagar a mesma recodificação, e duas que
+  migrem a mesma página lógica passam a ocupar duas páginas físicas. O ganho de
+  compartilhamento diminui conforme os ramos envelhecem de formas diferentes.
+- Validação macOS ARM64/Python 3.14.5: **564 regressões + 110 bootstrap = 674
+  testes, zero falhas e zero skips**. Os 6 novos cobrem herança de codecs com
+  logits idênticos, migração privada, cópia da página parcial hot, relatórios e
+  sobrevivência ao reset do pai, rejeição de política divergente e falha de adoção.
+- Guia: [sequências derivadas](NEXALM_KV_SEQUENCIAS_CPU.md). Checklist:
+  **34 concluídos e 107 pendentes**. Próximo incremento técnico: M4.06c.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1193,6 +1230,10 @@ python3 -m unittest discover -s tests -p 'test_reload_cache_regressions.py' -v
 # Sequência derivada que continua o prefixo sem recomputá-lo.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/kv-sequencias-tiny.json
 python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
+
+# Sequência derivada sob a política de idade, com migração privada.
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --kv-cache --kv-page-tokens 1 --kv-policy age --kv-hot-pages 1 --kv-warm-pages 1 --kv-group-size 3 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 7,2
+python3 -m unittest discover -s tests -p 'test_tiered_sequences_regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_offloaded*regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_kv_store_regressions.py' -v
 python3 -S -m unittest discover -s tests -p 'test_streaming_kv_kernels_regressions.py' -v
@@ -1387,10 +1428,13 @@ Décimo quarto incremento acrescenta:
 - `runtime/nexapack/paged.py`: contagem de referências em `_KVPage`, `fork`,
   `_adopt_prefix`, rejeição de escrita em página compartilhada e campos de
   residência compartilhada/própria no relatório.
-- `runtime/nexapack/tiered.py`: recusa explícita de sequências derivadas.
+- `runtime/nexapack/tiered.py` e `offloaded.py`: adoção sob tiers com migração
+  privada, identidade de layout pela política e recusa explícita no backing store.
 - `tools/nexa_run.py --fork-tokens` e bloco `derived_sequence` no relatório.
-- `tests/test_paged_sequences_regressions.py`: equivalência por codec,
-  isolamento de bytes, ownership, limites, falhas, relatórios e CLI.
+- `tests/test_paged_sequences_regressions.py` e
+  `tests/test_tiered_sequences_regressions.py`: equivalência por codec,
+  isolamento de bytes, migração privada, ownership, limites, falhas,
+  relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
 Limites atuais: DSL e pipeline de modelos separados de nxc; executor C scalar
@@ -1398,7 +1442,7 @@ orquestrado em Python, uma sequência, baseline por recomputação e KV incremen
 opcional F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
 por idade em RAM, com backing store opcional para evicção/recarga de cold Q3 CPU.
 Páginas cold podem ser reutilizadas em slots admitidos, e sequências derivadas
-compartilham o prefixo paginado homogêneo. Pesos Q3/TQ, TQ misto,
+compartilham o prefixo paginado, homogêneo ou por idade. Pesos Q3/TQ, TQ misto,
 promoção de precisão, prefetch, múltiplas sequências e compartilhamento de
 prefixos permanecem pendentes. O cache privado CPU não implementa residência
 GPU de experts, roteamento condicional ou Plastic Learning.
