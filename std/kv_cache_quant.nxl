@@ -8,10 +8,11 @@
 #   - bits in [2..4] recommended for KV usage
 
 extern "C" {
-    fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
+    fn tq_create_mse(dim: i32, bits: i32, seed: i32) -> *u8;
     fn tq_destroy(ctx: *u8);
-    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
-    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn tq_packed_size(ctx: *u8, n_vectors: i32) -> u64;
+    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32) -> i32;
+    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32) -> i32;
     fn malloc(size: i32) -> *u8;
     fn free(ptr: *u8);
 }
@@ -30,14 +31,7 @@ pub struct QuantizedKVCache {
 
 impl QuantizedKVCache {
     fn new(dim: i32, bits: i32, max_tokens: i32) -> QuantizedKVCache {
-        let qk = tq_create(dim, bits, 42);
-        let qv = tq_create(dim, bits, 42);
-        let total_bits = dim * bits;
-        let per_token = (total_bits + 7) / 8;
-        let total_size = per_token * max_tokens;
-        let k = malloc(total_size);
-        let v = malloc(total_size);
-        return QuantizedKVCache(qk, qv, dim, bits, max_tokens, 0, k, v, per_token);
+        return new_cache(dim, bits, max_tokens);
     }
 
     fn len(&self) -> i32 {
@@ -56,8 +50,8 @@ impl QuantizedKVCache {
         return self.max_tokens * self.bytes_per_token * 2;
     }
 
-    fn fp32_bytes_total(&self) -> i32 {
-        return self.max_tokens * self.dim * 4 * 2;
+    fn fp32_bytes_total(&self) -> i64 {
+        return cast::<i64>(self.max_tokens) * cast::<i64>(self.dim) * 8;
     }
 
     # Push one token's K and V vectors (shape: [dim]).
@@ -70,8 +64,8 @@ impl QuantizedKVCache {
         let k_dst = cast::<*u8>(cast::<i64>(self.k_buf) + cast::<i64>(offset));
         let v_dst = cast::<*u8>(cast::<i64>(self.v_buf) + cast::<i64>(offset));
 
-        tq_quantize_packed(self.qk, k_in, k_dst, 1);
-        tq_quantize_packed(self.qv, v_in, v_dst, 1);
+        if (tq_quantize_packed(self.qk, k_in, k_dst, 1) != 0) { return 0; }
+        if (tq_quantize_packed(self.qv, v_in, v_dst, 1) != 0) { return 0; }
 
         self.len_tokens = self.len_tokens + 1;
         return 1;
@@ -87,7 +81,7 @@ impl QuantizedKVCache {
         }
         let offset = index * self.bytes_per_token;
         let src = cast::<*u8>(cast::<i64>(self.k_buf) + cast::<i64>(offset));
-        tq_dequantize_packed(self.qk, src, out_k, 1);
+        if (tq_dequantize_packed(self.qk, src, out_k, 1) != 0) { panic("Invalid key payload"); }
     }
 
     # Dequantize value at token index into out_v[dim].
@@ -100,7 +94,7 @@ impl QuantizedKVCache {
         }
         let offset = index * self.bytes_per_token;
         let src = cast::<*u8>(cast::<i64>(self.v_buf) + cast::<i64>(offset));
-        tq_dequantize_packed(self.qv, src, out_v, 1);
+        if (tq_dequantize_packed(self.qv, src, out_v, 1) != 0) { panic("Invalid value payload"); }
     }
 
     # Dequantize both K and V at token index.
@@ -127,12 +121,30 @@ impl QuantizedKVCache {
 
 # Module-level constructor for broader compiler compatibility.
 pub fn new_cache(dim: i32, bits: i32, max_tokens: i32) -> QuantizedKVCache {
-    let qk = tq_create(dim, bits, 42);
-    let qv = tq_create(dim, bits, 42);
-    let total_bits = dim * bits;
-    let per_token = (total_bits + 7) / 8;
-    let total_size = per_token * max_tokens;
+    let qk = tq_create_mse(dim, bits, 42);
+    let qv = tq_create_mse(dim, bits, 42);
+    if (cast::<i64>(qk) == 0 or cast::<i64>(qv) == 0) {
+        tq_destroy(qk);
+        tq_destroy(qv);
+        panic("Invalid KV quantizer parameters or allocation failure");
+    }
+    let stride = tq_packed_size(qk, 1);
+    let total = tq_packed_size(qk, max_tokens);
+    if (total == cast::<u64>(0) or total > cast::<u64>(1073741823)) {
+        tq_destroy(qk);
+        tq_destroy(qv);
+        panic("Invalid KV capacity or size overflow");
+    }
+    let per_token = cast::<i32>(stride);
+    let total_size = cast::<i32>(total);
     let k = malloc(total_size);
     let v = malloc(total_size);
+    if (cast::<i64>(k) == 0 or cast::<i64>(v) == 0) {
+        free(k);
+        free(v);
+        tq_destroy(qk);
+        tq_destroy(qv);
+        panic("KV allocation failed");
+    }
     return QuantizedKVCache(qk, qv, dim, bits, max_tokens, 0, k, v, per_token);
 }

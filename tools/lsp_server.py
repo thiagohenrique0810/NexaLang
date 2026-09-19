@@ -15,6 +15,9 @@ import os
 import json
 import re
 import traceback
+import copy
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 # Add bootstrap to path
 BOOTSTRAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'bootstrap')
@@ -24,6 +27,7 @@ from lexer import Lexer
 from n_parser import Parser, FunctionDef, StructDef, EnumDef, TraitDef, ImplDef, VarDecl, ExternBlock
 from semantic import SemanticAnalyzer
 from errors import CompilerError
+from modules import resolve_modules
 
 # ── JSON-RPC Transport ───────────────────────────────────────────────────
 
@@ -31,18 +35,24 @@ def read_message():
     """Read a JSON-RPC message from stdin (Content-Length header protocol)."""
     headers = {}
     while True:
-        line = sys.stdin.buffer.readline().decode('utf-8')
+        raw_line = sys.stdin.buffer.readline()
+        if not raw_line:
+            return None
+        line = raw_line.decode('utf-8')
         if line == '\r\n' or line == '\n':
             break
         if ':' in line:
             key, value = line.split(':', 1)
-            headers[key.strip()] = value.strip()
+            headers[key.strip().lower()] = value.strip()
 
-    length = int(headers.get('Content-Length', 0))
-    if length == 0:
+    length = int(headers.get('content-length', 0))
+    if length <= 0:
+        raise ValueError('Content-Length must be a positive integer')
+
+    data = sys.stdin.buffer.read(length)
+    if len(data) != length:
         return None
-
-    body = sys.stdin.buffer.read(length).decode('utf-8')
+    body = data.decode('utf-8')
     return json.loads(body)
 
 
@@ -82,6 +92,9 @@ class NexaLSP:
     def analyze_document(self, uri, source):
         """Full lexer + parser + semantic analysis, collecting diagnostics."""
         self.documents[uri] = source
+        # Never serve stale symbols after an incomplete edit fails to parse.
+        self.ast_cache.pop(uri, None)
+        self.symbols.pop(uri, None)
         diagnostics = []
         ast = []
         symbols = []
@@ -120,7 +133,10 @@ class NexaLSP:
             sa = SemanticAnalyzer()
             sa.current_file_path = self._uri_to_path(uri)
             sa.current_dir = os.path.dirname(sa.current_file_path) if sa.current_file_path else '.'
-            sa.analyze(ast)
+            # Module expansion and semantic analysis mutate nodes. Preserve the
+            # original document AST for editor symbols and source locations.
+            semantic_ast = resolve_modules(copy.deepcopy(ast), sa.current_dir)
+            sa.analyze(semantic_ast)
 
             # Collect warnings
             for (msg, line, col) in sa.warnings:
@@ -136,8 +152,11 @@ class NexaLSP:
                 msg += f" (hint: {e.hint})"
             diagnostics.append(self._make_diagnostic(line, col, msg, 1))
         except Exception as e:
-            # Non-fatal: log but still provide partial diagnostics
-            pass
+            # Some semantic checks still raise ordinary exceptions. Surface
+            # these errors instead of reporting an apparently valid document.
+            line = (getattr(e, 'line', None) or 1) - 1
+            col = (getattr(e, 'column', None) or 1) - 1
+            diagnostics.append(self._make_diagnostic(line, col, str(e), 1))
 
         self._publish_diagnostics(uri, diagnostics)
 
@@ -146,7 +165,7 @@ class NexaLSP:
         return {
             "range": {
                 "start": {"line": max(0, line), "character": max(0, col)},
-                "end": {"line": max(0, line), "character": col + 20}
+                "end": {"line": max(0, line), "character": max(0, col) + 1}
             },
             "severity": severity,
             "source": "nexalang",
@@ -441,8 +460,12 @@ class NexaLSP:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _uri_to_path(self, uri):
-        if uri.startswith('file://'):
-            return uri[7:]
+        parsed = urlsplit(uri)
+        if parsed.scheme == 'file':
+            path = url2pathname(parsed.path)
+            if parsed.netloc and parsed.netloc != 'localhost':
+                path = '//' + parsed.netloc + path
+            return path
         return uri
 
     # ── Request Handler ──────────────────────────────────────────────
@@ -466,11 +489,7 @@ class NexaLSP:
                         "resolveProvider": False
                     },
                     "definitionProvider": True,
-                    "documentSymbolProvider": True,
-                    "diagnosticProvider": {
-                        "interFileDependencies": False,
-                        "workspaceDiagnostics": False
-                    }
+                    "documentSymbolProvider": True
                 },
                 "serverInfo": {
                     "name": "nexalang-lsp",
@@ -500,8 +519,14 @@ class NexaLSP:
         elif method == 'textDocument/didSave':
             td = params['textDocument']
             text = params.get('text')
-            if text:
+            if text is not None:
                 self.analyze_document(td['uri'], text)
+
+        elif method == 'workspace/didChangeWatchedFiles':
+            # Changes in imported files can invalidate an otherwise unchanged
+            # open document. Re-run the same shared module resolution pipeline.
+            for uri, source in list(self.documents.items()):
+                self.analyze_document(uri, source)
 
         elif method == 'textDocument/didClose':
             td = params['textDocument']
@@ -510,6 +535,7 @@ class NexaLSP:
             self.ast_cache.pop(uri, None)
             self.symbols.pop(uri, None)
             self._publish_diagnostics(uri, [])
+            self.diagnostics.pop(uri, None)
 
         elif method == 'textDocument/hover':
             td = params['textDocument']
@@ -542,6 +568,7 @@ class NexaLSP:
 def main():
     server = NexaLSP()
     while server.running:
+        msg = None
         try:
             msg = read_message()
             if msg is None:
@@ -552,6 +579,8 @@ def main():
             sys.stderr.write(f"LSP Error: {e}\n")
             sys.stderr.write(traceback.format_exc())
             sys.stderr.flush()
+            if isinstance(msg, dict) and msg.get('id') is not None:
+                send_error(msg['id'], -32603, str(e))
 
 if __name__ == '__main__':
     main()

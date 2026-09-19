@@ -3,7 +3,9 @@
 import os, sys
 
 sys.argv[0] = "nxc"
-root = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, root)
 
-exec(open(os.path.join(root, "nx.py")).read())
+from nx import main
+
+raise SystemExit(main())

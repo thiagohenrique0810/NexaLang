@@ -40,6 +40,7 @@ class EngineConfig:
     drafter_model: str = ""
     speculative_k: int = 4
     temperature: float = 1.0
+    memory_limit: str = ""
 
     @classmethod
     def from_plan(cls, plan: ExecutionPlan) -> 'EngineConfig':
@@ -56,6 +57,7 @@ class EngineConfig:
             drafter_model=cfg.get('decode', {}).get('drafter', ''),
             speculative_k=cfg.get('decode', {}).get('k', 4),
             temperature=cfg.get('decode', {}).get('temperature', 1.0),
+            memory_limit=cfg.get('target', {}).get('memory_limit', ''),
         )
 
 
@@ -79,6 +81,14 @@ class InferenceEngine:
         self.init(config)
 
     def init(self, config: EngineConfig):
+        if not isinstance(config.memory_limit, str):
+            raise ValueError("memory_limit must be a string with an explicit unit")
+        if config.memory_limit:
+            raise NotImplementedError(
+                "The experimental PyTorch executor cannot enforce memory_limit. "
+                "Use tools/nexa_bench.py for the bounded CPU packed-kernel path; "
+                "bounded full-model inference is not implemented yet."
+            )
         self.config = config
         logger.info(f"Initializing engine: model={config.model_name}, device={config.device}")
 

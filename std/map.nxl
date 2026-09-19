@@ -47,6 +47,7 @@ impl<K: Hash, V> HashMap<K, V> {
     }
 
     fn with_capacity(cap: i32) -> HashMap<K, V> {
+        if (cap < 1) { return HashMap::<K, V>::new(); }
         let mut entries = Vec::<Entry<K, V>>::new();
         for i in 0..cap {
             entries.push(Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
@@ -147,6 +148,17 @@ impl<K: Hash, V> HashMap<K, V> {
                 let val = entry.value;
                 self.entries.set(idx, Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
                 self.count = self.count - 1;
+                # Reinsert the remainder of this probe chain. An empty slot
+                # otherwise makes collided keys unreachable by get/remove.
+                let mut next = (idx + 1) % cap;
+                while (true) {
+                    let displaced = self.entries.get(next).unwrap();
+                    if (!displaced.occupied) { break; }
+                    self.entries.set(next, Entry::<K, V>(cast::<K>(0), cast::<V>(0), false));
+                    self.count = self.count - 1;
+                    self.insert(displaced.key, displaced.value);
+                    next = (next + 1) % cap;
+                }
                 return Option::<V>::Some(val);
             }
             idx = (idx + 1) % cap;

@@ -8,6 +8,6 @@ pub struct Helper {
 
 impl Helper {
     pub fn new(v: i32) -> Helper {
-        Helper { val: v }
+        return Helper(v);
     }
 }

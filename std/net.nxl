@@ -1,16 +1,17 @@
 extern "C" {
     fn curl_easy_init() -> *u8;
-    fn curl_easy_setopt(handle: *u8, option: i32, param: *u8) -> i32;
+    fn curl_easy_setopt(handle: *u8, option: i32, ...) -> i32;
+    fn curl_easy_reset(handle: *u8);
     fn curl_easy_perform(handle: *u8) -> i32;
     fn curl_easy_cleanup(handle: *u8);
-    fn curl_easy_getinfo(handle: *u8, info: i32, out: *u8) -> i32;
+    fn curl_easy_getinfo(handle: *u8, info: i32, ...) -> i32;
     fn curl_slist_append(list: *u8, val: *u8) -> *u8;
     fn curl_slist_free_all(list: *u8);
     fn malloc(size: i32) -> *u8;
     fn realloc(ptr: *u8, size: i32) -> *u8;
     fn free(ptr: *u8);
     fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
-    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn tmpfile() -> *u8;
     fn fclose(stream: *u8) -> i32;
     fn fseek(stream: *u8, offset: i64, whence: i32) -> i32;
     fn ftell(stream: *u8) -> i64;
@@ -27,7 +28,7 @@ pub struct Response {
 
 impl Response {
     fn ok(&self) -> bool {
-        return self.status >= 200 && self.status < 300;
+        return self.status >= 200 and self.status < 300;
     }
 
     fn is_error(&self) -> bool {
@@ -46,11 +47,13 @@ pub struct HttpClient {
 impl HttpClient {
     fn new() -> HttpClient {
         let h = curl_easy_init();
+        if (cast::<i64>(h) == 0) { panic("HTTP client allocation failed"); }
         return HttpClient(h, 30, true);
     }
 
     fn with_timeout(timeout_secs: i32) -> HttpClient {
         let h = curl_easy_init();
+        if (cast::<i64>(h) == 0) { panic("HTTP client allocation failed"); }
         return HttpClient(h, timeout_secs, true);
     }
 
@@ -99,6 +102,11 @@ impl HttpClient {
 
     fn _do_request(&self, method: string, url: string, body: string, body_len: i32, headers: *u8) -> Response {
         let h = self.handle;
+        if (cast::<i64>(h) == 0 or self.timeout < 0 or body_len < 0) {
+            return Response(0, "", 0);
+        }
+        # Clear method, body, header list and FILE* from the previous request.
+        curl_easy_reset(h);
 
         # CURLOPT_URL = 10002
         curl_easy_setopt(h, 10002, cast::<*u8>(url));
@@ -112,12 +120,14 @@ impl HttpClient {
         }
 
         # CURLOPT_CUSTOMREQUEST = 10036 (for PUT, DELETE, PATCH, HEAD)
-        if (method != "GET" && method != "POST") {
+        if (method != "GET" and method != "POST") {
             curl_easy_setopt(h, 10036, cast::<*u8>(method));
         }
 
+        if (method == "HEAD") { curl_easy_setopt(h, 44, cast::<i64>(1)); }
+
         # Set POST body if applicable
-        if (method == "POST" || method == "PUT" || method == "PATCH") {
+        if (method == "POST" or method == "PUT" or method == "PATCH") {
             # CURLOPT_POST = 47
             curl_easy_setopt(h, 47, cast::<*u8>(1));
             # CURLOPT_POSTFIELDS = 10015
@@ -133,7 +143,8 @@ impl HttpClient {
 
         # Capture response body: curl defaults WRITEFUNCTION to fwrite,
         # so setting WRITEDATA to a FILE* captures the body automatically.
-        let tmpf = fopen(cast::<*u8>("/tmp/_nexa_http_buf"), cast::<*u8>("w+b"));
+        let tmpf = tmpfile();
+        if (cast::<i64>(tmpf) == 0) { return Response(0, "", 0); }
         if (cast::<i64>(tmpf) != 0) {
             # CURLOPT_WRITEDATA = 10001
             curl_easy_setopt(h, 10001, tmpf);
@@ -161,11 +172,15 @@ impl HttpClient {
                 fseek(tmpf, 0, 2);  # SEEK_END
                 let bsize = ftell(tmpf);
                 fseek(tmpf, 0, 0);  # SEEK_SET
-                let bbuf = malloc(cast::<i32>(bsize) + 1);
-                fread(bbuf, 1, bsize, tmpf);
-                bbuf[cast::<i32>(bsize)] = cast::<u8>(0);
-                resp_body = cast::<string>(bbuf);
-                resp_len = cast::<i32>(bsize);
+                if (bsize > 0 and bsize < 2147483647) {
+                    let bbuf = malloc(cast::<i32>(bsize) + 1);
+                    if (cast::<i64>(bbuf) != 0) {
+                        let received = fread(bbuf, 1, bsize, tmpf);
+                        bbuf[cast::<i32>(received)] = cast::<u8>(0);
+                        resp_body = cast::<string>(bbuf);
+                        resp_len = cast::<i32>(received);
+                    } else { status = 0; }
+                } else if (bsize != 0) { status = 0; }
             }
         }
 
@@ -173,6 +188,7 @@ impl HttpClient {
             fclose(tmpf);
         }
 
+        curl_easy_reset(h);
         return Response(status, resp_body, resp_len);
     }
 

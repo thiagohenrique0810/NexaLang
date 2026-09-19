@@ -1,136 +1,77 @@
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
 const vscode = require('vscode');
 const path = require('path');
+const fs = require('fs');
 
 let client;
 
-function activate(context) {
-    const config = vscode.workspace.getConfiguration('nexalang');
-    const lspEnabled = config.get('lsp.enabled', true);
+function registerCompilerCommands(context) {
+    for (const action of ['build', 'run', 'test']) {
+        context.subscriptions.push(vscode.commands.registerCommand(`nexalang.${action}`, async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.languageId !== 'nexalang' || editor.document.uri.scheme !== 'file') {
+                vscode.window.showErrorMessage('Open a saved .nxl file first.');
+                return;
+            }
+            if (editor.document.isDirty && !(await editor.document.save())) {
+                return;
+            }
+            const file = editor.document.uri.fsPath;
+            const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+            const config = vscode.workspace.getConfiguration('nexalang', editor.document.uri);
+            const executable = config.get('compilerPath', 'nxc');
+            // Pass arguments directly, so filenames never become shell commands.
+            const execution = new vscode.ProcessExecution(executable, [action, file], {
+                cwd: folder ? folder.uri.fsPath : path.dirname(file)
+            });
+            const task = new vscode.Task(
+                { type: 'nexalang', action }, folder || vscode.TaskScope.Workspace,
+                `NexaLang ${action}`, 'nexalang', execution, []
+            );
+            await vscode.tasks.executeTask(task);
+        }));
+    }
+}
 
-    if (!lspEnabled) {
+async function activate(context) {
+    registerCompilerCommands(context);
+    const config = vscode.workspace.getConfiguration('nexalang');
+    if (!config.get('lsp.enabled', true)) {
         return;
     }
 
-    const pythonPath = config.get('lsp.pythonPath', 'python3');
-
-    // Find the LSP server script
-    // Try several locations: extension dir's parent (in-tree), or workspace
-    let serverScript = null;
-    const candidates = [
-        path.join(__dirname, '..', 'tools', 'lsp_server.py'),
-        path.join(__dirname, 'tools', 'lsp_server.py'),
+    const configuredServer = config.get('lsp.serverPath', '');
+    const candidates = configuredServer ? [configuredServer] : [
+        path.join(__dirname, 'server', 'tools', 'lsp_server.py'),
+        path.join(__dirname, '..', 'tools', 'lsp_server.py')
     ];
-
-    // Also check workspace folders
-    if (vscode.workspace.workspaceFolders) {
-        for (const folder of vscode.workspace.workspaceFolders) {
-            candidates.push(path.join(folder.uri.fsPath, 'tools', 'lsp_server.py'));
-        }
-    }
-
-    for (const candidate of candidates) {
-        try {
-            const fs = require('fs');
-            if (fs.existsSync(candidate)) {
-                serverScript = candidate;
-                break;
-            }
-        } catch (e) {
-            // ignore
-        }
-    }
-
+    const serverScript = candidates.find(candidate => fs.existsSync(candidate));
     if (!serverScript) {
-        vscode.window.showWarningMessage(
-            'NexaLang LSP server not found. Diagnostics and hover disabled.'
-        );
+        vscode.window.showWarningMessage('NexaLang LSP server not found. Run npm run prepare-server when developing the extension.');
         return;
     }
 
     const serverOptions = {
-        command: pythonPath,
+        command: config.get('lsp.pythonPath', 'python3'),
         args: [serverScript],
         transport: TransportKind.stdio
     };
-
-    const clientOptions = {
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.nxl');
+    context.subscriptions.push(watcher);
+    client = new LanguageClient('nexalang', 'NexaLang Language Server', serverOptions, {
         documentSelector: [{ scheme: 'file', language: 'nexalang' }],
-        synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.nxl')
-        }
-    };
-
-    client = new LanguageClient(
-        'nexalang',
-        'NexaLang Language Server',
-        serverOptions,
-        clientOptions
-    );
-
-    client.start();
-
-    context.subscriptions.push({
-        dispose: () => {
-            if (client) {
-                client.stop();
-            }
-        }
+        synchronize: { fileEvents: watcher }
     });
-
-    // Register build command
-    context.subscriptions.push(
-        vscode.commands.registerCommand('nexalang.build', async () => {
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== 'nexalang') {
-                vscode.window.showErrorMessage('Open a .nxl file first.');
-                return;
-            }
-
-            const file = editor.document.uri.fsPath;
-            const terminal = vscode.window.createTerminal('NexaLang Build');
-            terminal.show();
-            terminal.sendText(`nxc build "${file}"`);
-        })
-    );
-
-    // Register run command
-    context.subscriptions.push(
-        vscode.commands.registerCommand('nexalang.run', async () => {
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== 'nexalang') {
-                vscode.window.showErrorMessage('Open a .nxl file first.');
-                return;
-            }
-
-            const file = editor.document.uri.fsPath;
-            const terminal = vscode.window.createTerminal('NexaLang Run');
-            terminal.show();
-            terminal.sendText(`nxc run "${file}"`);
-        })
-    );
-
-    // Register test command
-    context.subscriptions.push(
-        vscode.commands.registerCommand('nexalang.test', async () => {
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== 'nexalang') {
-                vscode.window.showErrorMessage('Open a .nxl file first.');
-                return;
-            }
-
-            const file = editor.document.uri.fsPath;
-            const terminal = vscode.window.createTerminal('NexaLang Test');
-            terminal.show();
-            terminal.sendText(`nxc test "${file}"`);
-        })
-    );
+    context.subscriptions.push({ dispose: () => { if (client) { void client.stop(); } } });
+    try {
+        await client.start();
+    } catch (error) {
+        vscode.window.showErrorMessage(`NexaLang LSP failed to start: ${error.message}`);
+    }
 }
 
 function deactivate() {
-    if (client) {
-        return client.stop();
-    }
+    return client ? client.stop() : undefined;
 }
 
 module.exports = { activate, deactivate };

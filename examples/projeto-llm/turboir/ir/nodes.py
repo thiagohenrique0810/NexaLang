@@ -109,7 +109,8 @@ class IRModelConfig:
             'attention': {'variant': self.attention.variant.value, 'streaming': self.attention.streaming, 'window_size': self.attention.window_size},
             'decode': {'mode': self.decode.mode.value, 'drafter': self.decode.drafter, 'k': self.decode.k, 'temperature': self.decode.temperature},
             'scheduler': {'policy': self.scheduler.policy.value, 'max_batch': self.scheduler.max_batch, 'max_ctx': self.scheduler.max_ctx},
-            'target': {'device': self.target.device.value, 'backend': self.target.backend},
+            'target': {'device': self.target.device.value, 'backend': self.target.backend,
+                       'memory_limit': self.target.memory_limit},
         }
 
 

@@ -1,12 +1,13 @@
 import sys
 import os
 import argparse
+import tempfile
 from lexer import Lexer
 import n_parser
 from n_parser import ModDecl, FunctionDef, StructDef, EnumDef, ImplDef, CallExpr, IntegerLiteral, StringLiteral, ReturnStmt, UseStmt
 from codegen import CodeGen
 from errors import CompilerError
-import semantic
+from modules import resolve_modules
 
 
 DEFAULT_BUILD_DIR = os.path.join("artifacts", "build")
@@ -18,6 +19,21 @@ def _ensure_parent_dir(path):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _write_artifact(path, content):
+    """Publish a complete artifact only after compilation and validation succeed."""
+    _ensure_parent_dir(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    candidate = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as f:
+            candidate = f.name
+            f.write(str(content))
+        os.replace(candidate, path)
+    finally:
+        if candidate and os.path.exists(candidate):
+            os.unlink(candidate)
 
 
 def _build_test_runner(test_names):
@@ -41,110 +57,7 @@ def _build_test_runner(test_names):
     
     return body
 
-def mangle_ast(nodes, prefix):
-    for node in nodes:
-        if isinstance(node, (FunctionDef, StructDef, EnumDef)):
-            if getattr(node, 'module', None):
-                node.module = f"{prefix}::{node.module}"
-            else:
-                node.module = prefix
-            
-            node.name = f"{prefix}_{node.name}"
-        elif isinstance(node, ImplDef):
-            if getattr(node, 'module', None):
-                node.module = f"{prefix}::{node.module}"
-            else:
-                node.module = prefix
-            node.struct_name = f"{prefix}_{node.struct_name}"
-            for method in node.methods:
-                method.module = node.module
-
-def resolve_modules(ast, base_dir, loaded_modules=None):
-    if loaded_modules is None:
-        loaded_modules = set()
-
-    def _load_module_from_parts(parts):
-        key = "::".join(parts)
-        if key in loaded_modules:
-            return []
-
-        rel_dir = os.path.join(*parts)
-        mod_path = os.path.join(os.getcwd(), rel_dir + ".nxl")
-        if not os.path.exists(mod_path):
-            mod_path = os.path.join(os.getcwd(), rel_dir, "mod.nxl")
-        if not os.path.exists(mod_path):
-            return []
-
-        with open(mod_path, 'r') as f:
-            mod_src = f.read()
-
-        lx = Lexer(mod_src)
-        tokens = lx.tokenize()
-        p = n_parser.Parser(tokens)
-        mod_ast = p.parse()
-
-        loaded_modules.add(key)
-        mod_ast = resolve_modules(mod_ast, os.path.dirname(mod_path), loaded_modules)
-
-        # Match nested `mod` behavior: innermost module first, root last.
-        for prefix in reversed(parts):
-            mangle_ast(mod_ast, prefix)
-        return mod_ast
-
-    new_ast = []
-    for node in ast:
-        if isinstance(node, ModDecl):
-            if node.body is not None:
-                # Nested module block
-                inner_ast = resolve_modules(node.body, base_dir, loaded_modules)
-                mangle_ast(inner_ast, node.name)
-                new_ast.extend(inner_ast)
-            else:
-                # File-based module
-                mod_path = os.path.join(base_dir, node.name + ".nxl")
-                if not os.path.exists(mod_path):
-                     mod_path = os.path.join(base_dir, node.name, "mod.nxl")
-                
-                # Fallback to CWD/Project Root for std lib
-                if not os.path.exists(mod_path):
-                     mod_path = os.path.join(os.getcwd(), node.name + ".nxl")
-                     if not os.path.exists(mod_path):
-                          mod_path = os.path.join(os.getcwd(), node.name, "mod.nxl")
-
-                if not os.path.exists(mod_path):
-                     raise Exception(f"Module file not found: {node.name}.nxl or {node.name}/mod.nxl in {base_dir} or {os.getcwd()}")
-                
-                with open(mod_path, 'r') as f:
-                    mod_src = f.read()
-                
-                lx = Lexer(mod_src)
-                tokens = lx.tokenize()
-                p = n_parser.Parser(tokens)
-                mod_ast = p.parse()
-                
-                # Recurse
-                mod_ast = resolve_modules(mod_ast, os.path.dirname(mod_path), loaded_modules)
-                
-                # Mangle
-                mangle_ast(mod_ast, node.name)
-                
-                new_ast.extend(mod_ast)
-        elif isinstance(node, UseStmt):
-            # Auto-load std modules referenced by use-statements without
-            # requiring `mod std;` (which would parse the entire std tree).
-            if node.path and node.path[0] == 'std' and len(node.path) >= 2:
-                if node.is_glob:
-                    module_parts = node.path
-                else:
-                    module_parts = node.path[:-1]
-                if len(module_parts) >= 2:
-                    new_ast.extend(_load_module_from_parts(module_parts))
-            new_ast.append(node)
-        else:
-            new_ast.append(node)
-    return new_ast
-
-def main():
+def _compile():
     ap = argparse.ArgumentParser(prog="nxc (bootstrap)", add_help=True)
     ap.add_argument("file", help="Input .nxl file")
     ap.add_argument("--target", choices=["native", "spirv"], default="native", help="Compilation target")
@@ -160,11 +73,15 @@ def main():
     ap.add_argument("--out", default=None, help="Output path (default: artifacts/build/output.ll or artifacts/build/output.spv)")
     ap.add_argument("--emit-mir", action="store_true", help="Emit MIR (Mid-level IR) for debugging/optimization analysis")
     ap.add_argument("--opt", choices=["0", "1", "2", "3"], default="1", help="Optimization level (0=none, 1=basic, 2=aggressive, 3=max)")
-    ap.add_argument("--quantize-gpu", type=int, default=0, choices=[0, 1, 2, 3, 4], help="Auto-quantize GPU float buffers with TurboQuant (0=off, 1-4=bits)")
+    ap.add_argument("--quantize-gpu", type=int, default=0, choices=[0, 1, 2, 3, 4], help="Experimental automatic GPU quantization is disabled; only 0 is supported")
     args = ap.parse_args()
+    if args.emit == "spv" and args.target != "spirv":
+        ap.error("--emit spv requires --target spirv")
+    if args.run_jit and args.target != "native":
+        ap.error("--run-jit requires --target native")
 
     filepath = args.file
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         source = f.read()
 
     # 1. Lexing
@@ -184,13 +101,6 @@ def main():
     analyzer.current_dir = os.path.dirname(os.path.abspath(filepath))
     analyzer.current_file_path = os.path.basename(filepath)
     
-    # Pre-analyze to find tests if --run-tests is on
-    if args.run_tests:
-        # We need to find tests first. But analyzer does that during visit.
-        # Let's run a partial pass or just inject the main later.
-        # Better: run analyze, then if tests found, inject main and re-analyze main only.
-        pass
-
     try:
         analyzer.analyze(ast)
     except CompilerError as e:
@@ -210,8 +120,7 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"[SEMANTIC ERROR] {e}")
-        import traceback; traceback.print_exc()
-        return
+        return 1
     # 3.5 Print Warnings
     if analyzer.warnings:
          lines = source.splitlines()
@@ -280,6 +189,12 @@ def main():
     )
     llvm_ir = codegen.generate(ast)
 
+    # Reject malformed IR before reporting a successful compilation.
+    if args.target == "native":
+        import llvmlite.binding as llvm_binding
+        verified_module = llvm_binding.parse_assembly(str(llvm_ir))
+        verified_module.verify()
+
     # ── LLVM Optimization Passes ──
     opt_level = int(args.opt)
     if opt_level >= 2 and args.target == "native":
@@ -307,23 +222,22 @@ def main():
             llvm_ir = str(mod)
             print(f"[OPT] LLVM O{min(opt_level, 3)} passes applied")
         except Exception as e:
-            print(f"[OPT WARNING] LLVM passes skipped: {e}")
+            raise RuntimeError(f"LLVM optimization failed: {e}") from e
 
     if args.run_jit and args.target == "native":
         from jit import run_jit
         print("[JIT] Starting JIT...")
         ret = run_jit(str(llvm_ir))
         print(f"[JIT] Finished with code {ret}")
-        return
+        return ret
 
     if args.emit == "ll":
         out_path = args.out or DEFAULT_LL_PATH
         _ensure_parent_dir(out_path)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(llvm_ir)
+        _write_artifact(out_path, llvm_ir)
         print(f"\n[SUCCESS] LLVM IR compiled to '{out_path}'")
         if args.target == "native" and not args.run_jit:
-            print(f"To run (requires clang): clang {out_path} -o output.exe && ./output.exe")
+            print(f"To build and run with runtime dependencies: nxc run {filepath}")
         return
 
     # emit spv
@@ -348,6 +262,15 @@ def main():
              f.write(llvm_ir)
         print(f"[SPIR-V EMIT ERROR] {e}")
         print(f"[FALLBACK] Wrote LLVM IR to '{ll_fallback}' (use llvm-as + llvm-spirv to convert).")
+        return 1
+
+def main():
+    try:
+        return _compile() or 0
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f"[COMPILE ERROR] {exc or 'Interrupted'}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

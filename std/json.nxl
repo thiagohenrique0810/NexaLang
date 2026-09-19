@@ -5,7 +5,7 @@ use std::string::String;
 extern "C" {
     fn malloc(size: i32) -> *u8;
     fn memcpy(dest: *u8, src: *u8, n: i32) -> *u8;
-    fn snprintf(buf: *u8, size: i32, fmt: *u8) -> i32;
+    fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
 }
 
 pub enum JsonValue {
@@ -51,7 +51,7 @@ impl JsonValue {
         }
 
         # Number (simplified)
-        if (c >= 48 and c <= 57) or c == 45 { # '0'-'9' or '-'
+        if ((c >= 48 and c <= 57) or c == 45) { # '0'-'9' or '-'
             let neg = false;
             if (c == 45) {
                 neg = true;
@@ -250,7 +250,7 @@ impl JsonValue {
     fn get(&self, key: string) -> Option<JsonValue> {
         let s = self;
         match (s) {
-            Object(obj) => return obj.get(key),
+            Object(obj) => return obj.get(String::from(key)),
             _ => return Option::None,
         }
     }

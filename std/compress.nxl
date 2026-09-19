@@ -10,13 +10,19 @@
 #   - Network transfer of high-dimensional embeddings
 #
 # The quantizer is data-oblivious: no calibration data needed.
-# Distortion is within factor ≈2.7 of the information-theoretic minimum.
+# Packed records preserve each vector norm and include an 8-byte header.
+# Theoretical distortion references apply to unit-norm vectors; this runtime
+# does not guarantee a fixed approximation factor for every input.
 
 extern "C" {
     fn tq_create(dim: i32, bits: i32, seed: i32) -> *u8;
+    fn tq_create_mse(dim: i32, bits: i32, seed: i32) -> *u8;
     fn tq_destroy(ctx: *u8);
-    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32);
-    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32);
+    fn tq_packed_size(ctx: *u8, n_vectors: i32) -> u64;
+    fn tq_prod_idx_packed_size(ctx: *u8, n_vectors: i32) -> u64;
+    fn tq_prod_qjl_packed_size(ctx: *u8, n_vectors: i32) -> u64;
+    fn tq_quantize_packed(ctx: *u8, input: *f32, output: *u8, n_vectors: i32) -> i32;
+    fn tq_dequantize_packed(ctx: *u8, input: *u8, output: *f32, n_vectors: i32) -> i32;
     fn tq_mse(ctx: *u8, original: *f32, n_vectors: i32) -> f32;
     fn tq_upper_bound(ctx: *u8) -> f32;
     fn tq_lower_bound(ctx: *u8) -> f32;
@@ -68,11 +74,26 @@ impl Quantizer {
     #   4-bit: 8× compression, MSE ≈ 0.009
     fn new(dim: i32, bits: i32) -> Quantizer {
         let h = tq_create(dim, bits, 42);
+        if (cast::<i64>(h) == 0) { panic("Invalid quantizer parameters or allocation failure"); }
         return Quantizer(h, dim, bits);
     }
 
     fn with_seed(dim: i32, bits: i32, seed: i32) -> Quantizer {
         let h = tq_create(dim, bits, seed);
+        if (cast::<i64>(h) == 0) { panic("Invalid quantizer parameters or allocation failure"); }
+        return Quantizer(h, dim, bits);
+    }
+
+    # MSE-only context: linear state, without the quadratic Prod/QJL matrix.
+    # Packed TQ01 records and MSE results match new/with_seed for the same seed.
+    # Prod operations require the legacy new/with_seed constructors.
+    fn new_mse(dim: i32, bits: i32) -> Quantizer {
+        return Quantizer::with_seed_mse(dim, bits, 42);
+    }
+
+    fn with_seed_mse(dim: i32, bits: i32, seed: i32) -> Quantizer {
+        let h = tq_create_mse(dim, bits, seed);
+        if (cast::<i64>(h) == 0) { panic("Invalid MSE quantizer parameters or allocation failure"); }
         return Quantizer(h, dim, bits);
     }
 
@@ -80,14 +101,14 @@ impl Quantizer {
     # Input buffer:  f32 array of size n_vectors * dim
     # Output buffer: packed bitstream of size compressed_size(n_vectors)
     fn quantize(&self, input: *f32, output: *u8, n_vectors: i32) {
-        tq_quantize_packed(self.handle, input, output, n_vectors);
+        if (tq_quantize_packed(self.handle, input, output, n_vectors) != 0) { panic("Quantization failed"); }
     }
 
     # Dequantize compressed bitstream back to approximate f32 vectors.
     # Input buffer: packed bitstream of size compressed_size(n_vectors)
     # Output buffer: f32 array of size n_vectors * dim (caller-allocated)
     fn dequantize(&self, input: *u8, output: *f32, n_vectors: i32) {
-        tq_dequantize_packed(self.handle, input, output, n_vectors);
+        if (tq_dequantize_packed(self.handle, input, output, n_vectors) != 0) { panic("Invalid compressed payload"); }
     }
 
     # Compute mean squared error between originals and round-trip reconstruction.
@@ -105,16 +126,21 @@ impl Quantizer {
         return tq_lower_bound(self.handle);
     }
 
-    # How many bytes needed for compressed output of n_vectors
-    # at 'bits' bits per coordinate.
+    # Bytes for n_vectors independent TQ01 records:
+    # 8 bytes of version/norm metadata plus ceil(dim * bits / 8) per vector.
     fn compressed_size(&self, n_vectors: i32) -> i32 {
-        let total_bits = n_vectors * self.dim * self.bits;
-        return (total_bits + 7) / 8;
+        if (n_vectors == 0) { return 0; }
+        let size = tq_packed_size(self.handle, n_vectors);
+        if (size == cast::<u64>(0) or size > cast::<u64>(2147483647)) { panic("Compressed size overflow"); }
+        return cast::<i32>(size);
     }
 
     # Original size in bytes (f32 per coordinate).
     fn original_size(&self, n_vectors: i32) -> i32 {
-        return n_vectors * self.dim * 4;
+        if (n_vectors < 0) { panic("Invalid vector count"); }
+        let size = cast::<i64>(n_vectors) * cast::<i64>(self.dim) * 4;
+        if (size > 2147483647) { panic("Original size overflow"); }
+        return cast::<i32>(size);
     }
 
     # Size (bytes) of TurboQuantProd packed base indices at (bits-1) bpc.
@@ -122,37 +148,36 @@ impl Quantizer {
         if (self.bits <= 1) {
             return 0;
         }
-        let total_bits = n_vectors * self.dim * (self.bits - 1);
-        return (total_bits + 7) / 8;
+        let size = tq_prod_idx_packed_size(self.handle, n_vectors);
+        if (size == cast::<u64>(0) or size > cast::<u64>(2147483647)) { panic("Prod size overflow"); }
+        return cast::<i32>(size);
     }
 
     # Size (bytes) of TurboQuantProd 1-bit QJL payload.
     fn prod_qjl_size(&self, n_vectors: i32) -> i32 {
-        let total_bits = n_vectors * self.dim;
-        return (total_bits + 7) / 8;
+        let size = tq_prod_qjl_packed_size(self.handle, n_vectors);
+        if (size == cast::<u64>(0) or size > cast::<u64>(2147483647)) { panic("Prod size overflow"); }
+        return cast::<i32>(size);
     }
 
     # Quantize with TurboQuantProd (inner-product oriented).
     # Requires bits >= 2.
     fn quantize_prod(&self, input: *f32, out_idx: *u8, out_qjl: *u8, out_gamma: *f32, n_vectors: i32) {
         let rc = tq_quantize_prod(self.handle, input, out_idx, out_qjl, out_gamma, n_vectors);
-        if (rc != 0) {
-            return;
-        }
+        if (rc != 0) { panic("TurboQuantProd operation failed"); }
     }
 
     # Dequantize TurboQuantProd payload.
     fn dequantize_prod(&self, in_idx: *u8, in_qjl: *u8, in_gamma: *f32, output: *f32, n_vectors: i32) {
         let rc = tq_dequantize_prod(self.handle, in_idx, in_qjl, in_gamma, output, n_vectors);
-        if (rc != 0) {
-            return;
-        }
+        if (rc != 0) { panic("TurboQuantProd operation failed"); }
     }
 
     # Allocate payload buffers and quantize using TurboQuantProd.
     fn quantize_prod_alloc(&self, input: *f32, n_vectors: i32) -> QuantizedProd {
         let idx_size = self.prod_idx_size(n_vectors);
         let qjl_size = self.prod_qjl_size(n_vectors);
+        if (n_vectors <= 0 or n_vectors > 536870911) { panic("Invalid vector count"); }
         let gamma = cast::<*f32>(malloc(n_vectors * 4));
         let idx = malloc(idx_size);
         let qjl = malloc(qjl_size);
@@ -181,9 +206,21 @@ impl CompressedBuffer {
     # Create a compressed buffer for vectors of given dimension.
     fn new(dim: i32, bits: i32, capacity: i32) -> CompressedBuffer {
         let q = Quantizer::new(dim, bits);
-        let total_bits = capacity * dim * bits;
-        let buf_size = (total_bits + 7) / 8;
+        if (capacity <= 0) { panic("Invalid buffer capacity"); }
+        let buf_size = q.compressed_size(capacity);
         let buf = malloc(buf_size);
+        if (cast::<i64>(buf) == 0) { panic("CompressedBuffer allocation failed"); }
+        return CompressedBuffer(q, buf, 0, capacity);
+    }
+
+    # Explicit MSE-only storage; the legacy constructor keeps Prod available
+    # through the public quant field.
+    fn new_mse(dim: i32, bits: i32, capacity: i32) -> CompressedBuffer {
+        let q = Quantizer::new_mse(dim, bits);
+        if (capacity <= 0) { panic("Invalid buffer capacity"); }
+        let buf_size = q.compressed_size(capacity);
+        let buf = malloc(buf_size);
+        if (cast::<i64>(buf) == 0) { panic("CompressedBuffer allocation failed"); }
         return CompressedBuffer(q, buf, 0, capacity);
     }
 
@@ -200,6 +237,7 @@ impl CompressedBuffer {
 
     # Decompress a single vector at the given index.
     fn get(&self, index: i32, output: *f32) {
+        if (index < 0 or index >= self.n_vectors) { panic("CompressedBuffer index out of bounds"); }
         let offset = self.quant.compressed_size(index);
         let src = cast::<*u8>(cast::<i64>(self.data) + cast::<i64>(offset));
         self.quant.dequantize(src, output, 1);
@@ -222,7 +260,7 @@ impl CompressedBuffer {
 # Quick compress: creates a quantizer, compresses, returns indices buffer.
 # Caller must free the returned pointer.
 pub fn quick_compress(data: *f32, dim: i32, n_vectors: i32, bits: i32) -> *u8 {
-    let q = Quantizer::new(dim, bits);
+    let q = Quantizer::new_mse(dim, bits);
     let out_size = q.compressed_size(n_vectors);
     let out = malloc(out_size);
     q.quantize(data, out, n_vectors);
@@ -233,8 +271,8 @@ pub fn quick_compress(data: *f32, dim: i32, n_vectors: i32, bits: i32) -> *u8 {
 # Quick decompress: reconstructs f32 vectors from compressed indices.
 # Caller must free the returned pointer.
 pub fn quick_decompress(indices: *u8, dim: i32, n_vectors: i32, bits: i32) -> *f32 {
-    let q = Quantizer::new(dim, bits);
-    let out_size = n_vectors * dim * 4;
+    let q = Quantizer::new_mse(dim, bits);
+    let out_size = q.original_size(n_vectors);
     let out = cast::<*f32>(malloc(out_size));
     q.dequantize(indices, out, n_vectors);
     q.drop();
@@ -253,7 +291,7 @@ pub fn quick_quantize_prod(data: *f32, dim: i32, n_vectors: i32, bits: i32) -> Q
 # Caller must free the returned pointer.
 pub fn quick_dequantize_prod(payload: QuantizedProd) -> *f32 {
     let q = Quantizer::new(payload.dim, payload.bits);
-    let out_size = payload.n_vectors * payload.dim * 4;
+    let out_size = q.original_size(payload.n_vectors);
     let out = cast::<*f32>(malloc(out_size));
     q.dequantize_prod(payload.idx, payload.qjl, payload.gamma, out, payload.n_vectors);
     q.drop();

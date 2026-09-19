@@ -7,11 +7,7 @@ struct StringList {
 impl StringList {
     fn new() -> StringList {
          # Manually construct
-         let res = StringList {
-             ptr: cast<String*>(0),
-             len: 0,
-             cap: 0
-         };
+         let res = StringList(cast::<String*>(0), 0, 0);
          return res;
     }
 
@@ -23,8 +19,8 @@ impl StringList {
             # Size of String struct = 8 (ptr) + 4 (len) + 4 (cap) = 16 bytes
             # alignment usually 8.
             let size = 16; 
-            let n_ptr = realloc(cast<u8*>(self.ptr), n_cap * size);
-            self.ptr = cast<String*>(n_ptr);
+            let n_ptr = realloc(cast::<u8*>(self.ptr), n_cap * size);
+            self.ptr = cast::<String*>(n_ptr);
             self.cap = n_cap;
         }
         
@@ -51,11 +47,11 @@ struct String {
 impl String {
     fn from(s: string) -> String {
         let l = 0;
-        let p_start = cast<u8*>(s);
+        let p_start = cast::<u8*>(s);
         let temp_ptr = p_start;
         
         let c = *temp_ptr;
-        while (c != cast<u8>(0)) {
+        while (c != cast::<u8>(0)) {
             l = l + 1;
             temp_ptr = temp_ptr + 1;
             c = *temp_ptr;
@@ -65,13 +61,9 @@ impl String {
         memcpy(p, p_start, l);
         
         let term_dest = p + l;
-        *cast<u8*>(term_dest) = cast<u8>(0);
+        *cast::<u8*>(term_dest) = cast::<u8>(0);
 
-        let res = String {
-            ptr: p,
-            len: l,
-            cap: l + 1
-        };
+        let res = String(p, l, l + 1);
         return res;
     }
 
@@ -88,11 +80,11 @@ impl String {
             self.cap = n_cap;
         }
         let t_ptr = self.ptr + self.len;
-        *cast<u8*>(t_ptr) = c;
+        *cast::<u8*>(t_ptr) = c;
         self.len = self.len + 1;
         
         let trm_ptr = self.ptr + self.len;
-        *cast<u8*>(trm_ptr) = cast<u8>(0);
+        *cast::<u8*>(trm_ptr) = cast::<u8>(0);
     }
 
     fn concat(&self, other: &String) -> String {
@@ -104,13 +96,9 @@ impl String {
         memcpy(second_half, other.ptr, other.len);
         
         let term_dest = p + new_len;
-        *cast<u8*>(term_dest) = cast<u8>(0);
+        *cast::<u8*>(term_dest) = cast::<u8>(0);
         
-        let res = String {
-            ptr: p,
-            len: new_len,
-            cap: new_len + 1
-        };
+        let res = String(p, new_len, new_len + 1);
         return res;
     }
 
@@ -120,20 +108,16 @@ impl String {
         memcpy(p, src_start, len);
         
         let term_dest = p + len;
-        *cast<u8*>(term_dest) = cast<u8>(0);
+        *cast::<u8*>(term_dest) = cast::<u8>(0);
         
-        let res = String {
-            ptr: p,
-            len: len,
-            cap: len + 1
-        };
+        let res = String(p, len, len + 1);
         return res;
     }
 
     fn contains(&self, needle: string) -> bool {
         let needle_len = 0;
-        let n_ptr = cast<u8*>(needle);
-        while (*n_ptr != cast<u8>(0)) {
+        let n_ptr = cast::<u8*>(needle);
+        while (*n_ptr != cast::<u8>(0)) {
             needle_len = needle_len + 1;
             n_ptr = n_ptr + 1;
         }
@@ -148,7 +132,7 @@ impl String {
             let match_found = true;
             while (j < needle_len) {
                 let s_char = *(self.ptr + i + j);
-                let n_char = *(cast<u8*>(needle) + j);
+                let n_char = *(cast::<u8*>(needle) + j);
                 if (s_char != n_char) {
                     match_found = false;
                     # break; // no break yet
@@ -171,8 +155,8 @@ impl String {
         let i = 0;
         
         while (i < self.len) {
-            let c = *(cast<u8*>(self.ptr + i));
-            if (cast<char>(c) == delimiter) {
+            let c = *(cast::<u8*>(self.ptr + i));
+            if (cast::<char>(c) == delimiter) {
                  # New substring from start to i
                  let slice_len = i - start;
                  let s = self.substring(start, slice_len);
@@ -193,7 +177,7 @@ impl String {
     }
 
     fn print(&self) {
-        print(cast<string>(self.ptr));
+        print(cast::<string>(self.ptr));
     }
 }
 

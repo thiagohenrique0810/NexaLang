@@ -1,6 +1,6 @@
 fn main() {
-    let i: i32 = 5
-    while (i) {
+    let mut i: i32 = 5
+    while (i > 0) {
         print(i)
         i = i - 1
     }

@@ -252,22 +252,27 @@ class UseStmt(ASTNode):
 
 class IntegerLiteral(ASTNode):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class BooleanLiteral(ASTNode):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class FloatLiteral(ASTNode):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class VariableExpr(ASTNode):
     def __init__(self, name):
+        super().__init__()
         self.name = name
 
 class BlockStmt(ASTNode):
     def __init__(self, stmts):
+        super().__init__()
         self.stmts = stmts
 
 class RegionStmt(ASTNode):
@@ -506,7 +511,7 @@ class Parser:
 
         # Check for 'impl Trait for Type'
         # We read first identifier. It could be Trait or Type.
-        first_id = self.consume('IDENTIFIER').value
+        first_id = self.parse_type()
         
         trait_name = None
         struct_name = None
@@ -516,18 +521,13 @@ class Parser:
              # first_id was Trait
              trait_name = first_id
              # Next is Type (struct)
-             struct_name = self.consume('IDENTIFIER').value
+             struct_name = self.parse_type()
         else:
              # Regular impl Type
              struct_name = first_id
         
-        # Optional struct generics: Struct<T>
-        if self.peek().type == 'LT':
-            self.consume('LT')
-            while self.peek().type != 'GT':
-                self.consume('IDENTIFIER').value
-                if self.peek().type == 'COMMA': self.consume('COMMA')
-            self.consume('GT')
+        if generics:
+            struct_name = struct_name.split('<', 1)[0]
 
         self.consume('LBRACE')
         methods = []
@@ -727,6 +727,8 @@ class Parser:
                      param_type = '&' + self.parse_type()
                      params.append((param_name, param_type))
             else:
+                 if self.peek().type == 'MUT':
+                     self.consume('MUT')
                  param_name = self.consume('IDENTIFIER').value
                  self.consume('COLON')
                  param_type = self.parse_type()
@@ -1245,7 +1247,10 @@ class Parser:
                         self.consume('LT')
                         types = []
                         while self.peek().type != 'GT':
-                            types.append(self.parse_type())
+                            if self.peek().type == 'NUMBER':
+                                types.append(str(self.consume('NUMBER').value))
+                            else:
+                                types.append(self.parse_type())
                             if self.peek().type == 'COMMA': self.consume('COMMA')
                         self.consume('GT')
                         full_name = f"{full_name}<{','.join(types)}>"

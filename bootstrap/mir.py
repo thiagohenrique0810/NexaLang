@@ -12,6 +12,7 @@ When enabled: AST → MIR → (optimize) → LLVM IR
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import List, Optional, Dict, Tuple, Any
 
 
@@ -906,12 +907,20 @@ class MIROptimizer:
             return None
 
         try:
+            def quotient():
+                if rv == 0:
+                    return None
+                if isinstance(lv, int) and isinstance(rv, int):
+                    magnitude = abs(lv) // abs(rv)
+                    return -magnitude if (lv < 0) != (rv < 0) else magnitude
+                return lv / rv
+
             ops = {
                 'add': lambda: lv + rv,
                 'sub': lambda: lv - rv,
                 'mul': lambda: lv * rv,
-                'div': lambda: lv // rv if isinstance(lv, int) and rv != 0 else (lv / rv if rv != 0 else None),
-                'rem': lambda: lv % rv if rv != 0 else None,
+                'div': quotient,
+                'rem': lambda: (lv - quotient() * rv) if rv != 0 and isinstance(lv, int) and isinstance(rv, int) else (math.fmod(lv, rv) if rv != 0 else None),
                 'eq': lambda: lv == rv,
                 'ne': lambda: lv != rv,
                 'lt': lambda: lv < rv,
@@ -1025,8 +1034,8 @@ class MIROptimizer:
             if shift is not None:
                 return MIRBinOp(dest=inst.dest, op='shl', left=left,
                                 right=MIRConst(shift, MIRType("i32")))
-        # Divide by power of 2 → shift right
-        if op == 'div' and isinstance(right, MIRConst) and isinstance(right.value, int) and right.value > 0:
+        # Only unsigned division is equivalent to a plain right shift.
+        if op == 'div' and inst.dest.ty.name in ('u8', 'u64') and isinstance(right, MIRConst) and isinstance(right.value, int) and right.value > 0:
             shift = self._log2(right.value)
             if shift is not None:
                 return MIRBinOp(dest=inst.dest, op='shr', left=left,

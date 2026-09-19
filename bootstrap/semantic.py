@@ -1,5 +1,5 @@
 from lexer import Lexer
-from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt, TypeAlias
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt, TypeAlias, LambdaExpr
 from errors import CompilerError
 import sys
 import copy
@@ -17,7 +17,7 @@ class SemanticAnalyzer:
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_stack = [] # list of labels (None if no label)
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert', 'compress::create', 'compress::destroy', 'compress::quantize', 'compress::dequantize', 'compress::mse'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert', 'compress::create', 'compress::create_mse', 'compress::destroy', 'compress::quantize', 'compress::dequantize', 'compress::mse'])
         self.function_defs = {} # name -> list of FunctionDef
         self.structs = {} # name -> {field: type}
         self.struct_defs = {} # name -> StructDef (for privacy check)
@@ -28,6 +28,7 @@ class SemanticAnalyzer:
         self.generic_functions = {} # name -> node
         self.generic_structs = {} # name -> node
         self.generic_enums = {} # name -> node
+        self.generic_impls = {}
         self.traits = {} # name -> {method_name: method_signature_node}
         self.trait_defs = {} # name -> TraitDef
         self.current_module = ""
@@ -43,14 +44,23 @@ class SemanticAnalyzer:
         return matches[0] if matches else None
 
     def error(self, message, node=None, hint=None, error_code=None):
-        line = node.line if node else None
-        column = node.column if node else None
+        line = getattr(node, 'line', None)
+        column = getattr(node, 'column', None)
         raise CompilerError(message, line, column, hint=hint, error_code=error_code)
 
     def resolve_type_name(self, name):
         if not name: return name
         # Normalize: remove spaces
         name = name.replace(' ', '')
+        if name.startswith('fn('):
+            parameters, _, result = name[3:].rpartition(')->')
+            return f"fn({','.join(self.resolve_type_name(p) for p in self.split_generic_args(parameters))})->{self.resolve_type_name(result)}"
+        if name.startswith('&mut'):
+            return self.resolve_type_name(name[4:]) + '*'
+        if name.startswith('&'):
+            return self.resolve_type_name(name[1:]) + '*'
+        if name.endswith('*'):
+            return self.resolve_type_name(name[:-1]) + '*'
         
         # Mark as used if it's a known struct/enum
         base_name = name.split('<')[0] if '<' in name else name
@@ -104,7 +114,7 @@ class SemanticAnalyzer:
              local_name = f"{self.current_module.replace('::', '_')}_{name}"
              
              # Check if this local name exists in known types (Enums, Structs)
-             if local_name in self.structs or local_name in self.enums or local_name in self.generic_structs or local_name in self.generic_enums:
+             if local_name in self.structs or local_name in self.enums or local_name in self.generic_structs or local_name in self.generic_enums or local_name in self.traits:
                   return local_name
         
         return name
@@ -141,9 +151,9 @@ class SemanticAnalyzer:
 
     def is_copy_type(self, type_name: str) -> bool:
         if not type_name: return False
-        if type_name in ('i32', 'i64', 'u64', 'u8', 'bool', 'f32', 'string', 'char'):
+        if type_name in ('i32', 'i64', 'u64', 'u8', 'bool', 'f32', 'f64', 'string', 'char'):
             return True
-        if type_name.endswith('*'):
+        if type_name.endswith('*') or type_name.startswith('&') or type_name.startswith('fn('):
             return True
         return False
 
@@ -154,6 +164,8 @@ class SemanticAnalyzer:
 
         if var_info.get('moved'):
             self.error(f"Ownership Error: Use of moved variable '{name}'", node)
+        if var_info.get('moved_fields'):
+            self.error(f"Ownership Error: Use of partially moved variable '{name}'", node)
 
         if var_info.get('readers', 0) > 0:
             self.error(f"Borrow Error: Cannot move '{name}' because it is borrowed", node)
@@ -161,6 +173,68 @@ class SemanticAnalyzer:
             self.error(f"Borrow Error: Cannot move '{name}' because it is borrowed mutable", node)
 
         var_info['moved'] = True
+        if isinstance(node, VariableExpr):
+            node.moves_value = True
+
+    def consume(self, node, type_name):
+        if isinstance(node, VariableExpr) and '::' not in node.name and not self.is_copy_type(type_name):
+            self.move_var(node.name, node)
+        elif isinstance(node, MemberAccess) and not self.is_copy_type(type_name):
+            root, path = self._field_source(node)
+            info = self.lookup(root.name) if root else None
+            if info and not self.is_copy_type(info['type']):
+                destructor = self.current_function and '_drop' in self.current_function.name and root.name == 'self'
+                if 'drop' in self.struct_methods.get(info['type'], {}) and not destructor:
+                    self.error("Cannot move a field out of a value with a custom destructor", node, error_code="E0007")
+                info.setdefault('moved_fields', set()).add(path)
+                node.move_source = (root.name, path)
+
+    def _field_source(self, node):
+        path = []
+        while isinstance(node, MemberAccess):
+            path.append(node.member)
+            node = node.object
+        return (node, tuple(reversed(path))) if isinstance(node, VariableExpr) else (None, ())
+
+    def reference_origins(self, node):
+        """Keep provenance through aliases, pointer arithmetic and aggregate construction."""
+        if node is None:
+            return set()
+        type_name = getattr(node, 'type_name', None)
+        if type_name and not self._contains_references(type_name):
+            return set()
+        if isinstance(node, VariableExpr):
+            info = self.lookup(node.name)
+            return set(info.get('reference_origins', ())) if info else set()
+        if isinstance(node, UnaryExpr) and node.op in ('&', '&mut'):
+            target = node.operand
+            while isinstance(target, (MemberAccess, IndexAccess)):
+                target = target.object
+            if isinstance(target, VariableExpr):
+                _, depth = self.lookup_with_depth(target.name)
+                return {(target.name, depth)} if depth is not None else set()
+        if hasattr(node, 'reference_origins'):
+            return set(node.reference_origins)
+        origins = set()
+        for attr in ('args', 'elements', 'left', 'right', 'operand', 'object', 'receiver'):
+            value = getattr(node, attr, None)
+            for child in value if isinstance(value, list) else [value]:
+                if child is not None:
+                    origins.update(self.reference_origins(child))
+        return origins
+
+    def _contains_references(self, type_name, seen=None):
+        if type_name.endswith('*') or type_name.startswith(('&', 'fn(')) or type_name == 'string':
+            return True
+        seen = set() if seen is None else seen
+        if type_name in seen:
+            return False
+        seen.add(type_name)
+        if type_name.startswith('['):
+            return self._contains_references(type_name[1:-1].split(':', 1)[0], seen)
+        fields = self.structs.get(type_name, {}).values()
+        payloads = (typ for variant in self.enums.get(type_name, {}).values() for typ in variant)
+        return any(self._contains_references(typ, seen.copy()) for typ in list(fields) + list(payloads))
 
     def check_privacy(self, target_node, target_name):
         target_mod = getattr(target_node, 'module', "")
@@ -398,10 +472,9 @@ class SemanticAnalyzer:
         if inner_t.startswith('Task<') and inner_t.endswith('>'):
             res_t = inner_t[5:-1]
             node.type_name = res_t
+            self.consume(node.value, inner_t)
             return res_t
-            
-        node.type_name = inner_t
-        return inner_t
+        self.error(f"await expects Task<T>, got {inner_t}", node)
 
     def visit_MacroCallExpr(self, node):
         import os
@@ -515,6 +588,11 @@ class SemanticAnalyzer:
             elif name == 'TypeAlias':
                  self.aliases[node.alias] = node.original_type
 
+        # Imports must be available while registering impl signatures and traits.
+        for node in ast:
+            if isinstance(node, UseStmt):
+                self.visit_UseStmt(node)
+
         # Pass 2: Collect Functions and Impls
         for node in ast:
             name = type(node).__name__
@@ -600,6 +678,11 @@ class SemanticAnalyzer:
         elif name == 'StructDef':
              node.fields = [(n, self.resolve_type_name(self.mangle_type_if_local(t, prefix))) for n, t in node.fields]
              self.structs[node.name] = {n: self.resolve_type_name(self.mangle_type_if_local(t, prefix)) for n, t in node.fields}
+        elif name == 'EnumDef':
+             node.variants = [(variant, [self.resolve_type_name(self.mangle_type_if_local(t, prefix)) for t in payload])
+                              for variant, payload in node.variants]
+             if not node.generics:
+                 self.enums[node.name] = dict(node.variants)
         elif name == 'TypeAlias':
              node.original_type = self.resolve_type_name(self.mangle_type_if_local(node.original_type, prefix))
              if prefix:
@@ -649,15 +732,24 @@ class SemanticAnalyzer:
         return True
 
     def visit(self, node):
+        if isinstance(node, list):
+            for item in node:
+                self.visit(item)
+            return
         method_name = f'visit_{type(node).__name__}'
         visitor = getattr(self, method_name, self.generic_visit)
-        return visitor(node)
+        result = visitor(node)
+        if isinstance(result, str):
+            node.type_name = result
+        return result
 
     def visit_ExternBlock(self, node): pass
     def visit_TraitDef(self, node): pass
     def visit_StructDef(self, node): pass
     def visit_EnumDef(self, node): pass
     def visit_ImplDef(self, node):
+        if node.generics:
+            return
         prev_mod = self.current_module
         if getattr(node, 'module', None):
              self.current_module = node.module
@@ -718,6 +810,11 @@ class SemanticAnalyzer:
             self.aliases[alias] = full_name
 
     def register_impl_methods(self, node):
+        if node.generics:
+            self.generic_impls.setdefault(node.struct_name.split('<')[0], []).append(copy.deepcopy(node))
+            return
+        previous_module = self.current_module
+        self.current_module = getattr(node, 'module', previous_module)
         struct_name = node.struct_name
         if struct_name == 'std_hash_i32': struct_name = 'i32'
         if struct_name == 'std_hash_string': struct_name = 'string'
@@ -726,9 +823,10 @@ class SemanticAnalyzer:
             self.struct_methods[struct_name] = {}
             
         if node.trait_name:
-             if node.trait_name not in self.traits:
+             trait_key = self.resolve_type_name(node.trait_name.split('<', 1)[0])
+             if trait_key not in self.traits:
                   self.error(f"Semantic Error: Unknown trait '{node.trait_name}'", node)
-             trait_info = self.traits[node.trait_name]
+             trait_info = self.traits[trait_key]
              trait_methods = trait_info['methods']
              expected_types = trait_info['types']
              
@@ -783,8 +881,10 @@ class SemanticAnalyzer:
                  self.function_defs[mangled_base] = []
              self.function_defs[mangled_base].append(method)
              self.functions.add(mangled_base)
+        self.current_module = previous_module
 
     def check_trait_impl(self, type_name, trait_name):
+        trait_name = self.resolve_type_name(trait_name)
         if (type_name, trait_name) in self.impls: return True
         if '<' in type_name:
              base = type_name.split('<')[0]
@@ -792,7 +892,17 @@ class SemanticAnalyzer:
         return False
 
     def visit_MemberAccess(self, node):
-        obj_type = self.visit(node.object)
+        root, path = self._field_source(node)
+        if root:
+            info = self.lookup(root.name)
+            if info and not getattr(node, 'assignment_target', False):
+                if any(path[:len(moved)] == moved for moved in info.get('moved_fields', ())):
+                    self.error("Use of moved field", node, error_code="E0007")
+            root.allow_partial = True
+        try:
+            obj_type = self.visit(node.object)
+        finally:
+            if root: root.allow_partial = False
         base_type = obj_type.lstrip('&').replace('mut', '').rstrip('*')
         
         # Try full type first (monomorphized)
@@ -819,7 +929,8 @@ class SemanticAnalyzer:
     def visit_MethodCall(self, node):
         receiver_type = self.visit(node.receiver)
         base_type = receiver_type.lstrip('&').replace('mut ', '').rstrip('*')
-        lookup_type = base_type.split('<')[0] if '<' in base_type else base_type
+        self.instantiate_generic_type(base_type)
+        lookup_type = base_type if base_type in self.struct_methods else base_type.split('<')[0]
             
         if lookup_type not in self.struct_methods:
             raise Exception(f"Semantic Error: Type '{base_type}' has no methods")
@@ -866,6 +977,10 @@ class SemanticAnalyzer:
         node.receiver_type = receiver_type
         node.method_def = best_cand # Store for codegen
         best_cand.used = True
+        if best_cand.params and best_cand.params[0][0] == 'self':
+            self.consume(node.receiver, receiver_type if node.method_name == 'drop' else best_cand.params[0][1])
+        for arg, arg_type in zip(node.args, arg_types):
+            self.consume(arg, arg_type)
         
         # Mangle name
         node.method_name = self.get_mangled_name(f"{lookup_type}_{node.method_name}", best_cand.params)
@@ -966,7 +1081,7 @@ class SemanticAnalyzer:
         return t
 
     def visit_MatchExpr(self, node):
-        expr_type = self.visit(node.value)
+        expr_type = self.visit(node.value).rstrip('*')
         node.enum_name = expr_type # Set for codegen
         if expr_type and '<' in expr_type: self.instantiate_generic_type(expr_type)
         
@@ -983,11 +1098,16 @@ class SemanticAnalyzer:
              
         covered = set()
         for case in node.cases:
-            if case.variant_name not in variants: raise Exception(f"Enum has no variant '{case.variant_name}'")
-            covered.add(case.variant_name)
+            if case.variant_name == '_':
+                covered.update(variants)
+            elif case.variant_name not in variants:
+                raise Exception(f"Enum has no variant '{case.variant_name}'")
+            else:
+                covered.add(case.variant_name)
             self.enter_scope()
             if case.var_names:
                 payloads = variants[case.variant_name]
+                case.payload_type_names = payloads
                 if len(case.var_names) != len(payloads): raise Exception("Payload mismatch")
                 for i, vname in enumerate(case.var_names): self.declare_variable(vname, payloads[i])
             self.visit(case.body)
@@ -1029,6 +1149,36 @@ class SemanticAnalyzer:
         if is_concrete:
              self.structs[name] = dict(new_fields)
              self.ast_root.append(StructDef(name, new_fields))
+             self._instantiate_impls(name, base_name, mapping)
+
+    def _instantiate_impls(self, name, base_name, mapping):
+        for template in self.generic_impls.get(base_name, []):
+             impl = copy.deepcopy(template)
+             impl.struct_name = name
+             impl.generics = []
+             for method in impl.methods:
+                  method.params = [(pn, self.apply_submap(pt, mapping)) for pn, pt in method.params]
+                  method.return_type = self.apply_submap(method.return_type, mapping)
+                  self.substitute_generics(method.body, mapping)
+                  self._specialize_constructor(method.body, base_name, name)
+             saved_module = self.current_module
+             self.canonicalize_type_refs(impl)
+             self.register_impl_methods(impl)
+             self.current_module = saved_module
+             self.ast_root.append(impl)
+
+    def _specialize_constructor(self, node, base, concrete):
+        if isinstance(node, list):
+            for child in node:
+                self._specialize_constructor(child, base, concrete)
+        elif hasattr(node, '__dict__'):
+            if isinstance(node, CallExpr):
+                callee = node.callee.name if isinstance(node.callee, VariableExpr) else node.callee
+                if callee in (base, base.rsplit('_', 1)[-1]):
+                    node.callee = concrete
+            for value in vars(node).values():
+                if isinstance(value, list) or hasattr(value, '__dict__'):
+                    self._specialize_constructor(value, base, concrete)
 
     def instantiate_generic_enum(self, name):
         if name in self.enums: return
@@ -1053,6 +1203,7 @@ class SemanticAnalyzer:
         if is_concrete:
              self.enums[name] = {v: ps for v, ps in new_variants}
              self.ast_root.append(EnumDef(name, new_variants))
+             self._instantiate_impls(name, base_name, mapping)
 
     def instantiate_generic_function(self, name):
         if name in self.functions: return
@@ -1085,6 +1236,8 @@ class SemanticAnalyzer:
         is_concrete = all(self.is_deeply_concrete(arg) for arg in args)
         if is_concrete:
              new_func = FunctionDef(name, new_params, new_ret, new_body, def_node.is_kernel)
+             new_func.module = getattr(def_node, 'module', '')
+             new_func.is_pub = def_node.is_pub
              self.ast_root.append(new_func)
              self.functions.add(name)
              if name not in self.function_defs:
@@ -1093,16 +1246,41 @@ class SemanticAnalyzer:
 
     def visit_IfStmt(self, node):
         if self.visit(node.condition) != 'bool': raise Exception("If condition must be bool")
+        before = copy.deepcopy(self.scopes)
         self.enter_scope()
         for s in node.then_branch: self.visit(s)
         self.exit_scope()
-        
+        then_scopes = self.scopes
+        self.scopes = copy.deepcopy(before)
         if node.else_branch:
              self.enter_scope()
              for s in node.else_branch: self.visit(s)
              self.exit_scope()
+        # A value must be available on every path reaching the merge.
+        then_returns = self._ends_control_flow(node.then_branch)
+        else_returns = self._ends_control_flow(node.else_branch or [])
+        for index, scope in enumerate(self.scopes):
+            for name, info in scope.items():
+                if name == 'active_borrows': continue
+                other = then_scopes[index][name]
+                if else_returns and not then_returns:
+                    info['moved'] = other['moved']
+                elif not then_returns:
+                    info['moved'] = info['moved'] or other['moved']
+                info['used'] = info['used'] or other['used']
+                info['reference_origins'] = set(info.get('reference_origins', ())) | set(other.get('reference_origins', ()))
+                info['moved_fields'] = set(info.get('moved_fields', ())) | set(other.get('moved_fields', ()))
+
+    def _ends_control_flow(self, body):
+        if not body: return False
+        last = body[-1]
+        if isinstance(last, (ReturnStmt, BreakStmt, ContinueStmt)): return True
+        if isinstance(last, IfStmt):
+            return self._ends_control_flow(last.then_branch) and self._ends_control_flow(last.else_branch or [])
+        return False
 
     def visit_ForStmt(self, node):
+        outer_state = [{name: info['moved'] for name, info in scope.items() if name != 'active_borrows'} for scope in self.scopes]
         self.enter_scope()
         self.loop_stack.append(node.label)
         
@@ -1118,10 +1296,14 @@ class SemanticAnalyzer:
                 base = coll_type
                 args = []
                 
-            methods = self.struct_methods.get(base, {})
-            method = methods.get('next')
-            if not method:
+            self.instantiate_generic_type(coll_type)
+            methods = self.struct_methods.get(coll_type, self.struct_methods.get(base, {}))
+            candidates = methods.get('next', [])
+            if not candidates:
                  raise Exception(f"Type '{coll_type}' does not implement 'next()'")
+            method = candidates[0]
+            method.used = True
+            node.next_function = self.get_mangled_name(method.name, method.params)
                  
             ret_type = method.return_type
             
@@ -1144,6 +1326,7 @@ class SemanticAnalyzer:
                  raise Exception(f"Iterator next() must return Option<T>, got {real_ret}")
             
             node.item_type = item_type # Store for codegen
+            node.option_type = real_ret
             
             self.declare_variable(node.var_name, item_type, node=node)
             for s in node.body: self.visit(s)
@@ -1155,14 +1338,25 @@ class SemanticAnalyzer:
             
         self.loop_stack.pop()
         self.exit_scope()
+        self._check_loop_ownership(outer_state, node)
 
     def visit_WhileStmt(self, node):
         if self.visit(node.condition) != 'bool': raise Exception("While condition must be bool")
+        outer_state = [{name: info['moved'] for name, info in scope.items() if name != 'active_borrows'} for scope in self.scopes]
         self.loop_stack.append(node.label)
         self.enter_scope()
         for s in node.body: self.visit(s)
         self.loop_stack.pop()
         self.exit_scope()
+        self._check_loop_ownership(outer_state, node)
+
+    def _check_loop_ownership(self, before, node):
+        if node.body and isinstance(node.body[-1], (BreakStmt, ReturnStmt)):
+            return
+        for scope, old in zip(self.scopes, before):
+            for name, was_moved in old.items():
+                if not was_moved and scope[name]['moved']:
+                    self.error(f"Ownership Error: '{name}' may be moved again on the next loop iteration", node, error_code="E0007")
 
     def visit_BreakStmt(self, node):
         if not self.loop_stack: raise Exception("Break outside loop")
@@ -1194,6 +1388,7 @@ class SemanticAnalyzer:
                 bits = int(attr_args[0]) if attr_args else 3
                 node._quantize_bits = bits
 
+        previous_function = self.current_function
         self.current_function = node
         self.enter_scope()
         for i, (pn, pt) in enumerate(node.params):
@@ -1203,7 +1398,7 @@ class SemanticAnalyzer:
             self.declare_variable(pn, pt, node=node)
         
         # Mangle name for overloading (except main and externs)
-        if node.name != 'main' and not node.name.endswith('::main') and node.body is not None:
+        if node.name != 'main' and not node.name.endswith('::main') and node.body is not None and not getattr(node, 'is_lambda', False):
             node.name = self.get_mangled_name(node.name, node.params)
             self.functions.add(node.name) # Add mangled name to known functions
             
@@ -1216,7 +1411,7 @@ class SemanticAnalyzer:
 
         for s in node.body: self.visit(s)
         self.exit_scope()
-        self.current_function = None
+        self.current_function = previous_function
         self.current_module = prev_mod
 
     def check_type_compatibility(self, expected, actual, node):
@@ -1224,13 +1419,13 @@ class SemanticAnalyzer:
             return True
             
         # Handle Generics (e.g. Vec<T> == Vec<i32> if T is generic in current context? No, that's already handled elsewhere)
-        if '<' in expected and '<' in actual:
-             if expected.split('<')[0] == actual.split('<')[0]:
-                  return True
+        # Concrete generic arguments are part of a type's identity.
                   
         # Coercion
-        numeric_types = ('i32', 'i64', 'u8', 'f32')
+        numeric_types = ('i32', 'i64', 'u64', 'u8', 'f32', 'f64')
         if expected in numeric_types and actual in numeric_types:
+             if expected in ('u64', 'f64') or actual in ('u64', 'f64'):
+                  return True
              # Upcasts (allowed, no warning usually, or maybe warning if we want to be strict)
              if (expected == 'i64' and actual == 'i32') or (expected == 'i64' and actual == 'u8') or (expected == 'i32' and actual == 'u8'):
                   return True
@@ -1255,13 +1450,22 @@ class SemanticAnalyzer:
 
     def visit_VarDecl(self, node):
         if node.type_name: node.type_name = self.resolve_type_name(node.type_name)
+        if node.type_name and '<' in node.type_name and isinstance(node.initializer, CallExpr):
+            callee = node.initializer.callee
+            callee = callee.name if isinstance(callee, VariableExpr) else callee
+            if isinstance(callee, str) and '::' in callee:
+                base, member = callee.rsplit('::', 1)
+                if self.resolve_type_name(base) == node.type_name.split('<')[0]:
+                    node.initializer.callee = f"{node.type_name}::{member}"
         init_t = self.visit(node.initializer)
         if node.type_name is None: node.type_name = init_t
         if '<' in node.type_name: self.instantiate_generic_type(node.type_name)
         if init_t != node.type_name and not self.check_type_compatibility(node.type_name, init_t, node):
              self.error(f"Type Error: {init_t} != {node.type_name}", node, error_code="E0002")
-        if isinstance(node.initializer, VariableExpr) and not self.is_copy_type(init_t): self.move_var(node.initializer.name)
+        origins = self.reference_origins(node.initializer)
+        self.consume(node.initializer, init_t)
         self.declare_variable(node.name, node.type_name, node=node)
+        self.lookup(node.name)['reference_origins'] = origins
 
     def visit_Assignment(self, node):
         val_t = self.visit(node.value)
@@ -1274,21 +1478,57 @@ class SemanticAnalyzer:
                   self.error(f"Borrow Error: Cannot assign to '{node.target.name}' while it is borrowed", node, error_code="E0006")
              if val_t != v['type'] and not self.check_type_compatibility(v['type'], val_t, node):
                   self.error("Type mismatch in assignment", node, error_code="E0002")
+             node.target.type_name = v['type']
              v['moved'] = False  # Re-assignment restores ownership
+             v['moved_fields'] = set()
+             origins = self.reference_origins(node.value)
+             _, target_depth = self.lookup_with_depth(node.target.name)
+             if any(depth > target_depth for _, depth in origins):
+                  self.error("Lifetime Error: reference escapes the scope of its source", node, error_code="E0007")
+             v['reference_origins'] = origins
         else:
+             if isinstance(node.target, MemberAccess):
+                  node.target.assignment_target = True
              target_t = self.visit(node.target)
              if target_t != val_t and not self.check_type_compatibility(target_t, val_t, node):
                   self.error("Type mismatch in assignment", node, error_code="E0002")
-        if isinstance(node.value, VariableExpr) and not self.is_copy_type(val_t): self.move_var(node.value.name)
+             if isinstance(node.target, MemberAccess):
+                  root, path = self._field_source(node.target)
+                  if root and self.lookup(root.name):
+                       info = self.lookup(root.name)
+                       info['moved_fields'] = {moved for moved in info.get('moved_fields', ()) if moved[:len(path)] != path}
+                       origins = self.reference_origins(node.value)
+                       _, depth = self.lookup_with_depth(root.name)
+                       if any(source_depth > depth for _, source_depth in origins):
+                            self.error("Lifetime Error: reference escapes through a field", node, error_code="E0007")
+                       info['reference_origins'] = set(info.get('reference_origins', ())) | origins
+        self.consume(node.value, val_t)
 
     def visit_BinaryExpr(self, node):
         l, r = self.visit(node.left), self.visit(node.right)
+        if l == r and l in self.structs and node.op in ('EQEQ', 'NEQ'):
+            if 'eq' not in self.struct_methods.get(l, {}):
+                self.error(f"Type '{l}' needs an eq method for equality", node, error_code="E0002")
+            right_ref = UnaryExpr('&', node.right)
+            expanded = MethodCall(node.left, 'eq', [right_ref])
+            self.enter_scope()
+            result = self.visit(expanded)
+            self.exit_scope()
+            if result != 'bool':
+                self.error("eq must return bool", node)
+            node.expanded = expanded
+            return 'bool'
         if node.op in ('PLUS', 'MINUS'):
             if l.endswith('*') and r in ('i32', 'i64'): return l
             if r.endswith('*') and l in ('i32', 'i64') and node.op == 'PLUS': return r
         if l != r and not self.check_type_compatibility(l, r, node) and not self.check_type_compatibility(r, l, node):
             self.error(f"Type mismatch: {l} {node.op} {r}", node, error_code="E0002")
-        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return l
+        numeric = ('u8', 'i32', 'i64', 'u64', 'f32', 'f64')
+        common = max((l, r), key=numeric.index) if l in numeric and r in numeric else l
+        node.operand_type = common
+        if node.op in ('AND', 'OR') and (l != 'bool' or r != 'bool'):
+            self.error("Logical operators require bool operands", node, error_code="E0002")
+        if node.op in ('PLUS', 'MINUS', 'STAR', 'SLASH', 'PERCENT'): return common
         if node.op in ('AMPERSAND', 'PIPE', 'CARET', 'SHL', 'SHR'): return l
         if node.op in ('EQEQ', 'LT', 'GT', 'LTE', 'GTE', 'NEQ', 'AND', 'OR'): return 'bool'
         raise Exception(f"Unsupported binary op: {node.op}")
@@ -1319,7 +1559,7 @@ class SemanticAnalyzer:
         func_node.column = node.column
         
         # Register
-        self.function_defs[lambda_name] = func_node
+        self.function_defs[lambda_name] = [func_node]
         self.functions.add(lambda_name)
         
         if isinstance(self.ast_root, list):
@@ -1333,6 +1573,11 @@ class SemanticAnalyzer:
         
         node.captures = self.lambda_capture_stack.pop()
         self.lambda_base_scopes.pop()
+        if node.captures:
+            for name, typ in node.captures.items():
+                if not self.is_copy_type(typ):
+                    self.error(f"Cannot capture owned value '{name}' in a stack closure", node)
+            node.reference_origins = {('closure environment', len(self.scopes) - 1)}
         
         param_types = [p[1] for p in resolved_params]
         # Type of a lambda (pointer to it)
@@ -1358,6 +1603,19 @@ class SemanticAnalyzer:
 
         v, v_depth = self.lookup_with_depth(node.name)
         if not v:
+            function_name = node.name
+            if function_name not in self.function_defs and self.current_module:
+                function_name = f"{self.current_module.replace('::', '_')}_{node.name}"
+            candidates = self.function_defs.get(function_name, [])
+            if len(candidates) == 1:
+                function = candidates[0]
+                arguments = [VariableExpr(name) for name, _ in function.params]
+                call = CallExpr(function_name, arguments)
+                body = [call] if function.return_type == 'void' else [ReturnStmt(call)]
+                closure = LambdaExpr(function.params[:], function.return_type, body)
+                node.function_value = closure
+                return self.visit_LambdaExpr(closure)
+        if not v:
             possibilities = []
             for scope in self.scopes:
                 possibilities.extend([k for k in scope.keys() if k != 'active_borrows'])
@@ -1380,6 +1638,8 @@ class SemanticAnalyzer:
                   node.is_capture = True
 
         if v['moved']: self.error(f"Use of moved variable '{node.name}'", node, error_code="E0007")
+        if v.get('moved_fields') and not getattr(node, 'allow_partial', False):
+            self.error(f"Use of partially moved variable '{node.name}'", node, error_code="E0007")
         v['used'] = True
         return v['type']
 
@@ -1428,14 +1688,22 @@ class SemanticAnalyzer:
         # 4. Cast/sizeof/ptr_offset builtins
         if isinstance(callee, str) and callee.startswith('cast<'):
             self.visit(node.args[0])
-            return callee[5:-1]
+            result = self.resolve_type_name(callee[5:-1])
+            self.instantiate_generic_type(result)
+            node.callee = f"cast<{result}>"
+            return result
         if isinstance(callee, str) and callee.startswith('sizeof<'):
+            result = self.resolve_type_name(callee[7:-1])
+            self.instantiate_generic_type(result)
+            node.callee = f"sizeof<{result}>"
             return 'i32'
         if isinstance(callee, str) and callee.startswith('ptr_offset<'):
             for a in node.args:
                 self.visit(a)
             # Returns pointer to the element type
-            elem_type = callee[11:-1]  # extract T from ptr_offset<T>
+            elem_type = self.resolve_type_name(callee[11:-1])
+            self.instantiate_generic_type(elem_type)
+            node.callee = f"ptr_offset<{elem_type}>"
             return f'{elem_type}*'
 
         # 5. Local module lookup
@@ -1465,6 +1733,11 @@ class SemanticAnalyzer:
         # 9. Generic function instantiation
         if '<' in callee:
             base = callee.split('<')[0]
+            resolved_base = self.resolve_type_name(base)
+            if resolved_base in self.generic_functions:
+                callee = f"{resolved_base}<{callee.split('<', 1)[1]}"
+                node.callee = callee
+                base = resolved_base
             if base in self.generic_functions:
                  self.instantiate_generic_function(callee)
 
@@ -1482,7 +1755,7 @@ class SemanticAnalyzer:
                       'fs::read_file', 'fs::write_file', 'fs::append_file',
                       'malloc', 'free', 'realloc', 'memcpy',
                       '__nexa_panic', '__nexa_assert', 'gpu::dispatch', 'gpu::global_id',
-                      'compress::create', 'compress::destroy', 'compress::quantize',
+                      'compress::create', 'compress::create_mse', 'compress::destroy', 'compress::quantize',
                       'compress::dequantize', 'compress::mse')
         
         if callee not in INTRINSICS:
@@ -1497,9 +1770,9 @@ class SemanticAnalyzer:
         if callee == 'gpu::global_id':
             return 'i32'
 
-        if callee == 'compress::create':
+        if callee in ('compress::create', 'compress::create_mse'):
             for a in node.args: self.visit(a)
-            return '*u8'
+            return 'u8*'
         if callee == 'compress::destroy':
             for a in node.args: self.visit(a)
             return 'void'
@@ -1509,6 +1782,17 @@ class SemanticAnalyzer:
         if callee == 'compress::mse':
             for a in node.args: self.visit(a)
             return 'f32'
+
+        if callee == 'slice_from_array':
+            if len(node.args) != 1:
+                self.error("slice_from_array expects one array reference", node)
+            arg_type = self.visit(node.args[0])
+            if not (arg_type.startswith('[') and arg_type.endswith(']*')):
+                self.error("slice_from_array expects a reference to an array", node)
+            element = arg_type[1:-2].rsplit(':', 1)[0]
+            result = f"Slice<{element}>"
+            self.instantiate_generic_type(result)
+            return result
 
         for a in node.args:
             self.visit(a)
@@ -1540,10 +1824,8 @@ class SemanticAnalyzer:
                        generics_mapping[gname] = gval
 
         # Enum variant construction
-        if prefix in self.enums:
+        if prefix in self.enums and suffix in self.enums[prefix]:
             variants = self.enums[prefix]
-            if suffix not in variants:
-                raise Exception("Variant not found")
             payloads = variants[suffix]
             if len(node.args) != len(payloads):
                 raise Exception("Arg mismatch")
@@ -1552,19 +1834,23 @@ class SemanticAnalyzer:
                 if self.visit(arg) != payloads[i]:
                     raise Exception("Type mismatch")
                 if isinstance(arg, VariableExpr) and not self.is_copy_type(payloads[i]):
-                    self.move_var(arg.name)
+                    self.move_var(arg.name, arg)
             self.exit_scope()
             return prefix
         
         # Non-concrete generic enum variant
         base_prefix = prefix.split('<')[0]
-        if base_prefix in self.generic_enums:
+        if base_prefix in self.generic_enums and suffix in {v[0] for v in self.generic_enums[base_prefix].variants}:
              for arg in node.args:
                  self.visit(arg)
              return prefix
         
         # Static method call (mangled)
         mangled_base = f"{prefix}_{suffix}"
+        if mangled_base not in self.function_defs and self.current_module:
+            relative = f"{self.current_module.replace('::', '_')}_{mangled_base}"
+            if relative in self.function_defs:
+                mangled_base = relative
         if mangled_base not in self.function_defs and '<' in prefix:
              base_prefix = prefix.split('<')[0]
              if base_prefix in self.generic_structs or base_prefix in self.generic_enums:
@@ -1578,6 +1864,8 @@ class SemanticAnalyzer:
              func_def, mangled_full = self.resolve_overload(mangled_base, arg_types, node)
              node.callee = mangled_full
              func_def.used = True
+             for arg, arg_type in zip(node.args, arg_types):
+                  self.consume(arg, arg_type)
              ret = func_def.return_type
              if generics_mapping:
                  ret = self.apply_submap(ret, generics_mapping)
@@ -1606,6 +1894,18 @@ class SemanticAnalyzer:
             return None
 
         struct_name = callee
+        arg_types = None
+        if callee in self.generic_structs:
+            template = self.generic_structs[callee]
+            arg_types = [self.visit(arg) for arg in node.args]
+            mapping = {}
+            for (_, field_type), arg_type in zip(template.fields, arg_types):
+                self._infer_generic_arguments(field_type, arg_type, mapping)
+            parameters = [generic[0] for generic in template.generics]
+            if not all(name in mapping for name in parameters):
+                self.error(f"Cannot infer generic arguments for '{callee}'", node)
+            struct_name = f"{callee}<{','.join(mapping[name] for name in parameters)}>"
+            node.callee = struct_name
         if '<' in struct_name:
              base = struct_name.split('<')[0]
              if base in self.generic_structs:
@@ -1628,11 +1928,24 @@ class SemanticAnalyzer:
             raise Exception(f"Arg mismatch for '{struct_name}' constructor")
         self.enter_scope()
         for i, (fname, ftype) in enumerate(fields.items()):
-            arg_t = self.visit(node.args[i])
-            if arg_t != ftype: 
+            arg_t = arg_types[i] if arg_types is not None else self.visit(node.args[i])
+            if arg_t != ftype and not self.check_type_compatibility(ftype, arg_t, node):
                 raise Exception(f"Type mismatch field '{fname}': expected {ftype}, got {arg_t}")
+            self.consume(node.args[i], arg_t)
         self.exit_scope()
         return struct_name
+
+    def _infer_generic_arguments(self, pattern, actual, mapping):
+        if pattern.endswith('*') and actual.endswith('*'):
+            return self._infer_generic_arguments(pattern[:-1], actual[:-1], mapping)
+        if '<' in pattern and '<' in actual:
+            for p, a in zip(self.split_generic_args(pattern.split('<', 1)[1][:-1]),
+                            self.split_generic_args(actual.split('<', 1)[1][:-1])):
+                self._infer_generic_arguments(p, a, mapping)
+        elif len(pattern) == 1 and pattern.isupper():
+            if pattern in mapping and mapping[pattern] != actual:
+                raise CompilerError(f"Conflicting types for generic parameter '{pattern}'")
+            mapping[pattern] = actual
 
     def _visit_call_regular(self, callee, node, generics_mapping):
         """Handle regular function calls with overload resolution."""
@@ -1644,7 +1957,7 @@ class SemanticAnalyzer:
         
         for i, arg in enumerate(node.args):
              if isinstance(arg, VariableExpr) and not self.is_copy_type(arg_types[i]):
-                  self.move_var(arg.name)
+                  self.move_var(arg.name, arg)
 
         ret = func_def.return_type
         if generics_mapping:
@@ -1714,21 +2027,30 @@ class SemanticAnalyzer:
 
     def visit_ReturnStmt(self, node):
         if node.value:
+            expected = self.current_function.return_type if self.current_function else None
+            if expected and '<' in expected:
+                target = node.value.callee if isinstance(node.value, CallExpr) else node.value
+                name = target.name if isinstance(target, VariableExpr) else target
+                if isinstance(name, str) and '::' in name:
+                    base, member = name.rsplit('::', 1)
+                    if self.resolve_type_name(base) == expected.split('<', 1)[0]:
+                        if isinstance(node.value, CallExpr):
+                            node.value.callee = f'{expected}::{member}'
+                        else:
+                            node.value.name = f'{expected}::{member}'
             t = self.visit(node.value)
-            # Check for returning a reference to a local variable (dangling reference)
-            if isinstance(node.value, UnaryExpr) and node.value.op in ('&', '&mut'):
-                if isinstance(node.value.operand, VariableExpr):
-                    var_name = node.value.operand.name
-                    _, depth = self.lookup_with_depth(var_name)
-                    if depth is not None and depth > 0:
-                        self.error(
-                            f"Lifetime Error: Cannot return reference to local variable '{var_name}'",
-                            node, hint="local variables are dropped when the function returns",
-                            error_code="E0007"
-                        )
-            if isinstance(node.value, VariableExpr) and not self.is_copy_type(t):
-                 if '::' not in node.value.name:
-                      self.move_var(node.value.name)
+            expected = self.current_function.return_type if self.current_function else t
+            if expected != t and not self.check_type_compatibility(expected, t, node):
+                self.error(f"Return type mismatch: expected {expected}, got {t}", node, error_code="E0002")
+            if t.endswith('*') or t.startswith(('&', 'Slice<', 'fn(')) or t in self.structs:
+                origins = self.reference_origins(node.value)
+                if any(depth > 0 for _, depth in origins):
+                    names = ', '.join(sorted(name for name, _ in origins))
+                    self.error(f"Lifetime Error: Cannot return reference to local storage ({names})", node,
+                               hint="local storage is released when the function returns", error_code="E0007")
+            self.consume(node.value, t)
+        elif self.current_function and self.current_function.return_type != 'void':
+            self.error("Missing return value", node, error_code="E0002")
 
     def substitute_generics(self, node, mapping):
         if isinstance(node, list):
@@ -1771,6 +2093,9 @@ class SemanticAnalyzer:
         if not t: return t
         # Normalize: remove spaces
         t = t.replace(' ', '')
+        if '::' in t:
+            prefix, suffix = t.rsplit('::', 1)
+            return self.apply_submap(prefix, mapping) + '::' + self.apply_submap(suffix, mapping)
         if t.startswith('&mut'): return '&mut' + self.apply_submap(t[4:], mapping)
         if t.startswith('&'): return '&' + self.apply_submap(t[1:], mapping)
         if t.endswith('*'): return self.apply_submap(t[:-1], mapping) + '*'

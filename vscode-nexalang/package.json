@@ -4,7 +4,6 @@
   "description": "Syntax highlighting, diagnostics, hover, and completion for NexaLang (.nxl)",
   "version": "0.2.0",
   "publisher": "nexalang",
-  "icon": "nexalang-icon.svg",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -19,8 +18,13 @@
     "languages": [
       {
         "id": "nexalang",
-        "aliases": ["NexaLang", "nexalang"],
-        "extensions": [".nxl"],
+        "aliases": [
+          "NexaLang",
+          "nexalang"
+        ],
+        "extensions": [
+          ".nxl"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -49,13 +53,43 @@
           "type": "string",
           "default": "python3",
           "description": "Path to Python interpreter for the LSP server"
+        },
+        "nexalang.compilerPath": {
+          "type": "string",
+          "default": "nxc",
+          "description": "Path to the NexaLang compiler executable"
+        },
+        "nexalang.lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a custom lsp_server.py; uses the bundled server by default"
         }
       }
-    }
+    },
+    "commands": [
+      {
+        "command": "nexalang.build",
+        "title": "NexaLang: Build"
+      },
+      {
+        "command": "nexalang.run",
+        "title": "NexaLang: Run"
+      },
+      {
+        "command": "nexalang.test",
+        "title": "NexaLang: Test"
+      }
+    ]
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.0"
+  },
+  "scripts": {
+    "prepare-server": "node scripts/prepare-server.js",
+    "vscode:prepublish": "npm run prepare-server",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
   }
 }
-
-

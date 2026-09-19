@@ -15,9 +15,9 @@ impl Greeter for Robot {
 }
 
 fn main() -> i32 {
-    let p = Person {};
+    let p = Person();
     p.greet();
-    let r = Robot {};
+    let r = Robot();
     r.greet();
     return 0;
 }

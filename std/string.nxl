@@ -1,4 +1,5 @@
 use std::vec::Vec;
+use std::hash::Hash;
 
 pub struct String {
     ptr: *u8,
@@ -31,6 +32,14 @@ impl String {
         memcpy(ptr, raw_ptr, cap);
         
         return String(ptr, len, cap);
+    }
+
+    fn eq(&self, other: &String) -> bool {
+        if (self.len != other.len) { return false; }
+        for i in 0..self.len {
+            if (self.ptr[i] != other.ptr[i]) { return false; }
+        }
+        return true;
     }
 
     fn len(&self) -> i32 {
@@ -208,5 +217,15 @@ impl String {
         *ptr_offset::<u8>(ptr, len) = cast::<u8>(0);
         
         return String(ptr, len, cap);
+    }
+}
+
+impl Hash for String {
+    fn hash(&self) -> u64 {
+        let mut value: u64 = cast::<u64>(5381);
+        for i in 0..self.len {
+            value = value * cast::<u64>(33) + cast::<u64>(self.ptr[i]);
+        }
+        return value;
     }
 }

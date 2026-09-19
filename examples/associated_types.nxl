@@ -13,7 +13,7 @@ impl Iterator for Counter {
 }
 
 fn main() -> i32 {
-    let c = Counter { count: 10 };
+    let mut c = Counter(10);
     c.next();
     print("Associated Types Parsed & Validated");
     return 0;

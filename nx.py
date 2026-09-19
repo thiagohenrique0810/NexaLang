@@ -4,11 +4,12 @@ import platform
 import subprocess
 import sys
 import json
+import re
 
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.realpath(__file__))
 BOOTSTRAP_MAIN = os.path.join(REPO_ROOT, "bootstrap", "main.py")
-DEV_ARTIFACTS = os.path.join(REPO_ROOT, "dev", "artifacts")
+DEV_ARTIFACTS = os.path.abspath(os.path.join("artifacts", "build"))
 
 _EXE_EXT = ".exe" if platform.system() == "Windows" else ""
 
@@ -30,9 +31,13 @@ def load_project_config():
 
 
 def _run(cmd: list[str]) -> int:
-    print("+", " ".join(cmd))
-    p = subprocess.run(cmd)
-    return int(p.returncode)
+    print("+", " ".join(cmd), flush=True)
+    try:
+        p = subprocess.run(cmd)
+        return int(p.returncode)
+    except OSError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _python() -> list[str]:
@@ -86,46 +91,39 @@ def _clang():
 
 
 def _uses_turboquant(ll_path: str) -> bool:
-    """Return True if generated LLVM IR references TurboQuant runtime symbols."""
-    if not os.path.exists(ll_path):
-        return False
-    try:
-        with open(ll_path, "r", encoding="utf-8", errors="ignore") as f:
-            ir_text = f.read()
-        return (
-            "tq_create" in ir_text
-            or "tq_quantize" in ir_text
-            or "tq_dequantize" in ir_text
-            or "tq_mse" in ir_text
-            or "tq_destroy" in ir_text
-        )
-    except OSError:
-        return False
+    return any(name.startswith("tq_") for name in _called_symbols(ll_path))
+
+
+def _called_symbols(ll_path: str) -> set[str]:
+    with open(ll_path, "r", encoding="utf-8") as f:
+        ir_text = f.read()
+    matches = re.findall(r'\b(?:call|invoke)\b[^\n@]*@(?:"([^"\n]+)"|([\w.$]+))', ir_text)
+    return {quoted or plain for quoted, plain in matches}
 
 
 def _turboquant_link_args() -> list[str]:
-    """Return linker flags for TurboQuant, preferring static linking when available."""
+    """Compile the checked-out source for this host, never a bundled binary."""
     runtime_dir = os.path.join(REPO_ROOT, "runtime")
-    static_lib = os.path.join(runtime_dir, "libturboquant.a")
-    dyn_lib = os.path.join(runtime_dir, "libturboquant.dylib")
-
-    if os.path.exists(static_lib):
-        args = [static_lib]
-    elif os.path.exists(dyn_lib):
-        args = ["-L", runtime_dir, "-lturboquant"]
-    else:
-        args = ["-L", runtime_dir, "-lturboquant"]
-
-    # TurboQuant uses math + pthread APIs.
+    args = [os.path.join(runtime_dir, "turboquant.c")]
     if platform.system() != "Windows":
         args.extend(["-lm", "-lpthread"])
     return args
 
 
 def _native_link_cmd(ll_out: str, exe_out: str, opt: str) -> list[str]:
+    _ensure_dir(os.path.dirname(os.path.abspath(exe_out)))
     cmd = [_clang(), ll_out, f"-{opt}", "-o", exe_out]
-    if _uses_turboquant(ll_out):
+    symbols = _called_symbols(ll_out)
+    if any(name.startswith("tq_") for name in symbols):
         cmd.extend(_turboquant_link_args())
+    if any(name.startswith("__nexa_") for name in symbols) or (os.name == "nt" and "sched_yield" in symbols):
+        cmd.append(os.path.join(REPO_ROOT, "runtime", "nexa_async.c"))
+        if platform.system() == "Windows":
+            cmd.append("-lws2_32")
+    if any(name.startswith("curl_") for name in symbols):
+        cmd.append("-lcurl")
+    if any(name.startswith("sqlite3_") for name in symbols):
+        cmd.append("-lsqlite3")
     return cmd
 
 
@@ -147,7 +145,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     if args.target == "native":
         # Emit LLVM IR
-        rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--emit", "ll", "--out", ll_out])
+        rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--emit", "ll", "--out", ll_out, "--opt", args.opt[1:]])
         if rc != 0:
             return rc
         # Link
@@ -215,7 +213,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("Error: No input file specified and no nexa.json project file found.")
             return 1
 
-    cmd = _python() + [BOOTSTRAP_MAIN, file, "--target", "native"]
+    cmd = _python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--opt", args.opt[1:]]
     
     if args.jit:
         cmd.append("--run-jit")
@@ -232,7 +230,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     rc = _run(_native_link_cmd(ll_out, exe, getattr(args, "opt", "O0")))
     if rc != 0:
         return rc
-    return _run([exe])
+    return _run([os.path.abspath(exe)])
 
 
 def cmd_val(args: argparse.Namespace) -> int:
@@ -257,7 +255,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     exe_out = os.path.join(DEV_ARTIFACTS, f"test{_EXE_EXT}")
 
     # We need to tell the compiler to run tests
-    rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--run-tests", "--out", ll_out])
+    rc = _run(_python() + [BOOTSTRAP_MAIN, file, "--target", "native", "--run-tests", "--out", ll_out, "--opt", args.opt[1:]])
     if rc != 0: return rc
     
     # Link
@@ -328,5 +326,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

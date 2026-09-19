@@ -11,15 +11,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 extern "C" {
-    # POSIX sockets
-    fn socket(domain: i32, stype: i32, protocol: i32) -> i32;
-    fn bind(sockfd: i32, addr: *u8, addrlen: i32) -> i32;
-    fn listen(sockfd: i32, backlog: i32) -> i32;
-    fn accept(sockfd: i32, addr: *u8, addrlen: *i32) -> i32;
-    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *u8, optlen: i32) -> i32;
-    fn close(fd: i32) -> i32;
-    fn read(fd: i32, buf: *u8, count: i32) -> i32;
-    fn write(fd: i32, buf: *u8, count: i32) -> i32;
+    fn __nexa_stderr() -> *u8;
+    fn __nexa_socket_accept(fd: i32) -> i32;
+    fn __nexa_socket_close(fd: i32) -> i32;
+    fn __nexa_socket_read(fd: i32, data: *u8, length: i32) -> i32;
+    fn __nexa_listen_tcp(port: i32, backlog: i32) -> i32;
+    fn __nexa_socket_timeout(fd: i32, seconds: i32) -> i32;
+    fn __nexa_socket_write(fd: i32, data: *u8, length: i32) -> i32;
 
     # C stdlib
     fn malloc(size: i32) -> *u8;
@@ -29,11 +27,11 @@ extern "C" {
     fn strlen(s: *u8) -> i32;
     fn strcmp(s1: *u8, s2: *u8) -> i32;
     fn strncmp(s1: *u8, s2: *u8, n: i32) -> i32;
+    fn __nexa_ascii_ncasecmp(s1: *u8, s2: *u8, n: i32) -> i32;
     fn strstr(haystack: *u8, needle: *u8) -> *u8;
     fn snprintf(buf: *u8, size: i32, fmt: *u8, ...) -> i32;
     fn atoi(s: *u8) -> i32;
     fn fprintf(stream: *u8, fmt: *u8, ...) -> i32;
-    fn fdopen(fd: i32, mode: *u8) -> *u8;
     fn fflush(stream: *u8);
 
     # Time for logging
@@ -42,7 +40,6 @@ extern "C" {
     fn strftime(buf: *u8, maxsize: i32, fmt: *u8, tm: *u8) -> i32;
 }
 
-use std::string::String;
 
 # ── HTTP Method enum as i32 ─────────────────────────────────────────────────
 # 1=GET, 2=POST, 3=PUT, 4=DELETE, 5=PATCH, 6=OPTIONS, 7=HEAD
@@ -59,6 +56,83 @@ pub struct Request {
 
 fn ptr_add(base: *u8, offset: i32) -> *u8 {
     return cast::<*u8>(cast::<i64>(base) + cast::<i64>(offset));
+}
+
+# Search complete header lines only; field names are case-insensitive.
+fn find_header(raw: *u8, name: string) -> *u8 {
+    let name_ptr = cast::<*u8>(name);
+    let name_len = strlen(name_ptr);
+    let mut i = 0;
+    while (raw[i] != cast::<u8>(0) and raw[i] != cast::<u8>(10)) { i = i + 1; }
+    if (raw[i] == cast::<u8>(0)) { return cast::<*u8>(0); }
+    i = i + 1;
+    while (raw[i] != cast::<u8>(0) and raw[i] != cast::<u8>(13) and raw[i] != cast::<u8>(10)) {
+        let start = i;
+        while (raw[i] != cast::<u8>(0) and raw[i] != cast::<u8>(10)) { i = i + 1; }
+        if (i - start > name_len and raw[start + name_len] == cast::<u8>(58)) {
+            if (__nexa_ascii_ncasecmp(ptr_add(raw, start), name_ptr, name_len) == 0) {
+                let mut value = start + name_len + 1;
+                while (raw[value] == cast::<u8>(32) or raw[value] == cast::<u8>(9)) { value = value + 1; }
+                return ptr_add(raw, value);
+            }
+        }
+        if (raw[i] == cast::<u8>(0)) { return cast::<*u8>(0); }
+        i = i + 1;
+    }
+    return cast::<*u8>(0);
+}
+
+fn request_content_length(raw: *u8) -> i32 {
+    let value = find_header(raw, "Content-Length");
+    if (cast::<i64>(value) == 0) { return 0; }
+    if (cast::<i64>(find_header(value, "Content-Length")) != 0) { return -1; }
+    let mut length = 0;
+    let mut i = 0;
+    while (value[i] >= cast::<u8>(48) and value[i] <= cast::<u8>(57)) {
+        let digit = cast::<i32>(value[i]) - 48;
+        if (length > (2147483647 - digit) / 10) { return -1; }
+        length = length * 10 + digit;
+        i = i + 1;
+    }
+    if (i == 0) { return -1; }
+    while (value[i] == cast::<u8>(32) or value[i] == cast::<u8>(9)) { i = i + 1; }
+    if (value[i] != cast::<u8>(13) and value[i] != cast::<u8>(10) and value[i] != cast::<u8>(0)) { return -1; }
+    return length;
+}
+
+# Read a complete, bounded request, including a body split across TCP reads.
+# -1 = malformed/truncated, -2 = too large, -3 = unsupported transfer coding.
+fn read_request(fd: i32, buf: *u8, capacity: i32) -> i32 {
+    let mut received = 0;
+    let mut expected = -1;
+    while (true) {
+        if (received >= capacity - 1) { return -2; }
+        let count = __nexa_socket_read(fd, ptr_add(buf, received), capacity - 1 - received);
+        if (count <= 0) { return -1; }
+        received = received + count;
+        buf[received] = cast::<u8>(0);
+        if (expected < 0) {
+            let mut sep = strstr(buf, cast::<*u8>("\r\n\r\n"));
+            let mut separator_length = 4;
+            if (cast::<i64>(sep) == 0) {
+                sep = strstr(buf, cast::<*u8>("\n\n"));
+                separator_length = 2;
+            }
+            if (cast::<i64>(sep) != 0) {
+                if (cast::<i64>(find_header(buf, "Transfer-Encoding")) != 0) { return -3; }
+                let body_length = request_content_length(buf);
+                if (body_length < 0) { return -1; }
+                let header_length = cast::<i32>(cast::<i64>(sep) - cast::<i64>(buf)) + separator_length;
+                if (body_length > capacity - 1 - header_length) { return -2; }
+                expected = header_length + body_length;
+            }
+        }
+        if (expected >= 0 and received >= expected) {
+            buf[expected] = cast::<u8>(0);
+            return expected;
+        }
+    }
+    return -1;
 }
 
 impl Request {
@@ -83,26 +157,16 @@ impl Request {
     }
 
     fn header(& self, name: string) -> *u8 {
-        let needle_len = strlen(cast::<*u8>(name));
-        let buf = malloc(needle_len + 3);
-        memcpy(buf, cast::<*u8>(name), needle_len);
-        buf[needle_len] = cast::<u8>(58); # ':'
-        buf[needle_len + 1] = cast::<u8>(32); # ' '
-        buf[needle_len + 2] = cast::<u8>(0);
-
-        let pos = strstr(self.raw, buf);
-        free(buf);
+        let pos = find_header(self.raw, name);
         if (cast::<i64>(pos) == 0) { return cast::<*u8>(0); }
-
-        let start = cast::<i32>(cast::<i64>(pos) - cast::<i64>(self.raw)) + needle_len + 2;
-        let mut end = start;
-        while (self.raw[end] != cast::<u8>(13) and self.raw[end] != cast::<u8>(10) and self.raw[end] != cast::<u8>(0)) {
-            end = end + 1;
+        let mut length = 0;
+        while (pos[length] != cast::<u8>(13) and pos[length] != cast::<u8>(10) and pos[length] != cast::<u8>(0)) {
+            length = length + 1;
         }
-        let vlen = end - start;
-        let result = malloc(vlen + 1);
-        memcpy(result, ptr_add(self.raw, start), vlen);
-        result[vlen] = cast::<u8>(0);
+        let result = malloc(length + 1);
+        if (cast::<i64>(result) == 0) { return cast::<*u8>(0); }
+        memcpy(result, pos, length);
+        result[length] = cast::<u8>(0);
         return result;
     }
 
@@ -202,16 +266,18 @@ pub struct HttpServer {
     cors: bool
 }
 
-fn write_response(client_fd: i32, resp: &Response) {
+fn write_response(client_fd: i32, resp: &Response, cors: bool) {
     let body_len = strlen(resp.body);
     let header = malloc(1024);
+    let cors_headers = "";
+    if (cors) { cors_headers = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n"; }
     snprintf(header, 1024,
-        cast::<*u8>("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"),
-        resp.status, resp.status_text, resp.content_type, body_len);
+        cast::<*u8>("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n%s\r\n"),
+        resp.status, resp.status_text, resp.content_type, body_len, cast::<*u8>(cors_headers));
     let hlen = strlen(header);
-    write(client_fd, header, hlen);
+    __nexa_socket_write(client_fd, header, hlen);
     if (body_len > 0) {
-        write(client_fd, resp.body, body_len);
+        __nexa_socket_write(client_fd, resp.body, body_len);
     }
     free(header);
 }
@@ -230,6 +296,7 @@ fn parse_request(buf: *u8) -> Request {
     # Parse path
     let mut i = 0;
     while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(0)) { i = i + 1; }
+    if (buf[i] == cast::<u8>(0)) { return Request(0, cast::<*u8>(0), cast::<*u8>(0), buf, 0); }
     i = i + 1;
     let start = i;
     while (buf[i] != cast::<u8>(32) and buf[i] != cast::<u8>(63) and buf[i] != cast::<u8>(0)) { i = i + 1; }
@@ -250,10 +317,7 @@ fn parse_request(buf: *u8) -> Request {
         }
     }
 
-    let content_length = 0;
-    if (cast::<i64>(body) != 0) {
-        let cl_len = strlen(body);
-    }
+    let content_length = request_content_length(buf);
 
     return Request(method, path, body, buf, content_length);
 }
@@ -264,7 +328,7 @@ fn log_request(method: string, path: *u8, status: i32) {
     let tm = localtime(&ts);
     let ts_buf = malloc(32);
     strftime(ts_buf, 32, cast::<*u8>("%H:%M:%S"), tm);
-    let stderr = fdopen(2, cast::<*u8>("w"));
+    let stderr = __nexa_stderr();
     let color = "\x1b[32m"; # green
     if (status >= 400) { color = "\x1b[31m"; } # red
     if (status >= 300 and status < 400) { color = "\x1b[33m"; } # yellow
@@ -330,70 +394,58 @@ impl HttpServer {
     }
 
     fn run(&self) {
-        let server_fd = socket(2, 1, 0);
+        let server_fd = __nexa_listen_tcp(self.port, 128);
         if (server_fd < 0) {
-            print("ERROR: failed to create socket");
+            print("ERROR: failed to listen on port");
             return;
         }
 
-        # SO_REUSEADDR
-        let opt_val = malloc(4);
-        opt_val[0] = cast::<u8>(1); opt_val[1] = cast::<u8>(0);
-        opt_val[2] = cast::<u8>(0); opt_val[3] = cast::<u8>(0);
-        setsockopt(server_fd, 65535, 4, opt_val, 4);
-
-        # sockaddr_in (macOS)
-        let addr = malloc(16);
-        memset(addr, 0, 16);
-        addr[0] = cast::<u8>(16);  # sin_len
-        addr[1] = cast::<u8>(2);   # AF_INET
-        # port in big-endian
-        addr[2] = cast::<u8>(self.port >> 8);
-        addr[3] = cast::<u8>(self.port & 255);
-
-        let rc = bind(server_fd, addr, 16);
-        if (rc < 0) {
-            print("ERROR: failed to bind port");
-            close(server_fd);
-            return;
-        }
-
-        listen(server_fd, 128);
-
-        let stderr = fdopen(2, cast::<*u8>("w"));
+        let stderr = __nexa_stderr();
         fprintf(stderr, cast::<*u8>("\n\x1b[1m  NexaLang HTTP Server\x1b[0m\n"));
         fprintf(stderr, cast::<*u8>("  Listening on \x1b[36mhttp://localhost:%d\x1b[0m\n"), self.port);
         fprintf(stderr, cast::<*u8>("  Routes: %d registered\n"), self.route_count);
-        fprintf(stderr, cast::<*u8>("  CORS: %s\n\n"), cast::<*u8>(if (self.cors) { "enabled" } else { "disabled" }));
+        let cors_label = "disabled";
+        if (self.cors) { cors_label = "enabled"; }
+        fprintf(stderr, cast::<*u8>("  CORS: %s\n\n"), cast::<*u8>(cors_label));
         fflush(stderr);
 
         # Accept loop
         while (true) {
-            let mut client_addr_len: i32 = 16;
-            let client_addr = malloc(16);
-            memset(client_addr, 0, 16);
-            let client_fd = accept(server_fd, client_addr, &client_addr_len);
-            free(client_addr);
+            let client_fd = __nexa_socket_accept(server_fd);
 
             if (client_fd < 0) { continue; }
 
             let buf = malloc(16384);
             memset(buf, 0, 16384);
-            let n = read(client_fd, buf, 16383);
+            __nexa_socket_timeout(client_fd, 10);
+            let n = read_request(client_fd, buf, 16384);
             if (n <= 0) {
-                close(client_fd);
+                let status = 400;
+                if (n == -2) { status = 413; }
+                if (n == -3) { status = 501; }
+                let error_resp = Response::text(status, "Invalid or unsupported HTTP request");
+                write_response(client_fd, &error_resp, self.cors);
+                __nexa_socket_close(client_fd);
                 free(buf);
                 continue;
             }
 
             let req = parse_request(buf);
+            if (req.method == 0 or cast::<i64>(req.path) == 0) {
+                let invalid_resp = Response::text(400, "Invalid HTTP request");
+                write_response(client_fd, &invalid_resp, self.cors);
+                free(req.path);
+                __nexa_socket_close(client_fd);
+                free(buf);
+                continue;
+            }
 
             # OPTIONS preflight
             if (req.method == 6 and self.cors) {
                 let cors_resp = Response::no_content();
-                write_response(client_fd, &cors_resp);
+                write_response(client_fd, &cors_resp, self.cors);
                 log_request(req.method_name(), req.path, 204);
-                close(client_fd);
+                __nexa_socket_close(client_fd);
                 free(req.path);
                 free(buf);
                 continue;
@@ -416,7 +468,7 @@ impl HttpServer {
 
                 if (path_match) {
                     let resp = (route.handler)(&req);
-                    write_response(client_fd, &resp);
+                    write_response(client_fd, &resp, self.cors);
                     log_request(req.method_name(), req.path, resp.status);
                     matched = true;
                     break;
@@ -425,16 +477,16 @@ impl HttpServer {
 
             if (!matched) {
                 let resp = Response::not_found();
-                write_response(client_fd, &resp);
+                write_response(client_fd, &resp, self.cors);
                 log_request(req.method_name(), req.path, 404);
             }
 
-            close(client_fd);
+            __nexa_socket_close(client_fd);
             free(req.path);
             free(buf);
         }
 
-        close(server_fd);
+        __nexa_socket_close(server_fd);
     }
 }
 

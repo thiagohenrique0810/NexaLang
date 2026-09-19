@@ -1,0 +1,401 @@
+{
+  "examples": {
+    "arrays.nxl": {
+      "status": "compile"
+    },
+    "assert.nxl": {
+      "status": "compile"
+    },
+    "associated_types.nxl": {
+      "status": "compile"
+    },
+    "associated_types_fail.nxl": {
+      "status": "reject",
+      "diagnostic": "missing associated type"
+    },
+    "async_test.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "42"
+        ]
+      }
+    },
+    "bigram_lm.nxl": {
+      "status": "compile"
+    },
+    "borrow_check.nxl": {
+      "status": "reject",
+      "diagnostic": "Cannot assign.*borrowed"
+    },
+    "borrow_check_mut.nxl": {
+      "status": "reject",
+      "diagnostic": "Cannot borrow.*mutable.*immutably borrowed"
+    },
+    "chars.nxl": {
+      "status": "compile"
+    },
+    "closure_test.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "50"
+        ]
+      }
+    },
+    "compress_test.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "All compression tests passed"
+        ]
+      }
+    },
+    "const_generics.nxl": {
+      "status": "compile"
+    },
+    "control.nxl": {
+      "status": "compile"
+    },
+    "control_flow/for_loop.nxl": {
+      "status": "compile"
+    },
+    "control_flow/loop_control.nxl": {
+      "status": "compile"
+    },
+    "copy_ok.nxl": {
+      "status": "compile"
+    },
+    "database_test.nxl": {
+      "status": "compile"
+    },
+    "dead_code.nxl": {
+      "status": "compile"
+    },
+    "derive_test_v2.nxl": {
+      "status": "compile"
+    },
+    "drop_test.nxl": {
+      "status": "compile"
+    },
+    "enum.nxl": {
+      "status": "compile"
+    },
+    "error_scope.nxl": {
+      "status": "reject",
+      "diagnostic": "Undefined variable"
+    },
+    "error_suggestion.nxl": {
+      "status": "reject",
+      "diagnostic": "Unknown function or struct"
+    },
+    "error_suggestion_struct.nxl": {
+      "status": "reject",
+      "diagnostic": "has no member"
+    },
+    "error_test.nxl": {
+      "status": "reject",
+      "diagnostic": "Use of moved variable"
+    },
+    "error_type.nxl": {
+      "status": "reject",
+      "diagnostic": "Type Error: string != i32"
+    },
+    "floats.nxl": {
+      "status": "compile"
+    },
+    "generics.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "Done"
+        ]
+      }
+    },
+    "glob_test.nxl": {
+      "status": "compile"
+    },
+    "glob_utils.nxl": {
+      "status": "compile"
+    },
+    "gpu_dispatch.nxl": {
+      "status": "compile"
+    },
+    "gpu_kernel.nxl": {
+      "status": "compile"
+    },
+    "gpu_kernel_spirv.nxl": {
+      "status": "compile"
+    },
+    "gpu_kernel_vulkan_spirv.nxl": {
+      "status": "compile"
+    },
+    "hashmap_test.nxl": {
+      "status": "compile"
+    },
+    "hello.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "Hello, NexaLang!"
+        ]
+      }
+    },
+    "high_order_test.nxl": {
+      "status": "compile"
+    },
+    "import_test.nxl": {
+      "status": "compile"
+    },
+    "inference.nxl": {
+      "status": "compile"
+    },
+    "iterator_test.nxl": {
+      "status": "compile"
+    },
+    "kv_cache_quant_test.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "KV cache len:",
+          "Quantized total bytes:"
+        ]
+      }
+    },
+    "lambda_parse_test.nxl": {
+      "status": "compile"
+    },
+    "llama_chat.nxl": {
+      "status": "compile"
+    },
+    "loop.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "Loop finished"
+        ]
+      }
+    },
+    "loop_draft.nxl": {
+      "status": "compile"
+    },
+    "math.nxl": {
+      "status": "compile"
+    },
+    "method_field.nxl": {
+      "status": "compile"
+    },
+    "method_minimal.nxl": {
+      "status": "compile"
+    },
+    "method_test2.nxl": {
+      "status": "compile"
+    },
+    "methods_complete.nxl": {
+      "status": "compile"
+    },
+    "methods_final.nxl": {
+      "status": "compile"
+    },
+    "methods_simple.nxl": {
+      "status": "compile"
+    },
+    "methods_test.nxl": {
+      "status": "compile"
+    },
+    "mnist_train.nxl": {
+      "status": "compile"
+    },
+    "modules/main.nxl": {
+      "status": "compile"
+    },
+    "modules/math_utils.nxl": {
+      "status": "compile"
+    },
+    "modules/privacy.nxl": {
+      "status": "compile"
+    },
+    "modules/privacy_lib.nxl": {
+      "status": "compile"
+    },
+    "nested_closure_test.nxl": {
+      "status": "compile"
+    },
+    "nested_test.nxl": {
+      "status": "compile"
+    },
+    "oop_test.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "110"
+        ]
+      }
+    },
+    "ownership_move.nxl": {
+      "status": "reject",
+      "diagnostic": "Use of moved variable"
+    },
+    "panic.nxl": {
+      "status": "compile"
+    },
+    "perf_bench.nxl": {
+      "status": "compile"
+    },
+    "perf_diag.nxl": {
+      "status": "compile"
+    },
+    "pointers.nxl": {
+      "status": "compile"
+    },
+    "product_api.nxl": {
+      "status": "compile"
+    },
+    "product_server.nxl": {
+      "status": "compile"
+    },
+    "region_test.nxl": {
+      "status": "compile"
+    },
+    "simple_test.nxl": {
+      "status": "compile"
+    },
+    "slices.nxl": {
+      "status": "compile",
+      "run": {
+        "exit": 0,
+        "contains": [
+          "30"
+        ]
+      }
+    },
+    "std_lib.nxl": {
+      "status": "compile"
+    },
+    "std_modules_test.nxl": {
+      "status": "compile"
+    },
+    "std_test.nxl": {
+      "status": "compile"
+    },
+    "string_test.nxl": {
+      "status": "compile"
+    },
+    "strings.nxl": {
+      "status": "compile"
+    },
+    "structs.nxl": {
+      "status": "compile"
+    },
+    "test_direct.nxl": {
+      "status": "compile"
+    },
+    "test_mut.nxl": {
+      "status": "compile"
+    },
+    "test_return.nxl": {
+      "status": "compile"
+    },
+    "test_struct.nxl": {
+      "status": "compile"
+    },
+    "trait_bounds.nxl": {
+      "status": "compile"
+    },
+    "trait_default.nxl": {
+      "status": "compile"
+    },
+    "traits_basic.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_instruct.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_pt.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_v2.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_v5_pt.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_v6.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_v7.nxl": {
+      "status": "compile"
+    },
+    "transformer_chat_v8.nxl": {
+      "status": "compile"
+    },
+    "transformer_finetune_v5.nxl": {
+      "status": "compile"
+    },
+    "transformer_finetune_v6.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm_v2.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm_v3.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm_v4.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm_v5.nxl": {
+      "status": "compile"
+    },
+    "transformer_lm_v6.nxl": {
+      "status": "compile"
+    },
+    "turboquant_ffi.nxl": {
+      "status": "compile"
+    },
+    "type_alias_test.nxl": {
+      "status": "compile"
+    },
+    "ultra_simple.nxl": {
+      "status": "compile"
+    },
+    "utils.nxl": {
+      "status": "compile"
+    },
+    "variables.nxl": {
+      "status": "compile"
+    },
+    "vec_debug.nxl": {
+      "status": "compile"
+    },
+    "vec_simple.nxl": {
+      "status": "compile"
+    },
+    "vec_test.nxl": {
+      "status": "compile"
+    },
+    "vectors.nxl": {
+      "status": "compile"
+    },
+    "warnings_test.nxl": {
+      "status": "compile"
+    },
+    "xor_train.nxl": {
+      "status": "compile"
+    }
+  }
+}

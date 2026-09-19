@@ -1,0 +1,6 @@
+.gitignore
+.vscodeignore
+scripts/**
+node_modules/.bin/**
+**/__pycache__/**
+**/*.pyc

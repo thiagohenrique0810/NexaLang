@@ -35,9 +35,15 @@ impl<T> Vec<T> {
                 new_cap = 4;
             }
             let item_size: i32 = sizeof::<T>();
+            if (item_size < 1) { item_size = 1; }
+            if (new_cap <= self.cap or new_cap > 2147483647 / item_size) {
+                panic("Vec capacity overflow");
+            }
             let new_ptr: *T = cast::<*T>(malloc(new_cap * item_size));
+            if (cast::<i64>(new_ptr) == 0) { panic("Vec allocation failed"); }
             if (self.cap > 0) {
                 memcpy(new_ptr, self.ptr, self.len * item_size);
+                free(self.ptr);
             }
             self.ptr = new_ptr;
             self.cap = new_cap;
@@ -47,6 +53,11 @@ impl<T> Vec<T> {
     }
     
     
+    # The allocation is owned by Vec; elements removed by pop retain ownership.
+    fn drop(self) {
+        if (cast::<i64>(self.ptr) != 0) { free(self.ptr); }
+    }
+
     fn iter(&self) -> VecIterator<T> {
         return VecIterator(self.ptr, self.len, 0);
     }

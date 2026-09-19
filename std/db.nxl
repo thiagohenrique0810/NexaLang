@@ -168,12 +168,3 @@ impl Database {
         return sqlite3_close(self.handle);
     }
 }
-    }
-
-    fn close(self) -> i32 {
-        if (cast::<i64>(self.handle) != 0) {
-            return sqlite3_close(self.handle);
-        }
-        return 0;
-    }
-}

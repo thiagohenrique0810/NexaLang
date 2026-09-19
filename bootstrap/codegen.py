@@ -10,7 +10,10 @@ class CodeGen:
         spirv_local_size: str = "1,1,1",
         quantize_gpu: int = 0,
     ):
-        self.module = ir.Module(name="nexalang_module")
+        if quantize_gpu:
+            raise ValueError("Automatic GPU quantization is unavailable: the experimental dispatch path does not preserve vector norms or kernel output")
+        self.module = ir.Module(name="nexalang_module", context=ir.Context())
+        self._drop_flags = {}
         self.target = target
         self.emit_kernels_only = emit_kernels_only
         self.spirv_env = spirv_env
@@ -45,6 +48,7 @@ class CodeGen:
         # Core compiler state
         self.struct_types = {} # name -> ir.LiteralStructType
         self.struct_fields = {}
+        self.struct_field_types = {}
         self._current_generics = [] # name -> {field_name: index}
         self._generic_type_map = {} # maps generic param names to concrete types during monomorphization
         self.enum_types = {} # name -> {variant: tag_id}
@@ -241,6 +245,8 @@ class CodeGen:
         f32_ptr = f32.as_pointer()
         if "tq_create" not in self.module.globals:
             ir.Function(self.module, ir.FunctionType(void_ptr, [i32, i32, i32]), name="tq_create")
+        if "tq_create_mse" not in self.module.globals:
+            ir.Function(self.module, ir.FunctionType(void_ptr, [i32, i32, i32]), name="tq_create_mse")
         if "tq_destroy" not in self.module.globals:
             ir.Function(self.module, ir.FunctionType(ir.VoidType(), [void_ptr]), name="tq_destroy")
         if "tq_quantize" not in self.module.globals:
@@ -375,6 +381,11 @@ class CodeGen:
             elif type_name.startswith('mut') and len(type_name) > 3 and type_name[3] != '<':
                 type_name = type_name[3:]
 
+        if type_name.startswith('Task<'):
+            return ir.IntType(8).as_pointer()
+        if type_name.startswith('[') and type_name.endswith(']'):
+            element, count = type_name[1:-1].rsplit(':', 1)
+            return ir.ArrayType(self.get_llvm_type(element), int(count))
         if type_name == 'i32':
             return ir.IntType(32)
         elif type_name == 'bool':
@@ -466,6 +477,7 @@ class CodeGen:
         raise Exception(f"CodeGen: Unknown type '{type_name}'")
 
     def visit_StructDef(self, node):
+        if node.name.startswith('Task<'): return
         if getattr(node, 'generics', None): return
         #     return # Skip monomorphized version in bootstrap; use erased base type instead
             
@@ -504,6 +516,7 @@ class CodeGen:
 
         # Map field names to indices
         self.struct_fields[node.name] = {name: i for i, (name, _) in enumerate(node.fields)}
+        self.struct_field_types[node.name] = node.fields
         self._current_generics = []
 
     def visit_EnumDef(self, node):
@@ -594,7 +607,7 @@ class CodeGen:
             if isinstance(node, EnumDef):
                 self.enum_definitions[node.name] = (placeholder_enum, {})
             elif isinstance(node, StructDef):
-                 if '<' not in node.name:
+                 if not node.generics:
                      # Use IdentifiedStructType to support recursive/out-of-order types
                      self.struct_types[node.name] = self.module.context.get_identified_type(node.name)
 
@@ -616,6 +629,7 @@ class CodeGen:
                 for func in node.functions:
                     self._declare_function(func)
             elif isinstance(node, ImplDef):
+                if node.generics: continue
                 self._current_generics = [g[0] for g in node.generics]
                 for method in node.methods:
                     self._declare_function(method)
@@ -660,44 +674,23 @@ class CodeGen:
         res_type_name = getattr(node, 'type_name', 'void')
         res_ty = self.get_llvm_type(res_type_name)
         # struct { i1 done, T result }
-        state_ty = ir.LiteralStructType([ir.IntType(1), res_ty])
+        state_ty = ir.LiteralStructType([ir.IntType(1)] + ([] if res_type_name == 'void' else [res_ty]))
         state = self.builder.bitcast(h, state_ty.as_pointer())
         
-        cond_bb = self.builder.append_basic_block("await_cond")
-        body_bb = self.builder.append_basic_block("await_poll")
-        cont_bb = self.builder.append_basic_block("await_cont")
-        
-        self.builder.branch(cond_bb)
-        self.builder.position_at_end(cond_bb)
-        
-        done_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
-        done = self.builder.load(done_ptr)
-        self.builder.cbranch(done, cont_bb, body_bb)
-        
-        self.builder.position_at_end(body_bb)
-        # Resume: call the runtime resume function if available, otherwise yield via sched_yield
-        if "__nexa_resume" in self.module.globals:
-            opaque_h = self.builder.bitcast(h, ir.IntType(8).as_pointer())
-            self.builder.call(self.module.globals["__nexa_resume"], [opaque_h])
-        elif "sched_yield" in self.module.globals:
-            self.builder.call(self.module.globals["sched_yield"], [])
-        else:
-            # Declare sched_yield for cooperative yielding
-            yield_ty = ir.FunctionType(ir.IntType(32), [])
-            yield_fn = ir.Function(self.module, yield_ty, name="sched_yield")
-            self.builder.call(yield_fn, [])
-        self.builder.branch(cond_bb)
-        
-        self.builder.position_at_end(cont_bb)
+        # Bootstrap async functions execute eagerly and return a completed state.
+        # A scheduler handle has a different ABI and must not be resumed here.
         # 3. Load result
         if res_type_name == 'void':
+            self.builder.call(self.free, [h])
             return ir.Constant(ir.IntType(32), 0)
             
         res_ptr = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
-        return self.builder.load(res_ptr)
+        result = self.builder.load(res_ptr)
+        self.builder.call(self.free, [h])
+        return result
 
     def visit_UnaryExpr(self, node):
-        if node.op == '&':
+        if node.op in ('&', '&mut'):
             # Address-of: return pointer to the lvalue
             if isinstance(node.operand, VariableExpr):
                 for scope in reversed(self.scopes):
@@ -751,6 +744,11 @@ class CodeGen:
             raise Exception(f"Unsupported unary operator: {node.op}")
 
     def visit_MemberAccess(self, node):
+        if hasattr(node, 'move_source'):
+            root, path = self._field_key(node)
+            flag = self._field_drop_flags.get((root, path))
+            if flag is not None:
+                self.builder.store(ir.Constant(ir.IntType(1), 0), flag)
         # ... existing implementation ...
         # Vulkan: Buffer<T> is lowered to interface globals, not an in-memory struct.
         if (
@@ -845,10 +843,12 @@ class CodeGen:
                         break
 
             if receiver_arg is None:
-                # Fallback: create temporary
-                temp = self.builder.alloca(receiver_val.type, name="method_self_tmp")
-                self.builder.store(receiver_val, temp)
-                receiver_arg = temp
+                if isinstance(node.receiver, (MemberAccess, IndexAccess, UnaryExpr)):
+                    receiver_arg = self._lvalue_ptr(node.receiver)
+                else:
+                    temp = self.builder.alloca(receiver_val.type, name="method_self_tmp")
+                    self.builder.store(receiver_val, temp)
+                    receiver_arg = temp
         else:
             receiver_arg = receiver_val
 
@@ -979,34 +979,115 @@ class CodeGen:
 
         self.builder.ret_void()
 
+    def _drop_function(self, type_name):
+        for name in (f"{type_name}_drop__args__SELF_PTR", f"{type_name}_drop"):
+            if name in self.module.globals:
+                return self.module.globals[name]
+        return None
+
+    def _needs_drop(self, type_name, visiting=None):
+        if self._drop_function(type_name) or type_name.startswith('Task<'):
+            return True
+        visiting = set() if visiting is None else visiting
+        if type_name in visiting:
+            return False
+        visiting.add(type_name)
+        return any(self._needs_drop(field_type, visiting.copy())
+                   for _, field_type in self.struct_field_types.get(type_name, []))
+
+    def _drop_value_at(self, ptr, type_name, root=None, path=()):
+        flag = self._field_drop_flags.get((root, path))
+        if flag is not None:
+            with self.builder.if_then(self.builder.load(flag)):
+                self.builder.store(ir.Constant(ir.IntType(1), 0), flag)
+                self._drop_value_body(ptr, type_name, root, path)
+        else:
+            self._drop_value_body(ptr, type_name, root, path)
+
+    def _drop_value_body(self, ptr, type_name, root, path):
+        drop = self._drop_function(type_name)
+        if drop:
+            expected = drop.function_type.args[0]
+            value = ptr if expected == ptr.type else self.builder.load(ptr)
+            self.builder.call(drop, [self._coerce_value(value, expected)])
+        elif type_name.startswith('Task<'):
+            handle = self.builder.load(ptr)
+            result_type = type_name[5:-1]
+            if self._needs_drop(result_type):
+                state_type = ir.LiteralStructType([ir.IntType(1), self.get_llvm_type(result_type)])
+                state = self.builder.bitcast(handle, state_type.as_pointer())
+                result = self.builder.gep(state, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)])
+                self._drop_value_at(result, result_type)
+            self.builder.call(self.free, [handle])
+        else:
+            for index, (name, field_type) in reversed(list(enumerate(self.struct_field_types.get(type_name, [])))):
+                if self._needs_drop(field_type):
+                    field = self.builder.gep(ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)])
+                    self._drop_value_at(field, field_type, root, path + (name,))
+
+    def _new_drop_flag(self, active=True):
+        flag = self._entry_alloca(ir.IntType(1), name="owned")
+        with self.builder.goto_block(self.builder.function.entry_basic_block):
+            self.builder.position_after(flag)
+            self.builder.store(ir.Constant(ir.IntType(1), 0), flag)
+        self.builder.store(ir.Constant(ir.IntType(1), int(active)), flag)
+        return flag
+
+    def _register_field_flags(self, root, type_name, path=()):
+        if self._drop_function(type_name):
+            return
+        for name, field_type in self.struct_field_types.get(type_name, []):
+            if self._needs_drop(field_type):
+                field_path = path + (name,)
+                self._field_drop_flags[(root, field_path)] = self._new_drop_flag()
+                self._register_field_flags(root, field_type, field_path)
+
+    def _field_key(self, node):
+        path = []
+        while isinstance(node, MemberAccess):
+            path.append(node.member)
+            node = node.object
+        if isinstance(node, VariableExpr):
+            for scope in reversed(self.scopes):
+                if node.name in scope:
+                    return scope[node.name][0], tuple(reversed(path))
+        return None, ()
+
+    def _register_owned_slot(self, ptr, type_name, active=True):
+        if not self._needs_drop(type_name):
+            return
+        self._drop_flags[ptr] = self._new_drop_flag(active)
+        self._register_field_flags(ptr, type_name)
+
+    def _mark_moved(self, ptr):
+        flag = self._drop_flags.get(ptr)
+        if flag is not None:
+            self.builder.store(ir.Constant(ir.IntType(1), 0), flag)
+
+    def _drop_slot(self, ptr, type_name):
+        flag = self._drop_flags.get(ptr)
+        if flag is None or self.builder.block.is_terminated:
+            return
+        with self.builder.if_then(self.builder.load(flag)):
+            self.builder.store(ir.Constant(ir.IntType(1), 0), flag)
+            self._drop_value_at(ptr, type_name, ptr)
+
     def emit_scope_drops(self, scope):
-        # Iterate in reverse order of declaration (LIFO)
-        # Scope is dict, assuming insertion order preserved (Python 3.7+)
-        for var_name, entry in reversed(list(scope.items())):
-            if var_name.startswith('$') or not isinstance(entry, tuple) or len(entry) < 2:
-                continue
-            ptr, type_name = entry[0], entry[1]
-            # Look for destructor: {TypeName}_drop(T) or {TypeName}_drop(&T)
-            # Modern mangled name: {TypeName}_drop__args__SELF_PTR
-            drop_func_name = f"{type_name}_drop"
-            mangled_drop = f"{type_name}_drop__args__SELF_PTR"
-            
-            drop_func = None
-            if mangled_drop in self.module.globals:
-                drop_func = self.module.get_global(mangled_drop)
-            elif drop_func_name in self.module.globals:
-                drop_func = self.module.get_global(drop_func_name)
-                
-            if drop_func:
-                # Load value
-                val = self.builder.load(ptr)
-                # Call drop
-                self.builder.call(drop_func, [val])
+        if self.builder.block.is_terminated:
+            return
+        for name, entry in reversed(list(scope.items())):
+            if not name.startswith('$') and isinstance(entry, tuple) and len(entry) == 2:
+                self._drop_slot(entry[0], entry[1])
+
+    def _visit_statements(self, statements):
+        for statement in statements:
+            if self.builder.block.is_terminated:
+                break
+            self.visit(statement)
 
     def visit_Block(self, node):
         self.scopes.append({})
-        for stmt in node.statements:
-            self.visit(stmt)
+        self._visit_statements(node.statements)
 
         # Auto-drop variables in this scope
         self.emit_scope_drops(self.scopes[-1])
@@ -1043,7 +1124,7 @@ class CodeGen:
             
             # Call {Type}_next(&mut iter)
             base_type = node.iterator_type.split('<')[0]
-            func_name = f"{base_type}_next"
+            func_name = getattr(node, 'next_function', f"{base_type}_next")
             if func_name not in self.module.globals:
                  raise Exception(f"CodeGen: Method '{func_name}' not found")
                  
@@ -1066,7 +1147,7 @@ class CodeGen:
             
             # Extract Tag (field 0)
             # Ensure opt_mem points to a struct even if type was erased to i8
-            if not isinstance(opt_mem.type.pointee, (ir.ArrayType, ir.LiteralStructType, ir.StructureType)):
+            if not isinstance(opt_mem.type.pointee, (ir.ArrayType, ir.LiteralStructType, ir.IdentifiedStructType)):
                  # Deduce return type name (e.g. Option<T>)
                  opt_type_name = getattr(node, 'option_type', f"Option<{node.item_type}>")
                  actual_ty = self.get_llvm_type(opt_type_name)
@@ -1103,13 +1184,13 @@ class CodeGen:
             self.builder.store(item_val, var_ptr)
             self.scopes[-1][node.var_name] = (var_ptr, node.item_type)
             
-            for stmt in node.body:
-                self.visit(stmt)
+            self._visit_statements(node.body)
                 
             self.emit_scope_drops(self.scopes[-1])
             self.scopes.pop()
             self.loop_stack.pop()
-            self.builder.branch(cond_block)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(cond_block)
             
             self.builder.position_at_end(end_block)
             
@@ -1162,8 +1243,7 @@ class CodeGen:
         # Register loop variable
         self.scopes[-1][node.var_name] = (loop_var_ptr, 'i32') # i32, no tag needed for primitives
         
-        for stmt in node.body:
-             self.visit(stmt)
+        self._visit_statements(node.body)
              
         # Auto-drop (if we supported break/continue, we would need to handle drops there too)
         self.emit_scope_drops(self.scopes[-1])
@@ -1171,7 +1251,8 @@ class CodeGen:
         self.scopes.pop()
         self.loop_stack.pop()
         
-        self.builder.branch(inc_block)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(inc_block)
         
         # 5. Increment Block
         self.builder.position_at_end(inc_block)
@@ -1237,8 +1318,7 @@ class CodeGen:
         self.builder.branch(continue_block)
     def visit_BlockStmt(self, node):
         self.scopes.append({})
-        for stmt in node.stmts:
-             self.visit(stmt)
+        self._visit_statements(node.stmts)
         # Auto-drop variables in this scope
         self.emit_scope_drops(self.scopes[-1])
         self.scopes.pop()
@@ -1297,213 +1377,70 @@ class CodeGen:
         ptr = self._entry_alloca(llvm_type, name=node.name)
         # Coerce value type if needed (e.g. generic monomorphization, struct layout differences)
         if init_val.type != llvm_type:
-            init_val = self._coerce_value(init_val, llvm_type)
-        
-        # Auto-coerce pointer alloca type if value type still differs
-        if init_val.type != ptr.type.pointee:
-            ptr = self.builder.bitcast(ptr, init_val.type.as_pointer())
+            init_val = self._coerce_value(init_val, llvm_type, getattr(node.initializer, "type_name", None))
         
         self.builder.store(init_val, ptr)
 
         # Store in scope: (Pointer, TypeName)
         self.scopes[-1][node.name] = (ptr, node.type_name)
+        self._register_owned_slot(ptr, node.type_name)
+
+    def _lvalue_ptr(self, node):
+        if isinstance(node, VariableExpr):
+            for scope in reversed(self.scopes):
+                if node.name in scope:
+                    entry = scope[node.name]
+                    if len(entry) == 3 and entry[2] == "value":
+                        raise Exception("SSA values have no address")
+                    return entry[0]
+        elif isinstance(node, UnaryExpr) and node.op == '*':
+            return self.visit(node.operand)
+        elif isinstance(node, MemberAccess):
+            obj_type = getattr(node.object, 'type_name', '')
+            if obj_type.endswith('*') or obj_type.startswith('&'):
+                ptr = self.visit(node.object)
+            else:
+                ptr = self._lvalue_ptr(node.object)
+            index = self.struct_fields[node.struct_type][node.member]
+            return self.builder.gep(ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)])
+        elif isinstance(node, IndexAccess):
+            index = self.visit(node.index)
+            obj_type = getattr(node.object, 'type_name', '')
+            if obj_type.startswith('['):
+                ptr = self._lvalue_ptr(node.object)
+                return self.builder.gep(ptr, [ir.Constant(ir.IntType(32), 0), index])
+            value = self.visit(node.object)
+            if obj_type.startswith('Slice<'):
+                value = self.builder.extract_value(value, 0)
+            return self.builder.gep(value, [index])
+        raise Exception("Assignment requires an addressable value")
 
     def visit_Assignment(self, node):
-        val = self.visit(node.value)
-
+        value = self.visit(node.value)
         if isinstance(node.target, VariableExpr):
-            # Find stack allocation
-            ptr = None
-            entry = None
             for scope in reversed(self.scopes):
-                    if node.target.name in scope:
-                        entry = scope[node.target.name]
-                        if isinstance(entry, tuple) and len(entry) == 3 and entry[2] == "value":
-                            # SSA update (Vulkan pointer values, etc.)
-                            scope[node.target.name] = (val, entry[1], "value")
-                            return
-                        ptr, _ = entry
-                        break
-            if not ptr: raise Exception(f"Undefined var {node.target.name}")
-            if val.type != ptr.type.pointee:
-                ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-            # Auto-bitcast for type erasure
-            if val.type != ptr.type.pointee:
-                ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-            self.builder.store(val, ptr)
-
-        elif isinstance(node.target, MemberAccess):
-            # For (*ptr).field = val, get the pointer directly instead of loading
-            if isinstance(node.target.object, UnaryExpr) and node.target.object.op == '*':
-                struct_val = self.visit(node.target.object.operand)
-            else:
-                struct_val = self.visit(node.target.object)
-            # print(f"DEBUG ASSIGN MEMBER: {struct_val.type}")
-            # if not hasattr(node.target, 'struct_type'): raise Exception('Missing struct_type')
-            if not isinstance(struct_val.type, ir.PointerType):
-                obj_repr = repr(node.target.object) if hasattr(node.target, 'object') else 'unknown'
-                raise Exception(f"Cannot assign to member '{node.target.member}' of Value-type struct (object={obj_repr}): {struct_val.type} (is_ptr={isinstance(struct_val.type, ir.PointerType)})")
-            struct_name = node.target.struct_type
-            field_idx = self.struct_fields[struct_name][node.target.member]
-            if isinstance(struct_val.type, ir.PointerType):
-                ptr = self.builder.gep(struct_val, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), field_idx)])
-                if val.type != ptr.type.pointee:
-                    ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-                # Auto-bitcast for type erasure
-                if val.type != ptr.type.pointee:
-                    ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-                self.builder.store(val, ptr)
-            else:
-                raise Exception('Cannot assign to member of Value-type struct')
-
-        elif isinstance(node.target, UnaryExpr):
-            if node.target.op == '*':
-                # *ptr = val
-                # Evaluate 'ptr' (the operand of *)
-                ptr_val = self.visit(node.target.operand)
-                if val.type != ptr_val.type.pointee:
-                    ptr_val = self.builder.bitcast(ptr_val, val.type.as_pointer())
-                # Auto-bitcast for type erasure
-                if val.type != ptr_val.type.pointee:
-                    ptr_val = self.builder.bitcast(ptr_val, val.type.as_pointer())
-                self.builder.store(val, ptr_val)
-            else:
-                raise Exception("Invalid assignment target")
-
-        elif isinstance(node.target, IndexAccess):
-            # ptr[i] = val  OR  arr[i] = val
-            index_val = self.visit(node.target.index)
-            # Evaluate base (e.g. self.ptr)
-            ptr_val = self.visit(node.target.object)
-            
-            # For bootstrap, always treat as pointer indexing if not an array.
-            # If it's a pointer to array, GEP needs [0, i]. If it's a pointer to T, GEP needs [i].
-            if isinstance(ptr_val.type.pointee, ir.ArrayType):
-                ptr = self.builder.gep(ptr_val, [ir.Constant(ir.IntType(32), 0), index_val])
-            else:
-                ptr = self.builder.gep(ptr_val, [index_val])
-                
-            if val.type != ptr.type.pointee:
-                ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-            # Auto-bitcast for type erasure
-            if val.type != ptr.type.pointee:
-                ptr = self.builder.bitcast(ptr, val.type.as_pointer())
-            self.builder.store(val, ptr)
-
-            # If object is a variable, prefer addressable access.
-            if isinstance(node.target.object, VariableExpr):
-                entry = None
-                for scope in reversed(self.scopes):
-                        if node.target.object.name in scope:
-                            entry = scope[node.target.object.name]
-                            break
-                if not entry:
-                        raise Exception(f"Undefined var {node.target.object.name}")
-
-                if isinstance(entry, tuple) and len(entry) == 3:
-                        obj_val, type_name, tag = entry
-                        # SSA pointer value (Vulkan) or Vulkan Buffer data pointer.
-                        if tag in ("value", "vulkan_buffer"):
-                            if not isinstance(obj_val.type, ir.PointerType):
-                                raise Exception("Index assignment requires pointer/array base")
-                            if isinstance(obj_val.type.pointee, ir.ArrayType):
-                                zero = ir.Constant(ir.IntType(32), 0)
-                                elem_ptr = self.builder.gep(obj_val, [zero, index_val])
-                            else:
-                                elem_ptr = self.builder.gep(obj_val, [index_val])
-                            # Auto-bitcast for type erasure
-                            if val.type != elem_ptr.type.pointee:
-                                elem_ptr = self.builder.bitcast(elem_ptr, val.type.as_pointer())
-                            self.builder.store(val, elem_ptr)
-                            return
-                        # Fallback to old behavior if unknown tag
-                        obj_ptr = obj_val
-                else:
-                        obj_ptr, type_name = entry
-
-                # Array alloca: gep (0, idx)
-                if isinstance(obj_ptr.type.pointee, ir.ArrayType):
-                        zero = ir.Constant(ir.IntType(32), 0)
-                        elem_ptr = self.builder.gep(obj_ptr, [zero, index_val])
-                        # Auto-bitcast for type erasure
-                        if val.type != elem_ptr.type.pointee:
-                            elem_ptr = self.builder.bitcast(elem_ptr, val.type.as_pointer())
-                        self.builder.store(val, elem_ptr)
+                if node.target.name in scope:
+                    entry = scope[node.target.name]
+                    if len(entry) == 3 and entry[2] == "value":
+                        scope[node.target.name] = (self._coerce_value(value, entry[0].type,
+                            getattr(node.value, 'type_name', None)), entry[1], "value")
                         return
-
-                # Pointer alloca: load base ptr then gep (idx)
-                base_ptr = self.builder.load(obj_ptr)
-                elem_ptr = self.builder.gep(base_ptr, [index_val])
-                # Auto-bitcast for type erasure
-                if val.type != elem_ptr.type.pointee:
-                    elem_ptr = self.builder.bitcast(elem_ptr, val.type.as_pointer())
-                self.builder.store(val, elem_ptr)
-                return
-
-            # Fallback: if object evaluates to a pointer value
-            obj_val = self.visit(node.target.object)
-            if isinstance(obj_val.type, ir.PointerType):
-                elem_ptr = self.builder.gep(obj_val, [index_val])
-                # Auto-bitcast for type erasure
-                if val.type != elem_ptr.type.pointee:
-                    elem_ptr = self.builder.bitcast(elem_ptr, val.type.as_pointer())
-                self.builder.store(val, elem_ptr)
-                return
-
-            raise Exception("Index assignment requires array or pointer base")
-
+        ptr = self._lvalue_ptr(node.target)
+        value = self._coerce_value(value, ptr.type.pointee, getattr(node.value, 'type_name', None))
+        self._drop_slot(ptr, getattr(node.target, 'type_name', ''))
+        if ptr not in self._drop_flags and self._needs_drop(getattr(node.target, 'type_name', '')):
+            root, path = self._field_key(node.target)
+            self._drop_value_at(ptr, node.target.type_name, root, path)
+        self.builder.store(value, ptr)
+        if ptr in self._drop_flags:
+            self.builder.store(ir.Constant(ir.IntType(1), 1), self._drop_flags[ptr])
+            for (root, path), flag in self._field_drop_flags.items():
+                if root == ptr:
+                    self.builder.store(ir.Constant(ir.IntType(1), 1), flag)
         elif isinstance(node.target, MemberAccess):
-            # Assign to struct field: struct.field = val
-            # We need address of the struct.
-            struct_ptr = None
-
-            # Case 1: struct is a variable
-            if isinstance(node.target.object, VariableExpr):
-                var_name = node.target.object.name
-                for scope in reversed(self.scopes):
-                        if var_name in scope:
-                            struct_ptr, _ = scope[var_name]
-                            break
-                if not struct_ptr: raise Exception(f"Undefined var {var_name}")
-
-            # Case 2: struct is dereferenced pointer (*ptr).field
-            elif isinstance(node.target.object, UnaryExpr) and node.target.object.op == '*':
-                # ptr expression
-                struct_ptr = self.visit(node.target.object.operand)
-            else:
-                raise Exception("Assignment to field requires variable or pointer dereference")
-
-            # Get field index
-            # Semantic analyzer should have annotated struct type? 
-            # Or we look it up.
-            # MemberAccess node usually has .struct_type if we annotated it in Semantic
-            if not hasattr(node.target, 'struct_type'):
-                # Fallback: We need to know the type to find the index.
-                # It's tricky to get if not annotated.
-                # Assuming Semantic annotated it.
-                # If not, we might fail.
-                # Let's hope Semantic visit_MemberAccess does it.
-                # CHECK Semantic logic later.
-                # For now, raise or try?
-                raise Exception("CodeGen: Missing struct_type on MemberAccess target. Semantic analysis incomplete.")
-
-            struct_name = node.target.struct_type
-            field_index = self.struct_fields[struct_name][node.target.member]
-
-            # Ensure struct_ptr points to the actual struct type (handles type erasure fallback to i8*)
-            actual_struct_ty = self.get_llvm_type(struct_name)
-            if struct_ptr.type.pointee != actual_struct_ty:
-                struct_ptr = self.builder.bitcast(struct_ptr, actual_struct_ty.as_pointer())
-
-            # GEP to field
-            zero = ir.Constant(ir.IntType(32), 0)
-            idx = ir.Constant(ir.IntType(32), field_index)
-            field_ptr = self.builder.gep(struct_ptr, [zero, idx])
-
-            # Auto-bitcast for type erasure
-            if val.type != field_ptr.type.pointee:
-                field_ptr = self.builder.bitcast(field_ptr, val.type.as_pointer())
-            self.builder.store(val, field_ptr)
+            flag = self._field_drop_flags.get(self._field_key(node.target))
+            if flag is not None:
+                self.builder.store(ir.Constant(ir.IntType(1), 1), flag)
 
     def _is_float(self, llvm_type):
         """Check if type is f32 or f64."""
@@ -1511,19 +1448,40 @@ class CodeGen:
 
     def _fmath(self, result):
         """Add fast-math flags to a float instruction."""
-        result.flags.append('fast')
         return result
 
     def _nsw(self, result):
         """Add no-signed-wrap flag to an integer instruction."""
-        result.flags.append('nsw')
         return result
 
     def visit_BinaryExpr(self, node):
-        from n_parser import IntegerLiteral as _IntLit
-
+        if hasattr(node, 'expanded'):
+            value = self.visit(node.expanded)
+            return self.builder.not_(value) if node.op == 'NEQ' else value
         left = self.visit(node.left)
+        if node.op in ('AND', 'OR'):
+            origin = self.builder.block
+            right_block = self.builder.append_basic_block('logical_rhs')
+            end_block = self.builder.append_basic_block('logical_end')
+            if node.op == 'AND':
+                self.builder.cbranch(left, right_block, end_block)
+            else:
+                self.builder.cbranch(left, end_block, right_block)
+            self.builder.position_at_end(right_block)
+            right = self.visit(node.right)
+            right_origin = self.builder.block
+            self.builder.branch(end_block)
+            self.builder.position_at_end(end_block)
+            result = self.builder.phi(ir.IntType(1))
+            result.add_incoming(left, origin)
+            result.add_incoming(right, right_origin)
+            return result
         right = self.visit(node.right)
+        if left.type != right.type and not isinstance(left.type, ir.PointerType) and not isinstance(right.type, ir.PointerType):
+            common = getattr(node, 'operand_type', None)
+            target = self.get_llvm_type(common) if common else left.type
+            left = self._coerce_value(left, target, getattr(node.left, 'type_name', None))
+            right = self._coerce_value(right, target, getattr(node.right, 'type_name', None))
 
         # Mapping token types to operations
         if node.op == 'PLUS':
@@ -1549,18 +1507,14 @@ class CodeGen:
         elif node.op == 'SLASH':
             if self._is_float(left.type):
                 return self._fmath(self.builder.fdiv(left, right, name="fdivtmp"))
-            # Strength reduction: x / 2^n => x >> n (for positive power-of-2 constants)
-            if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
-                shift = node.right.value.bit_length() - 1
-                return self.builder.ashr(left, ir.Constant(left.type, shift), name="divsr")
+            if getattr(node, 'operand_type', None) in ('u8', 'u64'):
+                return self.builder.udiv(left, right, name="divtmp")
             return self.builder.sdiv(left, right, name="divtmp")
         elif node.op == 'PERCENT':
             if self._is_float(left.type):
                 return self._fmath(self.builder.frem(left, right, name="fremtmp"))
-            # Strength reduction: x % 2^n => x & (2^n - 1) (for positive power-of-2 constants)
-            if isinstance(node.right, _IntLit) and node.right.value > 0 and (node.right.value & (node.right.value - 1)) == 0:
-                mask = node.right.value - 1
-                return self.builder.and_(left, ir.Constant(left.type, mask), name="modsr")
+            if getattr(node, 'operand_type', None) in ('u8', 'u64'):
+                return self.builder.urem(left, right, name="remtmp")
             return self.builder.srem(left, right, name="remtmp")
         elif node.op == 'AND':
             return self.builder.and_(left, right, name="andtmp")
@@ -1625,16 +1579,18 @@ class CodeGen:
 
         # Generate 'then' block
         self.builder.position_at_end(then_bb)
-        for stmt in node.then_branch:
-            self.visit(stmt)
+        self.scopes.append({})
+        self._visit_statements(node.then_branch)
+        self.emit_scope_drops(self.scopes.pop())
         if not self.builder.block.is_terminated:
             self.builder.branch(merge_bb)
 
         # Generate 'else' block
         self.builder.position_at_end(else_bb)
+        self.scopes.append({})
         if node.else_branch:
-            for stmt in node.else_branch:
-                self.visit(stmt)
+            self._visit_statements(node.else_branch)
+        self.emit_scope_drops(self.scopes.pop())
         if not self.builder.block.is_terminated:
             self.builder.branch(merge_bb)
 
@@ -1654,7 +1610,7 @@ class CodeGen:
 
         # Determine the enum type name from semantic info
         enum_name = None
-        value_type = getattr(node.value, 'type_name', None)
+        value_type = getattr(node, 'enum_name', getattr(node.value, 'type_name', None))
         if value_type and value_type in self.enum_types:
             enum_name = value_type
         else:
@@ -1674,7 +1630,7 @@ class CodeGen:
         switch = self.builder.switch(tag_val, default_bb)
 
         for arm in node.cases:
-            arm_bb = self.builder.append_basic_block(name=f"match_{arm.variant_name}")
+            arm_bb = default_bb if arm.variant_name == '_' else self.builder.append_basic_block(name=f"match_{arm.variant_name}")
 
             if enum_name and arm.variant_name in self.enum_types.get(enum_name, {}):
                 tag_id = self.enum_types[enum_name][arm.variant_name]
@@ -1712,6 +1668,7 @@ class CodeGen:
                             ptype_name = 'f32'
                         elif isinstance(payload_type, ir.DoubleType):
                             ptype_name = 'f64'
+                        ptype_name = getattr(arm, 'payload_type_names', [ptype_name])[0]
                         self.scopes[-1][arm.var_names[0]] = (var_alloca, ptype_name)
                     elif isinstance(payload_type, ir.LiteralStructType):
                         for idx, vname in enumerate(arm.var_names):
@@ -1727,19 +1684,19 @@ class CodeGen:
 
             # Visit body
             if isinstance(arm.body, list):
-                for stmt in arm.body:
-                    self.visit(stmt)
+                self._visit_statements(arm.body)
             else:
                 self.visit(arm.body)
 
-            self.scopes.pop()
+            self.emit_scope_drops(self.scopes.pop())
 
             if not self.builder.block.is_terminated:
                 self.builder.branch(merge_bb)
 
         # Default block: just branch to merge (no-op)
         self.builder.position_at_end(default_bb)
-        self.builder.branch(merge_bb)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(merge_bb)
 
         self.builder.position_at_end(merge_bb)
 
@@ -1764,8 +1721,7 @@ class CodeGen:
         self.scopes.append({})
         self.loop_stack.append((cond_bb, end_bb, len(self.scopes) - 1, node.label))
         
-        for stmt in node.body:
-            self.visit(stmt)
+        self._visit_statements(node.body)
             
         self.emit_scope_drops(self.scopes[-1])
         self.scopes.pop()
@@ -1792,42 +1748,36 @@ class CodeGen:
 
         # 4. Register in Scope (with type name 'Arena')
         self.scopes[-1][node.name] = (ptr, 'Arena')
+        self._register_owned_slot(ptr, 'Arena')
 
         # 5. Visit Body
-        for stmt in node.body:
-            self.visit(stmt)
+        self._visit_statements(node.body)
 
         # 6. Auto-Drop
         self.emit_scope_drops(self.scopes[-1])
 
         self.scopes.pop()
 
-    def _coerce_value(self, val, target_type):
-        """Coerce an LLVM value to a target type, handling int/ptr/struct mismatches."""
+    def _coerce_value(self, val, target_type, source_type=None):
+        """Convert values; never reinterpret the size or layout of their storage."""
         if val.type == target_type:
             return val
+        unsigned = source_type in ('u8', 'u64', 'bool', 'char') or isinstance(val.type, ir.IntType) and val.type.width in (1, 8)
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
+            if val.type.addrspace != target_type.addrspace:
+                return self.builder.addrspacecast(val, target_type)
             return self.builder.bitcast(val, target_type)
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
             if val.type.width > target_type.width:
                 return self.builder.trunc(val, target_type)
-            else:
-                return self.builder.zext(val, target_type)
-        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.FloatType):
-            return self.builder.sitofp(val, target_type)
-        if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.IntType):
+            return (self.builder.zext if unsigned else self.builder.sext)(val, target_type)
+        if isinstance(val.type, ir.IntType) and self._is_float(target_type):
+            return (self.builder.uitofp if unsigned else self.builder.sitofp)(val, target_type)
+        if self._is_float(val.type) and isinstance(target_type, ir.IntType):
             return self.builder.fptosi(val, target_type)
-        if isinstance(val.type, ir.LiteralStructType) and isinstance(target_type, ir.LiteralStructType):
-            # Aggregate reinterpretation via memory
-            tmp = self.builder.alloca(val.type)
-            self.builder.store(val, tmp)
-            tmp_cast = self.builder.bitcast(tmp, target_type.as_pointer())
-            return self.builder.load(tmp_cast)
-        # Fallback: try bitcast
-        try:
-            return self.builder.bitcast(val, target_type)
-        except Exception:
-            return val  # Last resort: let LLVM error on call
+        if self._is_float(val.type) and self._is_float(target_type):
+            return (self.builder.fpext if isinstance(val.type, ir.FloatType) else self.builder.fptrunc)(val, target_type)
+        raise Exception(f"Cannot coerce {val.type} to {target_type}")
 
     def _get_or_create_string(self, string_val, name="str"):
         if not string_val.endswith('\0'):
@@ -1892,6 +1842,8 @@ class CodeGen:
         return struct_ty
 
     def visit_VariableExpr(self, node):
+        if hasattr(node, 'function_value'):
+            return self.visit_LambdaExpr(node.function_value)
         # 1. Primary Lookup (Local Scopes)
         for scope in reversed(self.scopes):
             if node.name in scope:
@@ -1901,7 +1853,10 @@ class CodeGen:
                     if tag == "value":
                         return val_or_ptr
                 ptr, _ = entry
-                return self.builder.load(ptr, name=node.name)
+                value = self.builder.load(ptr, name=node.name)
+                if getattr(node, 'moves_value', False):
+                    self._mark_moved(ptr)
+                return value
 
         # 2. Secondary Lookup (Closure Environment)
         # Search for the closest $env in scopes
@@ -1923,7 +1878,7 @@ class CodeGen:
         if '::' in node.name:
              parts = node.name.rsplit('::', 1)
              lhs = parts[0]; rhs = parts[1]
-             base_lhs = lhs.split('<')[0]
+             base_lhs = lhs if lhs in self.enum_definitions else lhs.split('<')[0]
              if base_lhs in self.enum_definitions:
                   enum_ty, max_size = self.enum_definitions[base_lhs]
                   if rhs in self.enum_types[base_lhs]:
@@ -1988,16 +1943,31 @@ class CodeGen:
         return self.builder.call(func_ptr, processed_args)
     def visit_CallExpr(self, node):
         callee = node.callee
+        if not isinstance(callee, (str, VariableExpr)):
+            return self._emit_closure_call(self.visit(callee), callee.type_name, node.args)
         if isinstance(callee, VariableExpr):
             callee = callee.name
             
         callee_name = callee
+        if callee_name == 'slice_from_array':
+            array_ptr = self.visit(node.args[0])
+            array_type = array_ptr.type.pointee
+            ptr = self.builder.gep(array_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
+            result = ir.Constant(self.get_llvm_type(node.type_name), ir.Undefined)
+            result = self.builder.insert_value(result, ptr, 0)
+            return self.builder.insert_value(result, ir.Constant(ir.IntType(32), array_type.count), 1)
         
         # 1. Built-in generic functions (Intrinsics)
         if isinstance(callee_name, str) and callee_name.startswith('cast<'):
-            target_ty_name = callee_name[5:].rstrip('>')
+            target_ty_name = callee_name[5:-1]
             target_ty = self.get_llvm_type(target_ty_name)
             val = self.visit(node.args[0])
+            if isinstance(target_ty, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+                if isinstance(val, ir.Constant) and isinstance(val.type, ir.IntType) and val.constant == 0:
+                    return ir.Constant(target_ty, None)
+                if val.type == target_ty:
+                    return val
+                raise ValueError("Aggregate casts only support typed zero initialization")
             
             # Pointer to pointer
             if isinstance(val.type, ir.PointerType) and isinstance(target_ty, ir.PointerType):
@@ -2037,7 +2007,7 @@ class CodeGen:
             return self.builder.bitcast(val, target_ty)
 
         elif isinstance(callee_name, str) and callee_name.startswith('sizeof<'):
-            type_name = callee_name[7:].rstrip('>')
+            type_name = callee_name[7:-1]
             llvm_ty = self.get_llvm_type(type_name)
             null_ptr = ir.Constant(llvm_ty.as_pointer(), None)
             gep = self.builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)])
@@ -2078,6 +2048,10 @@ class CodeGen:
                 fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
             elif val.type == ir.DoubleType():
                 fmt_str = self.visit_StringLiteral(None, name="fmt_f", value_override="%f\n\0")
+            elif isinstance(val.type, ir.IntType) and val.type.width == 64:
+                fmt = "%llu\n\0" if arg_type_name == 'u64' else "%lld\n\0"
+                fmt_str = self.visit_StringLiteral(None, name="fmt_i64", value_override=fmt)
+                int_like = True
             elif isinstance(val.type, ir.IntType) and not isinstance(val.type, ir.PointerType):
                 # Fallback: LLVM type is integer but AST type_name was missing
                 fmt_str = self.visit_StringLiteral(None, name="fmt_d", value_override="%d\n\0")
@@ -2148,12 +2122,12 @@ class CodeGen:
             if mode_ptr.type != void_ptr: mode_ptr = self.builder.bitcast(mode_ptr, void_ptr)
             return self.builder.call(self.fopen, [path_ptr, mode_ptr])
 
-        elif callee_name == "__nexa_assert":
+        elif callee_name in ("__nexa_assert", "assert"):
             # __nexa_assert(condition, message, file, line)
             cond = self.visit(node.args[0])
             msg = self.visit(node.args[1])
-            file_arg = self.visit(node.args[2])
-            line_arg = self.visit(node.args[3])
+            file_arg = self.visit(node.args[2]) if len(node.args) > 2 else self.visit_StringLiteral(None, value_override="unknown")
+            line_arg = self.visit(node.args[3]) if len(node.args) > 3 else ir.Constant(ir.IntType(32), getattr(node, 'line', 0))
 
             # Ensure cond is i1
             if cond.type != ir.IntType(1):
@@ -2202,12 +2176,13 @@ class CodeGen:
             return self.builder.load(self.gpu_global_id, name="gpu_global_id")
 
         # ── TurboQuant compression intrinsics ──
-        elif callee_name == "compress::create":
-            # compress::create(dim, bits, seed) -> *u8
+        elif callee_name in ("compress::create", "compress::create_mse"):
+            # Legacy create preserves Prod; create_mse opts into linear state.
             dim_val = self.visit(node.args[0])
             bits_val = self.visit(node.args[1])
             seed_val = self.visit(node.args[2]) if len(node.args) > 2 else ir.Constant(ir.IntType(32), 42)
-            return self.builder.call(self.module.globals["tq_create"], [dim_val, bits_val, seed_val], name="tq_ctx")
+            constructor = "tq_create_mse" if callee_name == "compress::create_mse" else "tq_create"
+            return self.builder.call(self.module.globals[constructor], [dim_val, bits_val, seed_val], name="tq_ctx")
 
         elif callee_name == "compress::destroy":
             ctx_val = self.visit(node.args[0])
@@ -2266,6 +2241,8 @@ class CodeGen:
 
             # Determine quantization bits: from @[quantize(N)] attr or --quantize-gpu flag
             q_bits = getattr(self._current_function_node, '_quantize_bits', 0) or self.quantize_gpu
+            if q_bits:
+                raise ValueError("Automatic GPU quantization is unavailable: vector norms and kernel output must be preserved")
 
             if self.target == "native":
                 if "__nexa_gpu_dispatch" not in self.module.globals:
@@ -2289,7 +2266,7 @@ class CodeGen:
                         if isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.FloatType):
                             if tq_ctx is None:
                                 # Lazily create TurboQuant context: dim = threads, bits = q_bits
-                                tq_create = self.module.globals["tq_create"]
+                                tq_create = self.module.globals["tq_create_mse"]
                                 tq_ctx = self.builder.call(tq_create, [
                                     threads_val,
                                     ir.Constant(i32, q_bits),
@@ -2360,6 +2337,7 @@ class CodeGen:
             struct_val = ir.Constant(struct_ty, ir.Undefined)
             for i, arg in enumerate(node.args):
                 arg_val = self.visit(arg)
+                arg_val = self._coerce_value(arg_val, struct_ty.elements[i], getattr(arg, 'type_name', None))
                 struct_val = self.builder.insert_value(struct_val, arg_val, i)
             return struct_val
 
@@ -2427,6 +2405,9 @@ class CodeGen:
             dest = self.visit(node.args[0])
             src = self.visit(node.args[1])
             size = self.visit(node.args[2])
+            dest = self._coerce_value(dest, ir.IntType(8).as_pointer())
+            src = self._coerce_value(src, ir.IntType(8).as_pointer())
+            size = self._coerce_value(size, ir.IntType(32), getattr(node.args[2], 'type_name', None))
             return self.builder.call(self.memcpy, [dest, src, size, ir.Constant(ir.IntType(1), 0)])
 
         # 7. Regular Function Calls
@@ -2443,18 +2424,13 @@ class CodeGen:
             for i in range(min(len(processed_args), len(callee_func.function_type.args))):
                 expected = callee_func.function_type.args[i]
                 actual = processed_args[i]
-                if actual.type != expected:
-                    if isinstance(actual.type, ir.PointerType) and isinstance(expected, ir.IntType):
-                        processed_args[i] = self.builder.ptrtoint(actual, expected)
-                    elif isinstance(actual.type, ir.IntType) and isinstance(expected, ir.PointerType):
-                        processed_args[i] = self.builder.inttoptr(actual, expected)
-                    elif isinstance(actual.type, ir.IntType) and isinstance(expected, ir.IntType):
-                        if actual.type.width < expected.width:
-                            processed_args[i] = self.builder.sext(actual, expected)
-                        else:
-                            processed_args[i] = self.builder.trunc(actual, expected)
-                    else:
-                        processed_args[i] = self.builder.bitcast(actual, expected)
+                processed_args[i] = self._coerce_value(actual, expected, getattr(node.args[i], 'type_name', None))
+            for i in range(len(callee_func.function_type.args), len(processed_args)):
+                actual = processed_args[i]
+                if isinstance(actual.type, ir.FloatType):
+                    processed_args[i] = self.builder.fpext(actual, ir.DoubleType())
+                elif isinstance(actual.type, ir.IntType) and actual.type.width < 32:
+                    processed_args[i] = self._coerce_value(actual, ir.IntType(32), getattr(node.args[i], 'type_name', None))
             return self.builder.call(callee_func, processed_args)
 
         raise Exception(f"Unknown function call: {callee_name}")
@@ -2464,13 +2440,17 @@ class CodeGen:
         ret_val = None
         if node.value:
             ret_val = self.visit(node.value)
+            target_type = self.get_llvm_type(self._current_function_node.return_type)
+            if self._current_function_node.name == 'main' and isinstance(target_type, ir.VoidType):
+                target_type = ir.IntType(32)
+            ret_val = self._coerce_value(ret_val, target_type, getattr(node.value, 'type_name', None))
 
         # Unwind scopes: Drop everything in current function scopes (LIFO)
         for scope in reversed(self.scopes):
             self.emit_scope_drops(scope)
 
         if not self.builder.block.is_terminated:
-            if getattr(self._current_function_node, 'is_async', False):
+            if self._is_async_body:
                 # Set done = true and store result in manual state
                 for scope in reversed(self.scopes):
                     if '$async_state' in scope:
@@ -2486,6 +2466,8 @@ class CodeGen:
                         break
             elif ret_val:
                 self.builder.ret(ret_val)
+            elif self._current_function_node.name == 'main':
+                self.builder.ret(ir.Constant(ir.IntType(32), 0))
             else:
                 self.builder.ret_void()
 
@@ -2499,11 +2481,13 @@ class CodeGen:
                 arg_types.append(self.get_llvm_type(ptype))
         
         ret_type = ir.VoidType()
-        if getattr(node, 'is_async', False):
+        if getattr(node, 'is_async', False) and node.name != 'main':
             # Async functions return a coroutine handle (i8*)
             ret_type = ir.IntType(8).as_pointer()
         elif node.return_type != 'void':
             ret_type = self.get_llvm_type(node.return_type)
+        elif node.name == 'main':
+            ret_type = ir.IntType(32)
 
         # Add env pointer to lambda signatures
         if getattr(node, 'is_lambda', False):
@@ -2552,6 +2536,8 @@ class CodeGen:
 
         self._current_function_name = node.name
         self._current_function_node = node
+        self._drop_flags = {}
+        self._field_drop_flags = {}
         self._current_function_is_kernel = bool(node.is_kernel)
         self.current_lambda_node = getattr(node, 'lambda_node', None)
         if self.current_lambda_node:
@@ -2563,15 +2549,16 @@ class CodeGen:
         # Create new scope
         self.scopes.append({})
 
-        is_async = getattr(node, 'is_async', False)
+        is_async = getattr(node, 'is_async', False) and node.name != 'main'
+        self._is_async_body = is_async
         if is_async:
             # Manual Coroutine State
             res_ty = self.get_llvm_type(node.return_type)
             # struct { i1 done, T result }
-            state_ty = ir.LiteralStructType([ir.IntType(1), res_ty])
-            # Compute actual size for alloc: 1 byte (i1) + padding + result size
-            state_size = 8 + max(4, res_ty.width // 8 if hasattr(res_ty, 'width') else 8)
-            state_ptr = self.builder.call(self.malloc, [ir.Constant(ir.IntType(32), state_size)])
+            state_ty = ir.LiteralStructType([ir.IntType(1)] + ([] if node.return_type == 'void' else [res_ty]))
+            size_ptr = self.builder.gep(ir.Constant(state_ty.as_pointer(), None), [ir.Constant(ir.IntType(32), 1)])
+            state_size = self.builder.ptrtoint(size_ptr, ir.IntType(32))
+            state_ptr = self.builder.call(self.malloc, [state_size])
             state = self.builder.bitcast(state_ptr, state_ty.as_pointer())
             
             # Init state: done = false
@@ -2621,6 +2608,9 @@ class CodeGen:
 
                 # Store in scope: (Pointer, TypeName)
                 self.scopes[-1][pname] = (alloca, actual_ptype)
+                destructor_self = pname == 'self' and node.name.startswith(f'{ptype}_drop')
+                if not destructor_self:
+                    self._register_owned_slot(alloca, actual_ptype)
 
         # Process body
         for stmt in node.body:
@@ -2630,6 +2620,7 @@ class CodeGen:
 
         # Add return void/undef if missing
         if not self.builder.block.is_terminated:
+            self.emit_scope_drops(self.scopes[-1])
             # For async functions: set done=true and return state pointer
             if is_async and '$async_state' in self.scopes[-1]:
                 state = self.scopes[-1]['$async_state']

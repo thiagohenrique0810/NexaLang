@@ -28,7 +28,7 @@ fn main() -> i32 {
     
     print(prod); # Should be 30 + 80 = 110
     
-    if prod == 110 {
+    if (prod == 110) {
         return 0;
     } else {
         return 1;

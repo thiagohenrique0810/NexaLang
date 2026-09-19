@@ -18,9 +18,9 @@ use utils::*;
 
 fn main() {
     let a: Int = 10;
-    let p: MyPoint = Point { x: a, y: 20 };
+    let p: MyPoint = Point(a, 20);
     
-    let w: Wrapper = Wrapper { val: 3.14 };
+    let w: Wrapper = Wrapper(3.14);
     
     # Simple print calls for bootstrap
     print(a);

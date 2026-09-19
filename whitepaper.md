@@ -1,5 +1,7 @@
 # NexaLang: The Universal Systems Language
-**Technical Specification & Whitepaper v0.5**
+**Design Notes & Whitepaper v0.5 — Experimental Implementation**
+
+This document describes design goals, not a conformance or memory-safety guarantee. The active compiler is Python/LLVM. Self-hosting is experimental, and async currently uses eager task evaluation rather than suspendable LLVM coroutines. See [readme.md](readme.md) for verified behavior and limitations.
 
 ## 1. Introduction
 
@@ -56,7 +58,7 @@ fn process() {
 ## 4. Parallelism & GPU Computing
 
 ### 4.1 Async / Await
-Foundation for non-blocking IO and concurrency using the `async` and `await` keywords.
+The bootstrap accepts `async` and `await` with eager task evaluation. Non-blocking I/O and suspendable coroutine scheduling remain design goals.
 ```nexalang
 async fn fetch_data() -> String { ... }
 

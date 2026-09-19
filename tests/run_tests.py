@@ -1,5 +1,10 @@
 """Run all NexaLang bootstrap compiler tests."""
-import sys, os, time
+import sys, os, time, tempfile
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
+from build_runtime import build_runtime
+_RUNTIME_TEMP = tempfile.TemporaryDirectory(prefix="nexa-suite-runtime-")
+_RUNTIME_LIB = str(build_runtime("turboquant", _RUNTIME_TEMP.name))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bootstrap'))
 
 from lexer import Lexer
@@ -196,19 +201,12 @@ test("mir optimizer", test_mir_optimizer)
 # ── TurboQuant Runtime Test ──────────────────────────────────────────────
 
 def test_turboquant_lib_exists():
-    lib_path = os.path.join(os.path.dirname(__file__), '..', 'runtime', 'libturboquant.dylib')
-    if not os.path.exists(lib_path):
-        lib_path = os.path.join(os.path.dirname(__file__), '..', 'runtime', 'libturboquant.so')
-    assert os.path.exists(lib_path), "libturboquant not built"
+    assert os.path.exists(_RUNTIME_LIB), "libturboquant not built"
 
 def test_turboquant_ctypes():
     import ctypes
-    lib_dir = os.path.join(os.path.dirname(__file__), '..', 'runtime')
-    lib_path = os.path.join(lib_dir, 'libturboquant.dylib')
-    if not os.path.exists(lib_path):
-        lib_path = os.path.join(lib_dir, 'libturboquant.so')
-    lib = ctypes.CDLL(lib_path)
-    
+    lib = ctypes.CDLL(_RUNTIME_LIB)
+
     lib.tq_create.restype = ctypes.c_void_p
     lib.tq_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.tq_destroy.argtypes = [ctypes.c_void_p]
@@ -228,12 +226,8 @@ def test_turboquant_ctypes():
 
 def test_turboquant_roundtrip():
     import ctypes
-    lib_dir = os.path.join(os.path.dirname(__file__), '..', 'runtime')
-    lib_path = os.path.join(lib_dir, 'libturboquant.dylib')
-    if not os.path.exists(lib_path):
-        lib_path = os.path.join(lib_dir, 'libturboquant.so')
-    lib = ctypes.CDLL(lib_path)
-    
+    lib = ctypes.CDLL(_RUNTIME_LIB)
+
     lib.tq_create.restype = ctypes.c_void_p
     lib.tq_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.tq_destroy.argtypes = [ctypes.c_void_p]
@@ -296,13 +290,14 @@ def test_semantic_quantize_attr():
     assert getattr(fns[0], '_quantize_bits', None) == 2, f"Expected 2, got {getattr(fns[0], '_quantize_bits', None)}"
 
 def test_codegen_quantize_gpu_flag():
-    """CodeGen should accept quantize_gpu parameter."""
+    """Unsafe automatic GPU quantization must fail before code is generated."""
+    from codegen import CodeGen
     try:
-        from codegen import CodeGen
-    except ImportError:
-        return  # llvmlite not available, skip
-    cg = CodeGen(quantize_gpu=3)
-    assert cg.quantize_gpu == 3
+        CodeGen(quantize_gpu=3)
+    except ValueError as exc:
+        assert "Automatic GPU quantization is unavailable" in str(exc)
+    else:
+        raise AssertionError("Automatic GPU quantization must be rejected")
 
 print("\n=== QUANTIZE ATTRIBUTE TESTS ===")
 test("parse @[quantize(N)]", test_parse_quantize_attr)
@@ -1284,22 +1279,19 @@ print('OK')
 """], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
     assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()[-300:]}"
 
-def test_codegen_await_poll_loop():
-    """Codegen: await should create polling loop blocks."""
+def test_codegen_await_result():
+    """Await consumes the eager task and returns its actual result."""
     import subprocess
-    result = subprocess.run([sys.executable, '-c', """
-import sys, os; sys.path.insert(0, 'bootstrap')
-from lexer import Lexer; from n_parser import Parser; from semantic import SemanticAnalyzer; from codegen import CodeGen
-src = 'async fn fetch() -> i32 { return 42; }\\nasync fn main() -> i32 { let t = fetch(); let v = await t; return v; }'
-tokens = Lexer(src).tokenize(); ast = Parser(tokens).parse()
-sa = SemanticAnalyzer(); sa.analyze(ast)
-cg = CodeGen(); cg.generate(ast)
-ir_str = str(cg.module)
-assert 'await_cond' in ir_str, 'Await should create condition block'
-assert 'await_cont' in ir_str, 'Await should create continuation block'
-print('OK')
-"""], capture_output=True, text=True, cwd=os.path.dirname(__file__) + '/..')
-    assert result.returncode == 0, f"Codegen test failed: {result.stderr.strip()[-300:]}"
+    with tempfile.TemporaryDirectory(prefix="nexa-await-") as directory:
+        source = Path(directory) / 'await.nxl'
+        source.write_text('async fn fetch() -> i32 { return 42; }\n'
+                          'async fn main() -> i32 { let t = fetch(); return await t; }')
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / 'nx.py'),
+             'run', str(source), '--ll-out', str(Path(directory) / 'await.ll'),
+             '--exe', str(Path(directory) / ('await.exe' if os.name == 'nt' else 'await'))],
+            capture_output=True, text=True, timeout=60)
+        assert result.returncode == 42, result.stdout + result.stderr
 
 def test_runtime_nexa_async_exists():
     """Runtime: nexa_async.c should exist."""
@@ -1330,7 +1322,7 @@ test("semantic: await outside async errors", test_semantic_await_outside_async)
 test("semantic: async fn returns Task<T>", test_semantic_async_returns_task)
 test("codegen: async fn returns i8*", test_codegen_async_fn_returns_ptr)
 test("codegen: async state alloc", test_codegen_async_state_alloc)
-test("codegen: await poll loop", test_codegen_await_poll_loop)
+test("codegen: await returns task result", test_codegen_await_result)
 test("runtime: nexa_async.c exists", test_runtime_nexa_async_exists)
 test("std::task with Task/Executor", test_std_task_exists)
 test("std::future with Future trait", test_std_future_exists)

@@ -3,6 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 extern "C" {
+    fn usleep(usec: i32) -> i32;
     fn time(t: *i64) -> i64;
     fn localtime(t: *i64) -> *u8;
     fn gmtime(t: *i64) -> *u8;
@@ -170,6 +171,5 @@ pub fn timestamp() -> i64 {
 
 pub fn sleep_ms(ms: i32) {
     # usleep takes microseconds
-    extern "C" { fn usleep(usec: i32) -> i32; }
     usleep(ms * 1000);
 }

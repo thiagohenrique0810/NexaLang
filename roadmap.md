@@ -1,6 +1,28 @@
 # NexaLang Development Roadmap
 
-This document serves as the master checklist for the development of the NexaLang compiler and ecosystem.
+Historical feature checklist and current stabilization work. A checked item records an implementation milestone, not complete correctness or production readiness. The executable regression suite and example manifest are the current source of truth.
+
+## 512 MB model execution initiative
+
+The active plan, implementation gates, validation results, and resume checkpoint
+are maintained in [docs/BLUEPRINT_512MB_CHECKLIST.md](docs/BLUEPRINT_512MB_CHECKLIST.md).
+Read [the technical amendments](docs/BLUEPRINT_512MB_AJUSTES.md) alongside the original
+PDF. Native packed CPU kernels are the first milestone; full-model GPU execution,
+backends, compressed attention, and model training have separate completion gates.
+
+## Current stabilization status
+
+- [x] Reject compilation errors before linking or running stale artifacts; verify generated native LLVM IR.
+- [x] Regression coverage for signed arithmetic, coercions, scope, ownership transfers, and escaping local references.
+- [x] Package-name confinement, versioned local cache, lockfile resolution, and integrity checks.
+- [x] Packed quantization format with per-vector scale, checked sizes, and small-dimension sanitizer coverage.
+- [x] Toolchain-relative standard modules, symlink launchers, and host runtime builds from source.
+- [ ] Complete formal language and memory-safety specification, with control-flow lifetime proofs.
+- [ ] Reproducible self-hosting: stage 1 → stage 2 → stage 3 comparison in CI.
+- [ ] Suspendable async scheduling and non-blocking I/O.
+- [ ] GPU hardware validation across supported backends.
+- [ ] Resolve remaining experimental examples recorded in `tests/examples_manifest.json`.
+
 
 ## Phase 1: Bootstrap & Foundation 🏗️
 The goal is to create a minimal working compiler in a host language (e.g., Python, C++ or Rust) that can emit LLVM IR.
@@ -90,22 +112,22 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
     - [x] `Vec<T>` (Dynamic array).
     - [x] String manipulation.
     - [x] `unwrap`, `map`, `and_then` helpers for Option/Result.
-- [x] **Self-Hosting**
-    - [x] Rewrite the compiler using NexaLang itself.
+- [ ] **Self-Hosting**
+    - [ ] Rewrite the compiler using NexaLang itself.
       - [x] Stage 1: file IO (`fs::read_file`) + Buffer<u8> sample.
       - [x] Stage 2: minimal lexer in NexaLang (token counting).
     - [x] Stage 3: tokenize into a token stream data structure (Token {kind,start,len}).
     - [x] Stage 4: parser subset (parse `fn` blocks + count `let`/`return` and basic block structure).
-    - [x] Stage 5: self-hosted compiler stage 5 (handles `match`, `for`, `cast`, `sizeof`, `if`, `while`, `struct`, `call`, `member`).
-    - [x] Verify `nxc` can compile `nxc`.
-    - [x] Native binary `nxc.exe` generated.
+    - [ ] Stage 5: complete function signatures, module/type handling, and code generation in the prototype.
+    - [ ] Verify `nxc` can compile `nxc` reproducibly.
+    - [ ] Generate and verify native self-hosted binaries from the current sources.
 - [x] Tooling
     - [x] `nx` CLI build tool (bootstrap: `python nx.py ...` with optimization support).
     - [x] Syntax highlighter extension (VSCode) (complete with keywords, snippets and multi-line comments).
 
 ## Phase 6: Advanced Language Features 🎯
 
-### 6.1 Complete OOP Support ✅ COMPLETE
+### 6.1 Structs and Methods
 - [x] **Struct Methods - Foundation**
   - [x] Parse `impl Type { }` blocks
   - [x] Basic method declarations in codegen
@@ -217,7 +239,8 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
   - [x] Function pointers as arguments
 
 ## Phase 9: Future Directions 🚀
-- [x] Async/await (Full LLVM Coroutine transformation + Executor)
+- [x] Async/await syntax with eager task evaluation
+- [ ] Suspendable LLVM coroutine transformation and scheduler
 - [x] Procedural macros
     - [x] Macro call syntax (`ident!(...)`).
     - [x] Built-in macros: `include_str!`, `env!`, `file!`, `line!`, `panic!`, `assert!`.
@@ -228,5 +251,4 @@ The goal is to create a minimal working compiler in a host language (e.g., Pytho
 - [x] Networking Stack (FFI foundation for libcurl + Response handling)
 - [x] Data Serialization (Full JSON parser for Objects and Arrays)
 - [x] Database Drivers (SQLite abstraction in `std::db` with Query support)
-- [x] Vector Compression (TurboQuant near-optimal quantization in `std::compress`, 1-4 bit, C runtime + intrinsics)
-
+- [x] Vector Compression (TurboQuant-style quantization in `std::compress`, 1-4 bit, C runtime + intrinsics)
