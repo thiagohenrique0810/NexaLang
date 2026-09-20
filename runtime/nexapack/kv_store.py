@@ -207,6 +207,10 @@ class KVPageStore:
         self._directory = directory
         self._directory_fd = descriptor
         self._refs = {}
+        # One count per published file and one per session holding this store,
+        # so a derived sequence can read a page its parent already closed over.
+        self._ref_counts = {}
+        self._holders = 1
         self._pending_cleanup = {}
         self._closed = False
 
@@ -232,6 +236,26 @@ class KVPageStore:
                 or ref.path.parent != self.directory or self._refs.get(ref.path.name) is not ref):
             raise ValueError("KV page reference does not belong to this backing store")
         return ref.path.name
+
+    @property
+    def holders(self):
+        return self._holders
+
+    def references(self, ref):
+        """How many owners hold this page; zero once it is fully released."""
+        return self._ref_counts.get(ref.path.name, 0) if self.contains(ref) else 0
+
+    def open_shared(self):
+        """Take another hold on this store, for a sequence reading its pages."""
+        self._check_open()
+        self._holders += 1
+        return self
+
+    def retain(self, ref):
+        """Share one published page with another owner."""
+        name = self._validate_ref(ref)
+        self._ref_counts[name] += 1
+        return ref
 
     def contains(self, ref):
         """Whether this exact reference is still live; safe after interrupted removal."""
@@ -319,12 +343,14 @@ class KVPageStore:
             self._publish(temporary, name)
             published = True
             self._refs[name] = ref
+            self._ref_counts[name] = 1
             committed = True
             return ref
         finally:
             metadata = payload = None
             if not committed:
                 self._refs.pop(name, None)
+                self._ref_counts.pop(name, None)
                 if created:
                     self._pending_cleanup[temporary] = owned_inode
                     # A cancellation can arrive after rename but before its
@@ -391,19 +417,29 @@ class KVPageStore:
             header = metadata = expected = payload = tail = None
 
     def remove(self, ref):
+        """Drop one owner's hold; the file survives while others still hold it."""
         name = self._validate_ref(ref)
+        if self._ref_counts.get(name, 1) > 1:
+            self._ref_counts[name] -= 1
+            return
         try:
             self._unlink(name)
         except FileNotFoundError:
             pass
         del self._refs[name]
+        self._ref_counts.pop(name, None)
 
     def close(self):
+        """Release this hold; the last one removes the files and the directory."""
         if self._closed:
+            return
+        if self._holders > 1:
+            self._holders -= 1
             return
         failure = None
         for name in tuple(self._refs):
             try:
+                self._ref_counts.pop(name, None)
                 self._unlink(name)
             except FileNotFoundError:
                 pass

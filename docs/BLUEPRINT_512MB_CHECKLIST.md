@@ -269,6 +269,18 @@ erro 25 vezes menor que o Q4 na fixture. Prefill em chunks continua equivalente
 ao prefill único. Passaram **674 regressões + 110 testes bootstrap = 784
 testes**, sem falhas ou skips. Checklist: **45 concluídos e 105 pendentes**.
 
+**Vigésimo sexto incremento implementado e validado:** sequências derivadas sob
+backing store. Uma página cold é um arquivo, não um buffer, então a adoção toma
+mais um hold sobre o arquivo no store do pai, e a derivada guarda um hold sobre
+o próprio store. Com isso o pai pode fechar **primeiro** — seus arquivos
+sobrevivem enquanto a derivada os lê — e um prefill substituto ou reset no pai
+não toca no que a outra sequência continua lendo, porque `remove` decrementa e
+só apaga em zero. `copied_bytes` segue zero: o prefixo inteiro é compartilhado,
+inclusive a parte em disco. Um bug encontrado pelos testes: o `close` da
+derivada não devolvia os holds herdados, e o arquivo ficaria com contagem presa.
+Passaram **682 regressões + 110 testes bootstrap = 792 testes**, sem falhas ou
+skips. Checklist: **47 concluídos e 104 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -285,12 +297,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.06c — sequências derivadas sob backing store.** Restam
-M4.05d e M4.06c antes do gate M4. Páginas cold são arquivos de um store privado
-que os remove ao fechar; compartilhá-las entre sequências exige propriedade por
-referência sobre os arquivos, ou cópia explícita na adoção. Alternativas em
-aberto: M6.01d (conjunto representativo e calibração por grupo) e M5.01 com
-modelo real.
+**Próxima tarefa: M4.05d — promoção de precisão e critérios de qualidade.**
+É o que resta de M4 junto de M4.06d. Continua dependendo de qualidade medida em
+checkpoint treinado (LLM.04b) e da calibração de M6.01 para definir importância
+por página; o que dá para fazer antes é o contrato de transição e a comparação
+contra idade uniforme na fixture. Alternativas em aberto: M4.06d (cancelamento e
+admissão conjunta), M6.01d (conjunto representativo) e M5.01 com modelo real.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -718,9 +730,12 @@ transferidos e limite máximo documentados.
 - [x] M4.06b Sequências derivadas sob a política de idade: descritores herdados,
   migração privada sobre páginas compartilhadas, identidade de layout incluindo
   política e group_size, e relatórios de residência compartilhada/própria.
-- [ ] M4.06c Sequências derivadas sob backing store, cancelamento de uma chamada
-  em andamento, limites e admissão conjunta por processo, e reuso de prefixo
-  entre sessões que não derivam uma da outra.
+- [x] M4.06c Sequências derivadas sob backing store: arquivos cold com
+  propriedade por referência, store com múltiplos donos, qualquer ordem de
+  fechamento e retirada que respeita os demais leitores.
+- [ ] M4.06d Cancelamento de uma chamada em andamento, limites e admissão
+  conjunta por processo, e reuso de prefixo entre sessões que não derivam uma
+  da outra.
 
 **Gate M4:** melhoria de bytes/token comprovada no cache usado pela atenção,
 com qualidade, latência e temporários contabilizados.
@@ -1609,6 +1624,35 @@ Décimo primeiro incremento:
   que descreviam o default antigo.
 - Checklist: **46 concluídos e 104 pendentes**.
 
+## Registro do vigésimo sexto incremento — sequências sobre backing store
+
+- Concluído M4.06c: `KVPageStore` conta donos por arquivo e por store.
+  `retain` compartilha uma página publicada, `open_shared` dá outro hold no
+  store, `remove` decrementa e só apaga em zero, e `close` só limpa quando o
+  último dono sai.
+- `OffloadedTieredTransformerSession` aceita `fork`: a derivada lê as páginas
+  herdadas pelo store do pai — cada `_OffloadedPage` carrega seu store — e
+  escreve as próprias no seu. A fila de aposentadas passou a guardar o par
+  store/referência, para remover no lugar certo.
+- Ordem de fechamento é livre. O pai pode fechar primeiro e a derivada continua
+  lendo; prefill substituto e reset do pai não tocam no que a outra lê.
+- Bug encontrado pelos testes: `close` da derivada não devolvia os holds
+  herdados, deixando a contagem presa e o arquivo sem dono aparente. `close`
+  agora libera cada página viva, tolerando falha de remoção.
+- Relatórios: `kv_shared_backing_pages` conta páginas compartilhadas que vivem
+  em disco (zero byte residente) e `kv_inherited_stores` diz de quantos stores
+  alheios a sequência lê. `--fork-tokens` passou a aceitar `--kv-backing-store`.
+- Fora do escopo, declarado: cancelar uma chamada **em andamento** exige
+  executá-la fora da thread que cancela; existe rollback de falhas e
+  interrupções, não cancelamento assíncrono. Admissão conjunta por processo
+  também não existe — cada sessão admite o próprio orçamento. Ambos em M4.06d.
+- Validação macOS ARM64/Python 3.14.5: **682 regressões + 110 bootstrap = 792
+  testes, zero falhas e zero skips**. Os 8 novos cobrem leitura das páginas do
+  pai, ordem de fechamento nos dois sentidos, retirada e reset preservando o
+  outro leitor, orçamento por sessão, falha de escrita na derivada e a CLI.
+- Guia: [sequências derivadas](NEXALM_KV_SEQUENCIAS_CPU.md). Checklist:
+  **47 concluídos e 104 pendentes**.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1661,6 +1705,10 @@ python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q8 --matrix-codec q8 --group-size 4 --block-rows 3
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
+
+# Sequência derivada sobre backing store, com arquivos compartilhados.
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-page-tokens 1 --kv-policy age --kv-group-size 3 --kv-backing-store artifacts/kv-store/fork --fork-tokens 2,4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB
+python3 -m unittest discover -s tests -p 'test_offloaded_sequences_regressions.py' -v
 
 # Caminho padrão (KV paginado), baseline e cache de dois bancos.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB
@@ -1908,6 +1956,15 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo sexto incremento acrescenta:
+
+- `runtime/nexapack/kv_store.py`: contagem de donos por arquivo e por store,
+  `retain`, `open_shared` e `references`.
+- `runtime/nexapack/offloaded.py`: `fork` com stores herdados, páginas que
+  carregam seu store, fila de aposentadas por store e liberação no close.
+- `tools/nexa_run.py`: `--fork-tokens` com backing store.
+- `tests/test_offloaded_sequences_regressions.py`.
 
 Vigésimo quinto incremento acrescenta:
 

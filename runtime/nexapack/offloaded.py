@@ -25,9 +25,17 @@ class _OffloadedPage:
     address = 0
     arena = None
     allocation_bytes = 0
+    shared = False
 
-    def __init__(self, ref, layout):
+    def __init__(self, ref, layout, store):
         self.ref, self.layout, self.codec = ref, layout, layout.codec
+        self.store = store
+
+    def retain(self):
+        """Share the published file with another sequence, not a buffer."""
+        self.store.retain(self.ref)
+        self.shared = True
+        return self
 
     def release(self):
         # File ownership belongs to the store, never to borrowed page handles.
@@ -49,6 +57,7 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         self._store = None
         self._retired_refs = []
         self._backing_io = self._reload_baseline = None
+        self._inherited_stores = []
         super().__init__(bundle_path, **kwargs)
 
     @property
@@ -81,10 +90,21 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         return graph, self._plan_workspace(length, requests, end, attention_length=2 * heads,
                                            extra_reserve=reserve)
 
-    def fork(self, **overrides):
-        # Cold pages are files owned by one session's private store, which
-        # removes them on close; sharing them needs its own ownership contract.
-        raise ValueError("A backing store does not support derived sequences yet; run without --kv-backing-store")
+    def _fork_options(self):
+        options = super()._fork_options()
+        options.update({"kv_backing_store": self._backing_parent, "kv_reload_slots": self._reload_slots})
+        return options
+
+    def _adopt_state(self, parent):
+        super()._adopt_state(parent)
+        if parent is None:
+            for store in self._inherited_stores:
+                store.close()
+            self._inherited_stores = []
+            return
+        # Cold pages stay in the parent's store, which now has a second holder:
+        # its files outlive the parent's close while this sequence reads them.
+        self._inherited_stores = [parent._store.open_shared()] if parent._store is not None else []
 
     def _ensure_store(self):
         if self._store is None:
@@ -94,7 +114,7 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         """Verified read of this page into a slot the cache owns and selects."""
         def load(address):
             tick = time.perf_counter()
-            count = self._store.read_page(page.ref, address, page.layout.page_extent_bytes)
+            count = page.store.read_page(page.ref, address, page.layout.page_extent_bytes)
             self._backing_io["read_seconds"] += time.perf_counter() - tick
             self._backing_io["bytes_read"] += count
             self._backing_io["reloads"] += 1
@@ -185,6 +205,8 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         # Slots outlive the call, so residency is the larger of what this
         # transition may occupy and what earlier calls already allocated.
         cache = self._reload_cache
+        live = self._pending_pages if self._pending_pages is not None else self._pages
+        shared = [page for page in live if getattr(page, "shared", False)]
         reload_bytes = max(physical["reload_slot_bytes"], cache.allocated_bytes if cache else 0)
         attention_peak = workspace + physical["attention_pages_bytes"] + reload_bytes
         if physical["reload_slot_bytes"]:
@@ -209,6 +231,13 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
                        "kv_page_table_bytes": 0, "attention_score_scratch_bytes": 0,
                        "kv_streaming_scratch_bytes": plan.allocations["__attention"].size_bytes +
                                                      plan.allocations["__stream_sums"].size_bytes,
+                       # A shared cold page costs no resident bytes: what two
+                       # sequences share is the published file, not a buffer.
+                       "kv_shared_page_count": len(shared),
+                       "kv_shared_allocation_bytes": sum(page.allocation_bytes for page in shared),
+                       "kv_owned_allocation_bytes": resident - sum(page.allocation_bytes for page in shared),
+                       "kv_shared_backing_pages": sum(isinstance(page, _OffloadedPage) for page in shared),
+                       "kv_inherited_stores": len(self._inherited_stores),
                        "kv_reload_slot_bytes": physical["reload_slot_bytes"],
                        "kv_reload_slot_capacity_bytes": self._offload_plan.reload_slot_bytes,
                        "kv_reload_slots": self._offload_plan.reload_slots,
@@ -244,7 +273,7 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
             self._backing_io["write_seconds"] += time.perf_counter() - tick
             self._backing_io["bytes_written"] += ref.file_bytes
             self._backing_io["evictions"] += 1
-            final_pages[index] = _OffloadedPage(ref, page.layout)
+            final_pages[index] = _OffloadedPage(ref, page.layout, self._store)
 
     def _finalize_report(self, report, candidate, chunk, transition, migration, migration_seconds):
         report = super()._finalize_report(report, candidate, chunk, transition, migration, migration_seconds)
@@ -270,11 +299,11 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         # propagates; after publication it only postpones garbage collection.
         for index in range(len(self._retired_refs) - 1, -1, -1):
             try:
-                ref = self._retired_refs[index]
+                store, ref = self._retired_refs[index]
                 # Removal can have completed immediately before an interrupt.
                 # Reconcile the queue with the store's ownership before retry.
-                if self._store.contains(ref):
-                    self._store.remove(ref)
+                if store.contains(ref):
+                    store.remove(ref)
             except OSError:
                 continue
             except BaseException:
@@ -331,7 +360,8 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
             report["timing"]["kv_eviction_wall_seconds"] = persistence_elapsed
             report["timing"]["execution_wall_seconds"] += persistence_elapsed
             retained = {id(page) for page in final_pages}
-            retired = self._retired_refs + [p.ref for p in old_pages if isinstance(p, _OffloadedPage) and id(p) not in retained]
+            retired = self._retired_refs + [(p.store, p.ref) for p in old_pages
+                                            if isinstance(p, _OffloadedPage) and id(p) not in retained]
             self._tokens, self._last_report, self._pages, self._page_descriptors, self._retired_refs = (
                 candidate, report, final_pages, transition.final_pages, retired)
             committed = True
@@ -354,7 +384,7 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
                 self._reload_cache.clear()
                 for page in staged:
                     page.release()
-                self._retired_refs.extend(staged_refs)
+                self._retired_refs.extend((self._store, ref) for ref in staged_refs)
             self._collect_retired(best_effort=True)
         return output
 
@@ -373,20 +403,39 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
             self._page_descriptors = descriptors
         report.update({"context_length": 0, "cache_length": 0, "cache_position_offset": 0})
         report["memory"]["kv_valid_prefix_f32_bytes"] = 0
-        retired = self._retired_refs + [p.ref for p in self._pages if isinstance(p, _OffloadedPage)]
+        retired = self._retired_refs + [(p.store, p.ref) for p in self._pages
+                                        if isinstance(p, _OffloadedPage)]
         old = self._pages
         self._tokens, self._last_report, self._pages, self._page_descriptors, self._retired_refs = (), report, [], (), retired
         for page in old:
             page.release()
         self._collect_retired(best_effort=True)
 
+    def _release_files(self, pages):
+        """Give back one hold per live page; a shared file may outlive us."""
+        for page in pages:
+            if not isinstance(page, _OffloadedPage) or page.store is None:
+                continue
+            try:
+                if page.store.contains(page.ref):
+                    page.store.remove(page.ref)
+            except OSError:
+                # Cleanup failure must not turn close into a lost handle; the
+                # owning store still removes what it can on its own close.
+                continue
+
     def close(self):
+        pages = list(self._pages)
         try:
             super().close()
         finally:
+            self._release_files(pages)
             if self._reload_cache is not None:
                 self._reload_cache.clear()
             if self._store is not None:
                 self._store.close()
                 self._store = None
                 self._retired_refs.clear()
+            for store in self._inherited_stores:
+                store.close()
+            self._inherited_stores = []

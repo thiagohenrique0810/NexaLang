@@ -228,25 +228,26 @@ class PagedSequenceRegressions(_PagedFixture):
         unpaged = [*common, "--recompute"]
         offloaded = [*common, "--kv-cache", "--kv-page-tokens", "2", "--kv-policy", "age",
                      "--kv-group-size", "4", "--kv-backing-store", str(self.directory / "cli-store")]
-        for invalid, message in ((unpaged, "--recompute keeps no cache"),
-                                 (offloaded, "--fork-tokens needs the paged cache")):
-            rejected = subprocess.run(invalid, capture_output=True, text=True, timeout=120)
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn(message, rejected.stderr)
-            self.assertNotIn("Traceback", rejected.stderr)
+        rejected = subprocess.run(unpaged, capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("--recompute keeps no cache", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        # A backing store used to reject fork; it now shares its files.
+        accepted = subprocess.run(offloaded, capture_output=True, text=True, timeout=120)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout)["derived_sequence"]["token_ids"],
+                         [1, 3, 5, 7, 2, 4])
 
-    def test_a_backing_store_rejects_derived_sequences(self):
+    def test_a_backing_store_shares_its_cold_files_with_a_derived_sequence(self):
         from runtime.nexapack.offloaded import OffloadedTieredTransformerSession
         with OffloadedTieredTransformerSession(self.path, kv_backing_store=self.directory / "store",
                                                memory_budget="1MiB", max_sequence_length=8,
                                                page_tokens=1, kv_group_size=4) as session:
             session.prefill([1, 3, 5])
-            with self.assertRaises(ValueError) as failure:
-                session.fork()
-            # Cold files belong to one private store that deletes them on close.
-            self.assertIn("derived sequences", str(failure.exception))
-            self.assertEqual(session.token_ids, (1, 3, 5))
-            session.decode(7)
+            child = session.fork()
+            self.addCleanup(child.close)
+            self.assertEqual(child.token_ids, (1, 3, 5))
+            self.assertEqual(child.decode(7), session.decode(7))
 
 
 if __name__ == "__main__":

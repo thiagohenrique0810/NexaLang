@@ -6,9 +6,8 @@ O décimo quarto incremento acrescenta `fork()` ao executor paginado homogêneo
 recomputá-lo e sem copiar suas páginas completas. O décimo quinto estende isso
 à política de idade (`--kv-policy age`), com migração privada.
 
-O backing store continua recusando `fork` explicitamente: páginas cold são
-arquivos de um store privado que os remove ao fechar, e compartilhá-los exige
-um contrato de propriedade próprio. Esse caso ficou em M4.06c.
+O vigésimo sexto estende ao backing store: páginas cold são arquivos, e duas
+sequências passam a **compartilhar o arquivo** em vez de copiá-lo.
 
 ## Por que o compartilhamento é seguro
 
@@ -46,6 +45,22 @@ como uma página Q4/Q3 herdada é lida. O contexto herdado precisa
 caber na capacidade da sequência derivada. Uma falha durante a adoção devolve as
 referências retidas, libera as cópias e deixa o pai intacto.
 
+## Backing store: o arquivo é que é compartilhado
+
+Sob `--kv-backing-store`, uma página cold não ocupa RAM — ela é um arquivo
+publicado. A adoção então não retém um buffer, e sim toma **mais um hold** sobre
+o arquivo no store do pai, e a sequência derivada guarda um hold sobre o próprio
+store. Daí as duas propriedades que importam:
+
+- O pai pode fechar **primeiro**. Seus arquivos sobrevivem enquanto a derivada
+  os lê, e o último dono é quem remove o arquivo e o diretório.
+- Um `prefill` substituto ou um `reset` no pai aposenta as páginas dele sem
+  tocar no que a derivada ainda lê: `remove` decrementa, e só apaga em zero.
+
+Cada sequência escreve suas próprias páginas novas no seu próprio store, então
+nada é escrito no store de outra. `copied_bytes` permanece zero na adoção: o
+prefixo inteiro é compartilhado, inclusive a parte em disco.
+
 ## Custo, orçamento e relatórios
 
 A derivada é uma sessão completa: admite o próprio orçamento antes de reter ou
@@ -55,7 +70,10 @@ para cada sequência.
 
 O relatório separa `kv_shared_page_count`, `kv_shared_allocation_bytes` e
 `kv_owned_allocation_bytes`; a soma dos dois últimos é a residência da
-sequência. Logo após a adoção, `kv_prefix_adoption` informa tokens herdados,
+sequência. Sob backing store, `kv_shared_backing_pages` conta as páginas
+compartilhadas que vivem em disco — elas aparecem em `kv_shared_page_count` com
+zero byte residente — e `kv_inherited_stores` diz de quantos stores de outra
+sequência esta lê. Logo após a adoção, `kv_prefix_adoption` informa tokens herdados,
 páginas compartilhadas, páginas copiadas e bytes copiados. Bytes compartilhados
 aparecem no relatório de cada sequência, mas existem uma vez no processo: somar
 sequências conta a mesma página mais de uma vez.
@@ -123,8 +141,10 @@ python3 -m unittest discover -s tests -p 'test_tiered_sequences_regressions.py' 
 
 ## Limites
 
-Backing store, cancelamento assíncrono de uma chamada em andamento e admissão
-conjunta por processo permanecem em M4.06c.
+Cancelamento assíncrono de uma chamada em andamento e admissão conjunta por
+processo permanecem em M4.06d. Cancelar uma chamada em curso exige executá-la
+fora da thread que cancela, o que esta sessão síncrona não faz; o que existe é
+rollback de falhas e de interrupções.
 
 Uma sessão continua **uma sequência**, síncrona, sem uso concorrente; várias
 sequências são várias sessões que compartilham páginas, cada uma com sua arena e

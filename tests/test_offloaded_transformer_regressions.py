@@ -40,8 +40,10 @@ class _OffloadFixture(_TierFixture):
         extent = page.layout.page_extent_bytes
         if hasattr(page, "ref"):
             # Diagnostic storage belongs to the test, not the execution budget.
+            # A derived sequence reads its inherited pages from the parent store.
             destination = (ctypes.c_uint8 * extent)()
-            count = session._store.read_page(page.ref, ctypes.addressof(destination), extent)
+            store = getattr(page, "store", None) or session._store
+            count = store.read_page(page.ref, ctypes.addressof(destination), extent)
             if count != page.ref.file_bytes:
                 raise AssertionError("store read byte count differs from its immutable reference")
             return bytes(destination)

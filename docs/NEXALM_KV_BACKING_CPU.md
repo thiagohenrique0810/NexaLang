@@ -41,7 +41,9 @@ Prefetch e promoção de precisão continuam pendentes. Os kernels não alocam h
 ## Arquivos e integridade
 
 `KVPageStore` cria `nexa-kv-*` dentro do diretório escolhido. Sessões compartilham
-o diretório pai, mas possuem subdiretórios e referências exclusivos. Apenas arquivos
+o diretório pai, mas possuem subdiretórios e referências exclusivos — com uma
+exceção explícita: uma [sequência derivada](NEXALM_KV_SEQUENCIAS_CPU.md) toma um
+hold sobre os arquivos do pai e sobre o store, e o último dono é quem remove. Apenas arquivos
 criados pela própria instância são removidos. Reset elimina referências antigas;
 close remove os arquivos próprios e o subdiretório se estiver vazio. Arquivos
 alheios e o diretório pai são preservados.

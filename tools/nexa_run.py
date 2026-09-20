@@ -118,9 +118,8 @@ def main(argv=None):
         parser.error("--prompt requires --tokenizer, and --tokenizer is only used with --prompt")
     if args.bos and args.prompt is None:
         parser.error("--bos requires --prompt")
-    if args.fork_tokens is not None and (args.recompute or args.kv_two_banks
-                                         or args.kv_backing_store is not None):
-        parser.error("--fork-tokens needs the paged cache and no --kv-backing-store")
+    if args.fork_tokens is not None and (args.recompute or args.kv_two_banks):
+        parser.error("--fork-tokens needs the paged cache; drop --recompute/--kv-two-banks")
     if (args.kv_bits is not None or args.kv_seed is not None) and args.kv_codec != "tq":
         parser.error("--kv-bits/--kv-seed require --kv-codec tq")
     if args.kv_bits is not None and not 1 <= args.kv_bits <= 8:
