@@ -21,6 +21,12 @@ import threading
 from compiler.model_ir import _integer
 
 
+# Constante de módulo, como `tiered_kv_plan.POLICY_ID` e
+# `offloaded_kv_plan.RELOAD_POLICY_ID`: um policy_id escrito inline não é
+# visto pelo registro de ADRs e pode ser renomeado sem quebrar nada.
+POLICY_ID = "PROCESS_JOINT_ADMISSION_UPPER_BOUND_V1"
+
+
 class PoolAdmissionError(MemoryError):
     """A session did not fit the ceiling shared with the sessions already open."""
 
@@ -111,5 +117,5 @@ class SessionMemoryPool:
 
     def to_dict(self):
         counters = self.counters
-        return {"schema_version": 1, "policy_id": "PROCESS_JOINT_ADMISSION_UPPER_BOUND_V1",
+        return {"schema_version": 1, "policy_id": POLICY_ID,
                 "scope": "declared per-session upper bound, not measured residence", **counters}

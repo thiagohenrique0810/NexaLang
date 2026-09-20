@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from typing import Iterable
 
 MAGIC = b'NEXAPACK'
+# Nome do formato no índice. Constante de módulo, e não literal repetido,
+# para que o registro de ADRs o enxergue: um contrato que a bijeção não vê
+# pode ser renomeado sem que nada falhe.
+FORMAT = 'NexaPack'
 FORMAT_VERSION = 1
 CODEC_ID = 'Q4_GROUPED'
 CODEC_VERSION = 1
@@ -506,7 +510,7 @@ def _new_metadata(rows, cols, group_size, block_rows, codec=CODEC_ID):
         for start in range(0, rows, block_rows)
     ]
     metadata = {
-        'format': 'NexaPack', 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
+        'format': FORMAT, 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
         'logical_dtype': 'f32', 'storage_dtype': _GROUPED_CODECS[codec], 'codec_id': codec,
         'codec_version': CODEC_VERSION, 'group_size': group_size,
         'endianness': 'little', 'checksum': 'sha256', 'row_bytes': row_bytes,
@@ -542,7 +546,7 @@ def _new_mixed_metadata(rows, cols, group_size, block_rows, block_codecs):
         for start, codec, width in zip(starts, codecs, widths)
     ]
     metadata = {
-        'format': 'NexaPack', 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
+        'format': FORMAT, 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
         'logical_dtype': 'f32', 'storage_dtype': 'mixed', 'codec_id': MIXED_CODEC_ID,
         'codec_version': MIXED_CODEC_VERSION, 'group_size': group_size,
         'endianness': 'little', 'checksum': 'sha256',
@@ -661,7 +665,7 @@ def _new_tq_metadata(rows, cols, bits, seed, codebook_f32le, block_rows):
         for start in range(0, rows, block_rows)
     ]
     metadata = {
-        'format': 'NexaPack', 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
+        'format': FORMAT, 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
         'logical_dtype': 'f32', 'storage_dtype': 'tq_mse', 'codec_id': TQ_CODEC_ID,
         'codec_version': TQ_CODEC_VERSION, 'bits': bits, 'seed': seed,
         'transform_id': TQ_TRANSFORM_ID, 'codebook_f32le': codebook_f32le,
@@ -885,7 +889,7 @@ class NexaPackReader:
             raise NexaPackError('Unsupported metadata codec_id')
         if set(metadata) != keys:
             raise NexaPackError('Unexpected NexaPack metadata fields')
-        expected = {'format': 'NexaPack', 'format_version': FORMAT_VERSION,
+        expected = {'format': FORMAT, 'format_version': FORMAT_VERSION,
                     'logical_dtype': 'f32', 'storage_dtype': storage_dtype, 'codec_id': codec,
                     'codec_version': _CODEC_VERSIONS[codec],
                     'endianness': 'little', 'checksum': 'sha256'}

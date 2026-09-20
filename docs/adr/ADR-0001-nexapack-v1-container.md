@@ -5,6 +5,8 @@ status: accepted
 identifiers:
   - name: runtime.nexapack.format:MAGIC
     value: b'NEXAPACK'
+  - name: runtime.nexapack.format:FORMAT
+    value: 'NexaPack'
   - name: runtime.nexapack.format:FORMAT_VERSION
     value: 1
   - name: runtime.nexapack:FORMAT_VERSION

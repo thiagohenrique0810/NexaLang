@@ -129,6 +129,38 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo quarto incremento — bloco paralelo, onda 5: ADRs verificados.**
+**999 testes** (965 + 34), zero falhas, zero skips. Doze ADRs, e a prova que os
+separa de doze arquivos Markdown: uma **bijeção com o código como oráculo**. Um
+`pkgutil.walk` sobre `compiler` e `runtime.nexapack` colhe todo identificador de
+contrato e exige que cada um seja reivindicado por exatamente um ADR. Eram 48 na
+árvore anterior; as cinco ondas levaram a 62, e as correções abaixo a **64**.
+
+**A distinção que dá valor ao registro:** 76 blocos de medição, **63 recalculados**
+do código pelo teste e **13 citados** de registros de incremento — todos os
+números de parede e de fixture inteira. Um teste fixa o conjunto citado por nome,
+então converter silenciosamente um número recalculado em citado falha.
+
+**O registro de ADRs achou três coisas que o código e este checklist erravam:**
+
+1. `PROCESS_JOINT_ADMISSION_UPPER_BOUND_V1` era **literal inline** dentro de
+   `SessionMemoryPool.to_dict()`, não constante de módulo como nos irmãos
+   `tiered_kv_plan` e `offloaded_kv_plan`. O censo não o via, então **renomeá-lo
+   não quebrava nada**. Promovido a `admission:POLICY_ID`.
+2. `format.py` escrevia `'format': 'NexaPack'` inline em quatro lugares, enquanto
+   `container.py` e `bundle.py` definiam `FORMAT` no módulo. Promovido a
+   `format:FORMAT`. Os dois entraram na bijeção, que **falhou apontando-os pelo
+   nome** antes de os ADRs os reivindicarem — a prova de que ela funciona.
+3. O Δ índice de 512 blocos registrado acima estava impreciso: dizia "metade dos
+   blocos" sem dizer qual. Corrigido nesta revisão.
+
+A defesa contra tautologia não é hipotética. Durante a investigação, um
+`numbers.py` perdido num scratchpad sombreou a stdlib, três módulos sumiram em
+silêncio e o censo voltou 53 em vez de 62 — perdendo exatamente os `policy_id`
+que as ondas tinham acrescentado. Por isso o extrator **levanta erro** em vez de
+pular um módulo que não importa: um extrator que engole esse erro é a tautologia
+inteira.
+
 **Trigésimo terceiro incremento — bloco paralelo, onda 4b: codecs mistos.**
 **965 testes** (945 + 20), zero falhas, zero skips. O contêiner passou a poder
 carregar um codec por bloco de linhas, e os quatro arquivos homogêneos saem
@@ -154,8 +186,13 @@ só o número de blocos varia, para que nenhum ganho venha da escolha de codec):
 | ---: | ---: | ---: | --- |
 | 64 | +2.487 | −8.192 | paga |
 | 256 | +9.847 | 0 | empata |
-| 512 | +20.215 | +12.288 | **perde** |
+| 512 | +20.133 a +20.215 | +12.288 | **perde** |
 | 1.024 | +39.927 | +32.768 | **perde 4× o que economizou** |
+
+O Δ índice em 512 blocos depende de **quais** blocos são rebaixados, e o registro
+original dizia "metade" sem dizer qual: metade contígua dá +20.133, alternada dá
++20.184. A correção veio do ADR-0007, cuja fixture é totalmente especificada — foi
+o registro de ADRs que apontou a imprecisão deste registro.
 
 Regra de break-even medida: um bloco só paga o próprio índice se o rebaixamento
 economizar mais de ~35 bytes — 17 linhas por bloco com 8 colunas, 3 com 64, uma
@@ -1128,7 +1165,16 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
 
 ## M9 — documentação, manutenção e referências
 
-- [ ] M9.01 ADRs por contrato/layout/algoritmo, justificativas e medições próprias.
+- [x] M9.01a ADRs com **registro verificado por máquina**: doze ADRs cobrindo os
+  contratos de armazenamento, precisão, KV, plasticidade e admissão, e uma
+  bijeção entre os **64 identificadores de contrato** que um `pkgutil.walk` acha
+  em `compiler`/`runtime.nexapack` e o que os ADRs reivindicam — cada um por
+  exatamente um. 63 medições **recalculadas** do código pelo teste e 13
+  **citadas** de registros, com a distinção fixada por teste próprio.
+- [ ] M9.01b Estender o censo a `bootstrap/` e aos cabeçalhos C: `qint<N>`,
+  `PackedVector<N>` e os contratos em `q4.h`/`turboquant.h` estão documentados
+  mas **fora da bijeção**. ADRs dos algoritmos (atenção GQA, RoPE, migração de
+  tiers) e dos números de parede, que hoje só podem ser citados.
 - [ ] M9.02 Conferir bibliografia P01–P31 e listas Conditional Compute/Plastic Learning;
   separar inventor, requerente e família, sem tomar alegações dos PDFs como verificação externa.
 - [ ] M9.03 Revisão das features ativadas antes de release comercial, conforme PDF §14.

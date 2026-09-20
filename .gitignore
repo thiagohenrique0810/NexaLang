@@ -58,3 +58,9 @@ __pycache__/
 
 # Worktrees temporários de agentes paralelos
 .claude/worktrees/
+
+# Pesos, checkpoints e bundles: estrutura versionada, binários não
+weights/**
+!weights/README.md
+!weights/*/
+!weights/**/.gitkeep

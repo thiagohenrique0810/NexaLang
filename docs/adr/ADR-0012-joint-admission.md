@@ -2,7 +2,9 @@
 adr: ADR-0012
 title: Admissão conjunta de memória — o teto é do processo, não da sessão
 status: accepted
-identifiers: []
+identifiers:
+  - name: runtime.nexapack.admission:POLICY_ID
+    value: 'PROCESS_JOINT_ADMISSION_UPPER_BOUND_V1'
 prior_art: []
 ---
 
