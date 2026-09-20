@@ -225,6 +225,8 @@ def main(argv=None):
                              "and calibration format: it costs eight times the packed form")
     parser.add_argument("--dense-all", action="store_true",
                         help="Store every matrix as RAW_F32; requires --checkpoint")
+    parser.add_argument("--precision-map", type=Path,
+                        help="Apply a planned per-tensor codec map; requires --checkpoint")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--rows", type=int)
     parser.add_argument("--cols", type=int)
@@ -242,10 +244,10 @@ def main(argv=None):
         parser.error("Supply either a float32 input or --checkpoint")
     if args.input is not None and (args.rows is None or args.cols is None):
         parser.error("Float32 input requires --rows and --cols")
-    if (args.dense_tensors or args.dense_all) and args.checkpoint is None:
-        parser.error("--dense-tensor/--dense-all require --checkpoint")
-    if args.dense_tensors and args.dense_all:
-        parser.error("pass either --dense-all or specific --dense-tensor names")
+    if (args.dense_tensors or args.dense_all or args.precision_map) and args.checkpoint is None:
+        parser.error("--dense-tensor/--dense-all/--precision-map require --checkpoint")
+    if sum(bool(value) for value in (args.dense_tensors, args.dense_all, args.precision_map)) > 1:
+        parser.error("pass only one of --dense-all, --dense-tensor or --precision-map")
     if args.checkpoint is not None and (args.rows is not None or args.cols is not None):
         parser.error("--checkpoint gets shapes from the architecture; do not pass --rows/--cols")
     tq_options = any(value is not None for value in
@@ -266,7 +268,11 @@ def main(argv=None):
         if args.checkpoint is not None:
             from compiler.importers.llama import import_llama_checkpoint
             codecs = None
-            if args.dense_all or args.dense_tensors:
+            if args.precision_map is not None:
+                from compiler.precision_map import PrecisionMap
+                precision = PrecisionMap.from_json(args.precision_map.read_text(encoding="utf-8"))
+                codecs = dict(precision.codecs)
+            elif args.dense_all or args.dense_tensors:
                 from compiler.model_config import ModelConfig
                 from compiler.importers.safetensors import read_json, safe_child
                 shapes = ModelConfig.from_hf_config(

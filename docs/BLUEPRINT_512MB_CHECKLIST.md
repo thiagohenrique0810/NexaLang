@@ -193,6 +193,18 @@ errada. `quality_measured` permanece falso: são proxies sobre pesos sintéticos
 não perplexidade. Passaram **606 regressões + 110 testes bootstrap = 716
 testes**, sem falhas ou skips. Checklist: **37 concluídos e 107 pendentes**.
 
+**Décimo nono incremento implementado e validado:** PrecisionMap versionado e
+seleção de codec por tensor sob teto de bytes. A seleção parte de tudo
+empacotado e gasta o orçamento restante promovendo a denso quem tem maior
+sensibilidade medida por byte extra; empates resolvem pelo nome, então o mesmo
+relatório sempre produz o mesmo mapa. O mapa carrega a proveniência da decisão —
+checkpoint, tokens de calibração, baseline, bytes planejados, sobra e cada
+promoção — e `nexa_convert --precision-map` o aplica. Limites declarados:
+a soma de sensibilidades individuais não é a qualidade do conjunto, porque erros
+não se somam, e a seleção é gulosa sobre uma razão, não ótima; `quality_measured`
+continua falso. Passaram **618 regressões + 110 testes bootstrap = 728 testes**,
+sem falhas ou skips. Checklist: **38 concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -209,12 +221,11 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M6.02 — PrecisionMap por tensor sob orçamento.** A calibração
-já produz `cost_per_saved_kib`, que é a ordenação que a seleção precisa: dado um
-teto de bytes, escolher o codec de cada tensor maximizando qualidade estimada,
-gravar o mapa no manifesto e permitir converter por ele. Hoje só há dois codecs
-de peso (Q4 e denso); Q2/Q3/Q8/F16 entram em M1.05b e ampliam o espaço de
-escolha sem mudar o contrato do mapa.
+**Próxima tarefa: M1.05b — codecs de peso Q2/Q3/Q8 e RAW-F16.** O despacho por
+codec, a calibração e o PrecisionMap já existem, mas o espaço de escolha tem
+apenas dois pontos: Q4 e denso. Cada codec novo precisa de writer, kernel de
+matmul sem expansão integral, caudas, comparação numérica e entrada no mapa —
+sem mudar o contrato do PrecisionMap. Isso também destrava M4.03d.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -665,7 +676,10 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
 - [ ] M6.01b Calibração por grupo dentro do tensor, conjunto de calibração
   representativo por domínio e orçamento de qualidade; sensibilidade em
   checkpoint treinado com perplexidade, dependente de LLM.04b.
-- [ ] M6.02 PrecisionMap Q2/Q3/Q4/Q8/F16 por tensor/bloco e seleção por custo físico
+- [x] M6.02a PrecisionMap versionado por tensor e seleção sob teto de bytes a
+  partir de sensibilidade medida, com proveniência da decisão, aplicação na
+  conversão e limites da estimativa declarados.
+- [ ] M6.02b PrecisionMap Q2/Q3/Q8/F16 e por bloco, e seleção por custo físico
   medido; misturar codecs dentro do tensor exige formato versionado, identidade/
   offsets por bloco e despacho compatível (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
 - [ ] M6.03 CompressionPlanner escolhe codec/sparsity/low-rank sem presumir speedup.
@@ -1330,6 +1344,30 @@ Décimo primeiro incremento:
 - Guia: [calibração](NEXALM_CALIBRACAO.md). Checklist: **37 concluídos e 107
   pendentes**; M6.01 foi dividido preservando grupo/orçamento em M6.01b.
 
+## Registro do décimo nono incremento — PrecisionMap
+
+- Concluído M6.02a: `compiler/precision_map.py` e `tools/nexa_precision.py`
+  (`plan` e `show`), com aplicação em `nexa_convert --precision-map`.
+- A seleção parte de tudo empacotado e promove por sensibilidade/byte extra;
+  um tensor que o codec não encolhe fica denso sem custo. Empates resolvem pelo
+  nome, então o mesmo relatório produz sempre o mesmo mapa.
+- Orçamento abaixo do baseline empacotado é erro explícito, não um plano
+  silenciosamente inviável. Relatório estático sem sensibilidade é recusado.
+- Contrato versionado: `schema_version` e `policy_id` conferidos na leitura,
+  campos estritos, e proveniência com checkpoint, tokens, baseline, bytes
+  planejados, sobra e promoções.
+- Limites declarados no guia e no relatório: somar sensibilidades individuais
+  não prediz a qualidade do conjunto, porque erros não se somam; a seleção é
+  gulosa, não ótima; `quality_measured` permanece falso.
+- Validação macOS ARM64/Python 3.14.5: **618 regressões + 110 bootstrap = 728
+  testes, zero falhas e zero skips**. Os 12 novos cobrem teto apertado, teto
+  amplo, compra por razão, determinismo com empates, codec que não encolhe,
+  rejeições de orçamento e relatório, round-trip do contrato, mapas malformados,
+  `bytes_for` e o fluxo calibrar → planejar → converter → executar.
+- Guia: [calibração e PrecisionMap](NEXALM_CALIBRACAO.md). Checklist:
+  **38 concluídos e 107 pendentes**; M6.02 foi dividido preservando os codecs
+  restantes e a seleção por bloco em M6.02b.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1377,6 +1415,12 @@ python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -
 python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --static-only
 python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibracao.json
 python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
+
+# PrecisionMap: planejar sob teto de bytes e converter pelo plano.
+python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json --budget 2KiB --out artifacts/precision/map.json
+python3 tools/nexa_precision.py show artifacts/precision/map.json
+python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-planned --precision-map artifacts/precision/map.json --group-size 4 --block-rows 3
+python3 -m unittest discover -s tests -p 'test_precision_map_regressions.py' -v
 
 # Codec de peso por tensor: referência densa e bundle misto.
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-dense --dense-all --block-rows 3
@@ -1595,6 +1639,14 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Décimo nono incremento acrescenta:
+
+- `compiler/precision_map.py`: contrato versionado, seleção gulosa sob teto e
+  proveniência da decisão.
+- `tools/nexa_precision.py` e `tools/nexa_convert.py --precision-map`.
+- `tests/test_precision_map_regressions.py` e a seção PrecisionMap do guia de
+  calibração.
 
 Décimo oitavo incremento acrescenta:
 

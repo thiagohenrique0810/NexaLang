@@ -1,4 +1,4 @@
-# Calibração por tensor: erro do codec e sensibilidade nos logits
+# Calibração por tensor e PrecisionMap
 
 O décimo oitavo incremento mede, tensor a tensor, o que a quantização custa.
 São duas medições separadas de propósito, porque respondem coisas diferentes:
@@ -81,6 +81,37 @@ python3 tools/nexa_calibrate.py --checkpoint CHECKPOINT --tokens 1,3 \
 `--work-dir` preserva os bundles intermediários para inspeção; sem ele, tudo
 vive num diretório temporário que é removido ao final.
 
+## PrecisionMap: escolher codecs sob um teto de bytes
+
+O décimo nono incremento consome esse relatório. `select_precision` parte de
+**tudo empacotado** — a configuração mais barata — e gasta o orçamento restante
+promovendo a denso os tensores com maior sensibilidade por byte extra. Um
+tensor que o codec não encolhe fica denso de graça.
+
+```bash
+python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json \
+  --budget 2KiB --out artifacts/precision/map.json
+python3 tools/nexa_precision.py show artifacts/precision/map.json
+python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/planejado \
+  --precision-map artifacts/precision/map.json --group-size 4 --block-rows 3
+```
+
+O mapa é versionado (`schema_version`, `policy_id`) e carrega a proveniência da
+decisão: checkpoint, tokens de calibração, `group_size`, baseline empacotado,
+bytes planejados, sobra e a lista de promoções com o RMSE que cada uma evita.
+Um mapa com versão, política ou campos diferentes é recusado em vez de
+reinterpretado.
+
+**O que a estimativa não é.** `estimated_avoided_rmse_sum` soma sensibilidades
+medidas **individualmente**, e erros de quantização não se somam: quantizar dois
+tensores não é a soma de quantizar cada um. O número ordena planos; não prevê a
+qualidade do conjunto, e `quality_measured` permanece `false`. A seleção também
+é gulosa sobre uma razão — com escolha binária por tensor, é heurística, não
+ótimo.
+
+Hoje o espaço de escolha tem dois codecs de peso, Q4 e denso. Q2/Q3/Q8/F16
+entram em M1.05b e ampliam esse espaço sem mudar o contrato do mapa.
+
 ## Limites
 
 O custo é **uma execução do modelo por tensor medido**, mais duas de
@@ -92,7 +123,7 @@ exercitam caminhos diferentes. Um único prompt curto não representa uma mistur
 de domínios — escolher o conjunto de calibração faz parte de M6.01b, junto com
 o orçamento de qualidade e a calibração por grupo dentro do tensor.
 
-A seleção automática de codec por tensor sob orçamento — o PrecisionMap — é
-M6.02, e usa exatamente o `cost_per_saved_kib` deste relatório. O
+Validar um plano de verdade exige comparar qualidade entre mapas num modelo
+treinado, o que depende de LLM.04b. O
 [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
 próxima tarefa.
