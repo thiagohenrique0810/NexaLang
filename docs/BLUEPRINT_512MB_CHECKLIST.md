@@ -129,6 +129,45 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo segundo incremento — bloco paralelo, onda 4a.** Dois agentes em
+paralelo com a onda 3, possível porque suas únicas colisões com o contêiner eram
+arquivos que as fronteiras do `AGENTS.md` já proíbem tocar. **945 testes**
+(863 + 82), zero falhas, zero skips.
+
+**M6.03a fechou a admissão que o guia de custo físico deixou em aberto.** Aquele
+guia terminava dizendo que o planejador "nem prediz velocidade: um codec menor
+pode decodificar mais devagar". Agora está medido, no kernel que o executor roda
+(bloco 32×1024, mediana de 21 trials, macOS ARM64, clang -O2, escalar):
+
+| Codec | B/valor | ns/valor |
+| --- | ---: | ---: |
+| Q2 | 0,375 | 1,6977 |
+| Q3 | 0,500 | 1,7234 |
+| Q4 | 0,625 | 1,5079 |
+| Q8 | 1,125 | 0,9992 |
+| F16 | 2,000 | 3,9523 |
+| F32 | 4,000 | 0,8139 |
+
+**As duas ordenações discordam, quase o inverso uma da outra:** por bytes
+Q2 < Q3 < Q4 < Q8 < F16 < F32; por tempo F32 < Q8 < Q4 < Q2 < Q3 < F16. Q2 guarda
+**40% menos bytes que Q4 e leva 12,6% mais tempo por valor**. F16 ocupa metade
+dos bytes de F32 e leva **4,86× o tempo**. E F32 é o mais rápido de todos, o que
+significa que otimizar só velocidade responde "não comprima nada" — por isso o
+tempo entra como **teto**, não como custo otimizado. Num plano de três tensores,
+−10,3% de tempo custou +44,4% de bytes.
+
+**PL.01a e PL.03a** num agente só, porque as duas partilham a noção de alvo
+físico. O adapter nulo é byte-idêntico ao baseline; o não nulo bate com um
+oráculo float64 independente e **difere** do baseline — as três asserções juntas,
+porque sem a terceira um delta que nunca é somado passaria nas outras duas.
+
+Falsificação em M6.03a: oito bugs injetados, oito pegos — mas **dois foram pegos
+por acaso na primeira rodada** e passaram na seguinte, porque os oráculos
+dependiam das taxas medidas daquela execução. O autor consertou o **teste**,
+acrescentando uma classe com tabela de taxas feita à mão onde cada ramo é
+alcançado por construção. Em PL, a defesa foi verificada e não afirmada:
+substituir o corpo de `_apply_adapters` por `return` derruba 10 testes.
+
 **Trigésimo primeiro incremento — bloco paralelo, onda 3: contêiner `.nxb`.**
 Um agente sozinho, dono exclusivo de `format.py` e `bundle.py` pela duração,
 porque o modo de falha desta mudança é silencioso: uma janela aplicada num lugar
@@ -676,6 +715,21 @@ A figura da p.17 agrupa curiosidade/consolidação e omite fases da tabela; não
 eliminar P6/P7. P2 foi dividido em aplicação de adapters, transações e aprendizado
 validado para permitir retomadas. Novos itens permanecem pendentes.
 
+- [x] PL.01a Mapa de regiões de parâmetro: `ParameterRegion`,
+  `ModelPlasticityConfig` versionado e `resolve_plasticity_map`, com resolução de
+  alias, faixas de linha e recusa de sobreposição nos dois sentidos. Baseline
+  intocado. `importance`, `drift_budget`, `update_count`, `last_update` e
+  `residency` foram **omitidos de propósito** — não têm produtor nem consumidor
+  hoje e seriam campos infalsificáveis; há teste que afirma a ausência deles.
+- [x] PL.03a Contrato CPU de adapter low-rank sobre base congelada:
+  `y = W_base x + (alpha/r)·B(A x)` com ordem de acumulação declarada, validação
+  antes de ler payload, adapter nulo byte-idêntico ao baseline e adapter não nulo
+  conferido contra um oráculo float64 com decodificador Q4 próprio — há teste que
+  lê o **fonte** do oráculo e falha se aparecer `decode_q4_row`, `format` ou
+  `torch`.
+- [ ] PL.01b/PL.03b `ExpertIR` e `LearningPolicyIR` (compartilhados com CC.01),
+  sintaxe pública (depende de LLM.01b2), e persistência versionada de adapters
+  com transações — que é PL.04 e continua sem sujeito enquanto não houver treino.
 - [ ] PL.01 P0: ParameterRegion/ModelPlasticityConfig/ExpertIR/LearningPolicyIR e
   passes de mapa/validação/layout/probes; IDs físicos, aliases tied, máscaras,
   proteção e limites validados sem mudar baseline. Compartilhar ExpertIR com CC.01;
@@ -964,7 +1018,14 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
   offset e identidade por bloco, despacho que troque de kernel dentro do mesmo
   matmul, e demonstração de ganho — o overhead fixo medido em M6.02c é por
   arquivo, e metadados por bloco heterogêneo tendem a aumentá-lo.
-- [ ] M6.03 CompressionPlanner escolhe codec/sparsity/low-rank sem presumir speedup.
+- [x] M6.03a `CompressionPlanner` sobre o eixo medido, com o **tempo real de
+  decodificação por codec** medido no kernel que o executor roda, teto
+  `--max-decode-ns` ortogonal aos tetos de bytes e de erro, fronteira de
+  dominância bidimensional, e eixos não suportados recusados **por nome**
+  (`sparsity`, `low_rank`, `peak_vram`) em vez de aceitos e ignorados.
+- [ ] M6.03b Sparsity e low-rank de fato (dependem de M6.06/M6.07), e latência
+  ponta a ponta: a taxa medida cobre o matmul do codec, não leitura de disco,
+  atenção, ativações nem orquestração Python, e não transfere para outro host.
 - [ ] M6.04 Fusões dequant+GEMM, RMSNorm+QKV, QKV+RoPE e FFN/SwiGLU por custo.
 - [x] M6.05a StreamingRegions como análise pura: regra de corte falsificável
   (só `CausalAttention` lê linhas anteriores, logo encerra uma região),
