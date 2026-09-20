@@ -274,9 +274,9 @@ class IncrementalNativeRegressions(_IncrementalFixture):
     def test_cli_incremental_keeps_native_default_and_rejects_invalid_eos(self):
         command = [sys.executable, str(ROOT / 'tools/nexa_run.py'), str(self.path), '--tokens', '1,3',
                    '--decode-tokens', '5,7', '--memory-budget', '1MiB', '--include-logits']
-        baseline = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        baseline = subprocess.run(command + ['--recompute'], capture_output=True, text=True, timeout=60)
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
-        incremental = subprocess.run(command + ['--kv-cache'], capture_output=True, text=True, timeout=60)
+        incremental = subprocess.run(command + ['--kv-two-banks'], capture_output=True, text=True, timeout=60)
         self.assertEqual(incremental.returncode, 0, incremental.stderr)
         original, cached = json.loads(baseline.stdout), json.loads(incremental.stdout)
         self.assertFalse(original['persistent_kv_cache'])

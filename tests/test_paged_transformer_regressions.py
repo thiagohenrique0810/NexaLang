@@ -438,7 +438,7 @@ class PagedNativeRegressions(_PagedFixture):
         command = [sys.executable, str(ROOT / 'tools/nexa_run.py'), str(self.path),
                    '--tokens', '1,3,5,7,2', '--decode-tokens', '8,4',
                    '--memory-budget', '1MiB', '--include-logits']
-        baseline = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        baseline = subprocess.run(command + ['--recompute'], capture_output=True, text=True, timeout=60)
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
         paged = subprocess.run(command + ['--kv-cache', '--kv-page-tokens', '2', '--prefill-chunk-size', '2'],
                                capture_output=True, text=True, timeout=60)
@@ -451,11 +451,14 @@ class PagedNativeRegressions(_PagedFixture):
         self.assertEqual(cached['token_ids'], [1, 3, 5, 7, 2, 8, 4])
         self.assertEqual(cached['run_totals']['processed_tokens'], 7)
         self.assertEqual([step['processed_tokens'] for step in cached['steps']], [2, 2, 1, 1, 1])
-        for options in (['--kv-page-tokens', '2'], ['--kv-cache', '--kv-page-tokens', '0'],
-                        ['--kv-cache', '--kv-page-tokens', '-1']):
+        # Paging is the default now; only impossible sizes are rejected.
+        for options in (['--kv-cache', '--kv-page-tokens', '0'],
+                        ['--kv-cache', '--kv-page-tokens', '-1'],
+                        ['--recompute', '--kv-page-tokens', '2']):
             invalid = subprocess.run(command + options, capture_output=True, text=True, timeout=60)
             self.assertNotEqual(invalid.returncode, 0)
-            self.assertIn('--kv-page-tokens', invalid.stderr)
+            self.assertIn('--recompute' if '--recompute' in options else '--kv-page-tokens',
+                          invalid.stderr)
 
 
 @unittest.skipUnless(torch_available(), 'Optional PyTorch reference is unavailable')

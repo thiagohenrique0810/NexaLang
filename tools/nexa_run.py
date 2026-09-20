@@ -21,6 +21,10 @@ if str(ROOT) not in sys.path:
 from runtime.nexapack.transformer import TransformerSession
 from tools.nexa_bench import write_report
 
+# Page size when the caller does not choose one: small enough for short
+# prompts, large enough to keep the page table modest on long contexts.
+DEFAULT_PAGE_TOKENS = 16
+
 
 def token_list(text):
     try:
@@ -47,7 +51,12 @@ def main(argv=None):
     parser.add_argument("--memory-budget", default="512MiB")
     parser.add_argument("--reserve", default="0B")
     parser.add_argument("--tile-rows", type=int, default=32)
-    parser.add_argument("--kv-cache", action="store_true", help="Use transactional incremental F32 KV instead of recomputing the prefix")
+    parser.add_argument("--kv-cache", action="store_true",
+                        help="Accepted for compatibility; paged KV is the default execution path")
+    parser.add_argument("--recompute", action="store_true",
+                        help="Recompute the whole prefix each step instead of keeping a KV cache")
+    parser.add_argument("--kv-two-banks", action="store_true",
+                        help="Use the two-bank reference cache of M4.00; it stores the cache twice")
     parser.add_argument("--prefill-chunk-size", type=int, help="Bound activation/logit buffers by processing the prompt in chunks; requires --kv-cache")
     parser.add_argument("--kv-page-tokens", type=int, help="Use on-demand KV pages with this token capacity per page; requires --kv-cache")
     parser.add_argument("--kv-codec", choices=("f32", "q4", "q3", "q8", "tq"), default="f32", help="KV storage codec; q4/q3/q8/tq require --kv-cache and --kv-page-tokens")
@@ -73,18 +82,24 @@ def main(argv=None):
         parser.error("--generate must be nonnegative")
     if args.reference_checkpoint is not None and not args.verify:
         parser.error("--reference-checkpoint requires --verify")
-    if args.prefill_chunk_size is not None and (not args.kv_cache or args.prefill_chunk_size <= 0):
-        parser.error("--prefill-chunk-size requires --kv-cache and a positive size")
-    if args.kv_page_tokens is not None and (not args.kv_cache or args.kv_page_tokens <= 0):
-        parser.error("--kv-page-tokens requires --kv-cache and a positive size")
-    if args.kv_codec != "f32" and (not args.kv_cache or args.kv_page_tokens is None):
-        parser.error(f"--kv-codec {args.kv_codec} requires --kv-cache and --kv-page-tokens")
+    if args.prefill_chunk_size is not None and args.prefill_chunk_size <= 0:
+        parser.error("--prefill-chunk-size must be a positive size")
+    if args.recompute and (args.kv_cache or args.kv_two_banks or args.kv_page_tokens is not None
+                           or args.kv_codec != "f32" or args.kv_policy != "homogeneous"
+                           or args.kv_backing_store is not None or args.fork_tokens is not None
+                           or args.prefill_chunk_size is not None):
+        parser.error("--recompute keeps no cache; drop the KV options")
+    if args.kv_two_banks and (args.kv_page_tokens is not None or args.kv_codec != "f32"
+                              or args.kv_policy != "homogeneous" or args.kv_backing_store is not None):
+        parser.error("--kv-two-banks is the F32 reference cache; it takes no paging or codec options")
+    if args.kv_page_tokens is not None and args.kv_page_tokens <= 0:
+        parser.error("--kv-page-tokens must be a positive size")
     if args.kv_group_size is not None and ((args.kv_policy != "age" and args.kv_codec not in ("q4", "q3", "q8"))
                                           or args.kv_group_size <= 0):
         parser.error("--kv-group-size requires --kv-codec q4/q3/q8 or --kv-policy age and a positive size")
     if args.kv_policy == "age":
-        if not args.kv_cache or args.kv_page_tokens is None:
-            parser.error("--kv-policy age requires --kv-cache and --kv-page-tokens")
+        if args.recompute or args.kv_two_banks:
+            parser.error("--kv-policy age needs the paged cache; drop --recompute/--kv-two-banks")
         if args.kv_codec != "f32" or args.kv_bits is not None or args.kv_seed is not None:
             parser.error("--kv-policy age fixes F32/Q4/Q3 tiers; do not pass another --kv-codec or TQ options")
         if args.kv_hot_pages is not None and args.kv_hot_pages < 1:
@@ -103,9 +118,9 @@ def main(argv=None):
         parser.error("--prompt requires --tokenizer, and --tokenizer is only used with --prompt")
     if args.bos and args.prompt is None:
         parser.error("--bos requires --prompt")
-    if args.fork_tokens is not None and (not args.kv_cache or args.kv_page_tokens is None
+    if args.fork_tokens is not None and (args.recompute or args.kv_two_banks
                                          or args.kv_backing_store is not None):
-        parser.error("--fork-tokens requires --kv-cache and --kv-page-tokens, and no --kv-backing-store")
+        parser.error("--fork-tokens needs the paged cache and no --kv-backing-store")
     if (args.kv_bits is not None or args.kv_seed is not None) and args.kv_codec != "tq":
         parser.error("--kv-bits/--kv-seed require --kv-codec tq")
     if args.kv_bits is not None and not 1 <= args.kv_bits <= 8:
@@ -131,14 +146,20 @@ def main(argv=None):
                     else len(args.tokens) + steps + forked)
         session_type = TransformerSession
         session_options = {}
-        if args.kv_cache:
+        if args.recompute:
+            pass  # The baseline stays reachable, but is no longer the default.
+        elif args.kv_two_banks:
             from runtime.nexapack.incremental import IncrementalTransformerSession
             session_type = IncrementalTransformerSession
-            if args.kv_page_tokens is not None:
-                from runtime.nexapack.paged import PagedTransformerSession
-                session_type = PagedTransformerSession
-                session_options["page_tokens"] = args.kv_page_tokens
-                session_options["kv_group_size"] = args.kv_group_size
+        else:
+            # Paged KV is the execution path now. The two-bank cache of M4.00
+            # stored the whole cache twice and must be asked for by name.
+            from runtime.nexapack.paged import PagedTransformerSession
+            session_type = PagedTransformerSession
+            session_options["page_tokens"] = (DEFAULT_PAGE_TOKENS if args.kv_page_tokens is None
+                                              else args.kv_page_tokens)
+            session_options["kv_group_size"] = args.kv_group_size
+            if True:
                 if args.kv_policy == "age":
                     from runtime.nexapack.tiered import TieredTransformerSession
                     session_type = TieredTransformerSession
@@ -195,7 +216,7 @@ def main(argv=None):
                 token_chunks.append([token])
                 generated.append(token)
                 current = session.report()
-                step_reports.append({"mode": "decode_incremental" if args.kv_cache else "decode_recompute",
+                step_reports.append({"mode": "decode_recompute" if args.recompute else "decode_incremental",
                                      "sequence_length": len(session.token_ids),
                                      "processed_tokens": current["processed_tokens"],
                                      "timing": current["timing"], "io": current["io"],

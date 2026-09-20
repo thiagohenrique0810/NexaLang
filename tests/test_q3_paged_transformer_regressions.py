@@ -463,7 +463,7 @@ class Q3PagedNativeRegressions(_Q3Fixture):
                 expected.append(session.decode(token))
         self.assertEqual(report['appended_token_ids'], generated)
         self.assert_rows_close(report['logits'], expected)
-        for invalid in (['--kv-codec', 'q3'], ['--kv-cache', '--kv-codec', 'q3'],
+        for invalid in (['--recompute', '--kv-codec', 'q3'], ['--kv-two-banks', '--kv-codec', 'q3'],
                         ['--kv-cache', '--kv-page-tokens', '2', '--kv-codec', 'q3', '--kv-group-size', '0'],
                         ['--kv-cache', '--kv-page-tokens', '2', '--kv-codec', 'f32', '--kv-group-size', '3']):
             failed = subprocess.run(command + invalid, capture_output=True, text=True, timeout=60)

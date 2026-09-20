@@ -285,13 +285,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.04 — integrar KV no prefill/decode real e remover a
-duplicação de cache para métricas.** É o item que resta antes do gate M4 junto
-de M4.05d e M4.06c: hoje o KV incremental é opcional por flag e o baseline por
-recomputação continua sendo o caminho padrão da CLI, o que mantém dois modos
-vivos só para comparação. Decidir qual passa a ser o caminho real, e o que a
-comparação ainda precisa medir, é o trabalho. Alternativas em aberto: M6.01d
-(conjunto representativo e calibração por grupo), M4.06c e M5.01 com modelo real.
+**Próxima tarefa: M4.06c — sequências derivadas sob backing store.** Restam
+M4.05d e M4.06c antes do gate M4. Páginas cold são arquivos de um store privado
+que os remove ao fechar; compartilhá-las entre sequências exige propriedade por
+referência sobre os arquivos, ou cópia explícita na adoção. Alternativas em
+aberto: M6.01d (conjunto representativo e calibração por grupo) e M5.01 com
+modelo real.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -696,7 +695,9 @@ transferidos e limite máximo documentados.
 - [x] M4.03d Atenção packed com despacho por layout: kernel homogêneo sobre os
   acessores por codec, páginas Q8 por token/head, equivalência com os kernels
   dedicados e sem expansão de página, head ou prefixo.
-- [ ] M4.04 Integrar no prefill/decode real; remover duplicação de cache para métricas.
+- [x] M4.04 KV paginado é o caminho de execução da CLI; o cache de dois bancos
+  de M4.00, que guardava o cache duas vezes, passou a ser referência explícita
+  (`--kv-two-banks`) e a recomputação virou `--recompute`.
 - [x] M4.05a Recodificação CPU por página, transacional, scratch limitado,
   custo/bytes e erro local medidos, com oracle que reproduz o histórico de chunks.
 - [x] M4.05b Evicção/recarga CPU de páginas cold Q3, backing store privado com
@@ -1590,6 +1591,24 @@ Décimo primeiro incremento:
 - Guia: [codecs de KV](NEXALM_KV_CODECS_CPU.md). Checklist: **45 concluídos e
   105 pendentes**; M4.03d fechou sem deixar subitem.
 
+## Registro do vigésimo quinto incremento — KV como caminho real
+
+- Concluído M4.04: a CLI executa com **KV paginado por padrão**, com páginas de
+  16 tokens quando o chamador não escolhe um tamanho. `--recompute` pede o
+  baseline por recomputação e `--kv-two-banks` pede o cache de M4.00.
+- A duplicação removida é concreta: o cache de dois bancos guarda o KV inteiro
+  duas vezes e era o que `--kv-cache` selecionava sem `--kv-page-tokens`. Ele
+  continua acessível como referência, mas deixou de ser um caminho acidental.
+- `--kv-cache` segue aceito sem efeito, para não quebrar linhas de comando
+  existentes; as validações passaram a rejeitar combinações com `--recompute` e
+  `--kv-two-banks` em vez de exigir `--kv-cache`.
+- Equivalência fixada em regressão: o caminho padrão e `--recompute` produzem a
+  mesma sequência e o mesmo próximo token — o cache é otimização, não variante.
+- Validação macOS ARM64/Python 3.14.5: **674 regressões + 110 bootstrap = 784
+  testes, zero falhas e zero skips**, após atualizar onze expectativas de CLI
+  que descreviam o default antigo.
+- Checklist: **46 concluídos e 104 pendentes**.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1642,6 +1661,11 @@ python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q8 --matrix-codec q8 --group-size 4 --block-rows 3
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
+
+# Caminho padrão (KV paginado), baseline e cache de dois bancos.
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --recompute --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --kv-two-banks --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB
 
 # KV Q8 paginado com despacho por layout.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec q8 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 96KiB
@@ -1885,6 +1909,13 @@ Décimo quarto incremento acrescenta:
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
+Vigésimo quinto incremento acrescenta:
+
+- `tools/nexa_run.py`: KV paginado por padrão, `--recompute`, `--kv-two-banks`,
+  `DEFAULT_PAGE_TOKENS` e validações reescritas em torno do novo default.
+- Atualização das expectativas de CLI nas suítes existentes, incluindo a
+  equivalência entre o caminho padrão e o baseline.
+
 Vigésimo quarto incremento acrescenta:
 
 - `runtime/nexapack/transformer.c/.h`: `nexa_q8_quantize`, acessores Q8 e
@@ -1972,8 +2003,8 @@ O cache KV paginado homogêneo executa F32, Q4, Q3, Q8 e TQ, com despacho por
 layout.
 
 Limites atuais: DSL e pipeline de modelos separados de nxc; executor C scalar
-orquestrado em Python, uma sequência, baseline por recomputação e KV incremental
-opcional F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
+orquestrado em Python, uma sequência, KV paginado como caminho padrão, com
+baseline por recomputação e cache de dois bancos por flag; F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
 por idade em RAM, com backing store opcional para evicção/recarga de cold Q3 CPU.
 Páginas cold podem ser reutilizadas em slots admitidos, e sequências derivadas
 compartilham o prefixo paginado, homogêneo ou por idade. Pesos Q3/TQ, TQ misto,

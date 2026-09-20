@@ -225,14 +225,14 @@ class PagedSequenceRegressions(_PagedFixture):
         common = [sys.executable, str(ROOT / "tools/nexa_run.py"), str(self.path), "--tokens", "1,3,5,7",
                   "--max-sequence-length", "8", "--tile-rows", "3", "--memory-budget", "1MiB",
                   "--fork-tokens", "2,4"]
-        unpaged = [*common, "--kv-cache"]
+        unpaged = [*common, "--recompute"]
         offloaded = [*common, "--kv-cache", "--kv-page-tokens", "2", "--kv-policy", "age",
                      "--kv-group-size", "4", "--kv-backing-store", str(self.directory / "cli-store")]
-        for invalid in (unpaged, offloaded):
+        for invalid, message in ((unpaged, "--recompute keeps no cache"),
+                                 (offloaded, "--fork-tokens needs the paged cache")):
             rejected = subprocess.run(invalid, capture_output=True, text=True, timeout=120)
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("--fork-tokens requires --kv-cache and --kv-page-tokens, and no --kv-backing-store",
-                          rejected.stderr)
+            self.assertIn(message, rejected.stderr)
             self.assertNotIn("Traceback", rejected.stderr)
 
     def test_a_backing_store_rejects_derived_sequences(self):

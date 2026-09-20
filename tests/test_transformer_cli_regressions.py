@@ -60,11 +60,21 @@ class TransformerCLIRegressions(unittest.TestCase):
         self.assertEqual(report["token_ids"], [1, 3, 5, 7])
         self.assertEqual(len(report["logits"]), 4)
         self.assertEqual(len(report["steps"]), 3)
-        self.assertFalse(report["persistent_kv_cache"])
+        # Paged KV is the default execution path; the baseline is opt-in now.
+        self.assertTrue(report["persistent_kv_cache"])
+        self.assertEqual(report["decode_strategy"], "paged_incremental_kv")
         self.assertFalse(report["tokenizer_executed"])
         direct = self.run_cli("--tokens", "1,3,5,7", "--include-logits", "--tile-rows", 2)
         self.assertEqual(direct.returncode, 0, direct.stderr)
         self.assertEqual(report["logits"], json.loads(direct.stdout)["logits"])
+        recomputed = self.run_cli("--tokens", "1,3", "--decode-tokens", "5,7",
+                                  "--include-logits", "--recompute", "--tile-rows", 3)
+        self.assertEqual(recomputed.returncode, 0, recomputed.stderr)
+        baseline = json.loads(recomputed.stdout)
+        self.assertFalse(baseline["persistent_kv_cache"])
+        # Both paths must agree: the cache is an optimization, not a variant.
+        self.assertEqual(baseline["token_ids"], report["token_ids"])
+        self.assertEqual(baseline["next_token_id"], report["next_token_id"])
         greedy = self.run_cli("--tokens", "1,3", "--generate", 2)
         self.assertEqual(greedy.returncode, 0, greedy.stderr)
         first = json.loads(greedy.stdout)

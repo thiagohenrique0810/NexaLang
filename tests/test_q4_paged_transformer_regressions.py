@@ -460,7 +460,7 @@ class Q4PagedNativeRegressions(_Q4Fixture):
         self.assertEqual(report['run_totals']['processed_tokens'], 4)
         with self.session(page_tokens=4) as session:
             self.assert_rows_close(report['logits'], session.prefill([1, 3, 5, 7]))
-        for invalid in (['--kv-codec', 'q4'], ['--kv-cache', '--kv-codec', 'q4'],
+        for invalid in (['--recompute', '--kv-codec', 'q4'], ['--kv-two-banks', '--kv-codec', 'q4'],
                         ['--kv-cache', '--kv-page-tokens', '2', '--kv-group-size', '3'],
                         ['--kv-cache', '--kv-page-tokens', '2', '--kv-codec', 'q4', '--kv-group-size', '0']):
             with self.subTest(options=invalid):

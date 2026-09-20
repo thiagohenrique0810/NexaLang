@@ -246,7 +246,9 @@ class ChunkedPrefillRegressions(unittest.TestCase):
         with self.session() as session:
             self.assertEqual(session.max_chunk_length, session.max_sequence_length)
             self.assertEqual(len(session.prefill(tokens)), len(tokens))
-        baseline = self.cli("--tokens", "1,3,5,7,2", "--decode-tokens", "8", "--include-logits")
+        # The recomputing baseline is still reachable, now by name.
+        baseline = self.cli("--tokens", "1,3,5,7,2", "--decode-tokens", "8",
+                            "--recompute", "--include-logits")
         self.assertEqual(baseline.returncode, 0, baseline.stderr)
         original = json.loads(baseline.stdout)
         self.assertFalse(original["persistent_kv_cache"])
@@ -259,14 +261,18 @@ class ChunkedPrefillRegressions(unittest.TestCase):
         self.assertEqual(report["logits_sha256"], original["logits_sha256"])
         self.assert_rows_close(report["logits"], original["logits"])
 
-    def test_cli_requires_kv_and_positive_chunk_size(self):
-        for arguments in (("--prefill-chunk-size", 2),
-                          ("--kv-cache", "--prefill-chunk-size", 0),
+    def test_cli_chunking_needs_a_cache_and_a_positive_size(self):
+        # Chunking without an explicit --kv-cache is now the default path.
+        allowed = self.cli("--tokens", "1,3", "--prefill-chunk-size", 2)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        for arguments in (("--prefill-chunk-size", 0),
+                          ("--recompute", "--prefill-chunk-size", 2),
                           ("--kv-cache", "--prefill-chunk-size", -2)):
             with self.subTest(arguments=arguments):
                 result = self.cli("--tokens", "1,3", *arguments)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("--prefill-chunk-size", result.stderr)
+                self.assertIn("--recompute" if "--recompute" in arguments else "--prefill-chunk-size",
+                              result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
 

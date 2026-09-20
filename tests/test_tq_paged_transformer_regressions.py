@@ -442,7 +442,7 @@ class TQPagedNativeRegressions(_TQFixture):
                 expected.append(session.decode(token))
         self.assertEqual(report['appended_token_ids'], generated)
         self.assert_rows_close(report['logits'], expected)
-        invalid = (['--kv-codec', 'tq'], ['--kv-cache', '--kv-codec', 'tq'],
+        invalid = (['--recompute', '--kv-codec', 'tq'], ['--kv-two-banks', '--kv-codec', 'tq'],
                    options + ['--kv-group-size', '3'], options + ['--kv-bits', '0'],
                    options + ['--kv-seed', str(1 << 31)], ['--kv-bits', '3'],
                    ['--kv-cache', '--kv-page-tokens', '2', '--kv-codec', 'q3', '--kv-seed', '42'])
