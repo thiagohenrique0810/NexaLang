@@ -1,5 +1,5 @@
 from llvmlite import ir
-from n_parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, MethodCall, FloatLiteral, IndexAccess, CharLiteral, ExternBlock
+from n_parser import StructDef, EnumDef, ImplDef, FunctionDef, VariableExpr, UnaryExpr, MemberAccess, MethodCall, FloatLiteral, IndexAccess, CharLiteral, ExternBlock, SUPPORTED_EXTERN_ABIS
 
 class CodeGen:
     def __init__(
@@ -256,6 +256,26 @@ class CodeGen:
         if "tq_mse" not in self.module.globals:
             ir.Function(self.module, ir.FunctionType(f32, [void_ptr, f32_ptr, i32]), name="tq_mse")
 
+        # NexaPack packed-level kernels. Sizes and counts are size_t in C, which
+        # is i64 on every host this bootstrap builds for; the language-visible
+        # counts are i32 and are sign-extended at the call site.
+        size_t = ir.IntType(64)
+        i8_ptr = ir.IntType(8).as_pointer()
+        for name, signature in (
+            ("nexa_qpack_size", ir.FunctionType(size_t, [size_t, size_t, size_t])),
+            ("nexa_qpack_groups", ir.FunctionType(size_t, [size_t, size_t, size_t])),
+            ("nexa_qpack_pack", ir.FunctionType(
+                i32, [size_t, f32_ptr, size_t, size_t, size_t, i8_ptr, size_t])),
+            ("nexa_qpack_unpack", ir.FunctionType(
+                i32, [size_t, i8_ptr, size_t, size_t, size_t, f32_ptr, size_t])),
+            ("nexa_qpack_code", ir.FunctionType(
+                i32, [size_t, i8_ptr, size_t, size_t, size_t, size_t, i8_ptr])),
+            ("nexa_qpack_scale", ir.FunctionType(
+                i32, [size_t, i8_ptr, size_t, size_t, size_t, size_t, f32_ptr])),
+        ):
+            if name not in self.module.globals:
+                ir.Function(self.module, signature, name=name)
+
     def _declare_arena(self):
         # struct Arena { chunk: i8*, offset: i32, capacity: i32 }
         void_ptr = ir.IntType(8).as_pointer()
@@ -382,6 +402,14 @@ class CodeGen:
                 type_name = type_name[3:]
 
         if type_name.startswith('Task<'):
+            return ir.IntType(8).as_pointer()
+        # qint<N> is one two's-complement level code. Every supported width fits
+        # a byte, so the unpacked ABI is one signed byte per code whatever N is;
+        # the N-bit form only exists inside a PackedVector, which is the raw
+        # packed buffer and therefore travels as a plain byte pointer.
+        if type_name.startswith('qint<'):
+            return ir.IntType(8)
+        if type_name.startswith('PackedVector<'):
             return ir.IntType(8).as_pointer()
         if type_name.startswith('[') and type_name.endswith(']'):
             element, count = type_name[1:-1].rsplit(':', 1)
@@ -1981,8 +2009,11 @@ class CodeGen:
             # Int to int
             if isinstance(val.type, ir.IntType) and isinstance(target_ty, ir.IntType):
                 if val.type.width < target_ty.width:
-                    # u8 (i8) is unsigned in NexaLang → zero-extend
-                    if val.type.width == 8:
+                    # u8 (i8) is unsigned in NexaLang → zero-extend. A qint<N>
+                    # shares that storage but is two's complement, so widening
+                    # a negative code has to keep its sign.
+                    source_name = getattr(node.args[0], 'type_name', '') or ''
+                    if val.type.width == 8 and not source_name.startswith('qint<'):
                         return self.builder.zext(val, target_ty)
                     return self.builder.sext(val, target_ty)
                 elif val.type.width > target_ty.width:
@@ -2174,6 +2205,10 @@ class CodeGen:
                 self.gpu_global_id.initializer = ir.Constant(ir.IntType(32), 0)
                 self.gpu_global_id.linkage = "internal"
             return self.builder.load(self.gpu_global_id, name="gpu_global_id")
+
+        # ── NexaPack qint<N>/PackedVector<N> intrinsics ──
+        elif isinstance(callee_name, str) and callee_name.startswith("qpack::"):
+            return self._emit_qpack_intrinsic(callee_name, node)
 
         # ── TurboQuant compression intrinsics ──
         elif callee_name in ("compress::create", "compress::create_mse"):
@@ -2519,8 +2554,75 @@ class CodeGen:
 
         return func
 
+    def _qpack_width(self, callee_name, node):
+        """N from the turbofish for the sizes, from PackedVector<N> otherwise."""
+        name, separator, turbofish = callee_name[len("qpack::"):].partition("<")
+        if separator:
+            return name, int(turbofish[:-1])
+        buffer_type = getattr(node.args[0], "type_name", "") or ""
+        return name, int(buffer_type[buffer_type.index("<") + 1:-1])
+
+    def _emit_qpack_intrinsic(self, callee_name, node):
+        size_t = ir.IntType(64)
+        name, width = self._qpack_width(callee_name, node)
+        bits = ir.Constant(size_t, width)
+
+        def extend(argument):
+            value = self.visit(argument)
+            return value if value.type == size_t else self.builder.sext(value, size_t)
+
+        if name in ("size", "groups"):
+            count, group_size = extend(node.args[0]), extend(node.args[1])
+            return self.builder.call(self.module.globals[f"nexa_qpack_{name}"],
+                                     [bits, count, group_size], name=f"qpack_{name}")
+
+        packed = self.visit(node.args[0])
+        if packed.type != ir.IntType(8).as_pointer():
+            packed = self.builder.bitcast(packed, ir.IntType(8).as_pointer())
+        if name in ("pack", "unpack"):
+            buffer_ptr = self.visit(node.args[1])
+            float_ptr = ir.FloatType().as_pointer()
+            if buffer_ptr.type != float_ptr:
+                buffer_ptr = self.builder.bitcast(buffer_ptr, float_ptr)
+            count, group_size = extend(node.args[2]), extend(node.args[3])
+            # The language cannot see a raw buffer's capacity, so it declares the
+            # exact packed size the layout requires and the kernel's own
+            # too-small check can never be what catches a caller's short buffer.
+            packed_bytes = self.builder.call(self.module.globals["nexa_qpack_size"],
+                                             [bits, count, group_size], name="qpack_bytes")
+            if name == "pack":
+                return self.builder.call(self.module.globals["nexa_qpack_pack"],
+                                         [bits, buffer_ptr, count, count, group_size,
+                                          packed, packed_bytes], name="qpack_pack")
+            return self.builder.call(self.module.globals["nexa_qpack_unpack"],
+                                     [bits, packed, packed_bytes, count, group_size,
+                                      buffer_ptr, count], name="qpack_unpack")
+
+        count, group_size, index = (extend(node.args[1]), extend(node.args[2]),
+                                    extend(node.args[3]))
+        packed_bytes = self.builder.call(self.module.globals["nexa_qpack_size"],
+                                         [bits, count, group_size], name="qpack_bytes")
+        # A failed read leaves the slot untouched, so it is pre-seeded with a
+        # value the storage contract calls impossible: the reserved code for a
+        # level, a negative scale for a group. No status channel is invented.
+        if name == "code":
+            slot = self.builder.alloca(ir.IntType(8), name="qpack_code_slot")
+            self.builder.store(ir.Constant(ir.IntType(8), -(1 << (width - 1))), slot)
+            self.builder.call(self.module.globals["nexa_qpack_code"],
+                              [bits, packed, packed_bytes, count, group_size, index, slot])
+            return self.builder.load(slot, name="qpack_code")
+        slot = self.builder.alloca(ir.FloatType(), name="qpack_scale_slot")
+        self.builder.store(ir.Constant(ir.FloatType(), -1.0), slot)
+        self.builder.call(self.module.globals["nexa_qpack_scale"],
+                          [bits, packed, packed_bytes, count, group_size, index, slot])
+        return self.builder.load(slot, name="qpack_scale")
+
     def visit_ExternBlock(self, node):
-        pass # Headers already declared in Pass 2
+        # Pass 2 declared the signatures; this is the last gate before the
+        # module is emitted, and an ABI the backend cannot produce must not
+        # reach it silently -- that silence is what made every ABI "work".
+        if node.abi not in SUPPORTED_EXTERN_ABIS:
+            raise Exception(f'CodeGen: unsupported extern ABI "{node.abi}"')
 
     def visit_FunctionDef(self, node):
         if getattr(node, 'generics', None): return

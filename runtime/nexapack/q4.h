@@ -109,6 +109,39 @@ NEXA_Q4_API int nexa_q4_decode_row(
     const uint8_t *packed, size_t packed_bytes, size_t cols, size_t group_size,
     float *output, size_t output_count);
 
+
+/* ── qint<N> / PackedVector<N> storage ABI ────────────────────────────────
+ * One kernel family for the widths the language exposes: bits in {2,3,4,8}.
+ * A packed vector is `groups` records of 4 + ceil(bits*group_size/8) bytes:
+ * a little-endian F32 scale, then bits-wide two's-complement codes packed
+ * from the least significant bit. The last group encodes only the values it
+ * actually has; its remaining code slots and the spare high bits stay zero.
+ * Byte-for-byte this is Q2_GROUPED, Q3_GROUPED, Q4_GROUPED and Q8_GROUPED
+ * version 1 as `runtime/nexapack/format.py` writes them.
+ * Zero and unsupported widths return zero (sizes) or a negative status.
+ */
+NEXA_Q4_API size_t nexa_qpack_size(size_t bits, size_t count, size_t group_size);
+NEXA_Q4_API size_t nexa_qpack_groups(size_t bits, size_t count, size_t group_size);
+
+NEXA_Q4_API int nexa_qpack_pack(
+    size_t bits, const float *values, size_t value_count,
+    size_t count, size_t group_size,
+    uint8_t *packed, size_t packed_bytes);
+
+NEXA_Q4_API int nexa_qpack_unpack(
+    size_t bits, const uint8_t *packed, size_t packed_bytes,
+    size_t count, size_t group_size,
+    float *output, size_t output_count);
+
+/* Read one stored level code, or one group scale, without decoding the rest. */
+NEXA_Q4_API int nexa_qpack_code(
+    size_t bits, const uint8_t *packed, size_t packed_bytes,
+    size_t count, size_t group_size, size_t index, int8_t *code);
+
+NEXA_Q4_API int nexa_qpack_scale(
+    size_t bits, const uint8_t *packed, size_t packed_bytes,
+    size_t count, size_t group_size, size_t group, float *scale);
+
 #ifdef __cplusplus
 }
 #endif

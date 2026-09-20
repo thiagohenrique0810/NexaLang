@@ -227,6 +227,12 @@ def _compile():
     if args.run_jit and args.target == "native":
         from jit import run_jit
         print("[JIT] Starting JIT...")
+        # The JIT-ed program writes to the same descriptor through the C
+        # runtime's own buffer. Whatever is still sitting in Python's buffer
+        # has to leave first, or a diagnostic is flushed into the middle of a
+        # line the program printed.
+        sys.stdout.flush()
+        sys.stderr.flush()
         ret = run_jit(str(llvm_ir))
         print(f"[JIT] Finished with code {ret}")
         return ret

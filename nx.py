@@ -101,6 +101,14 @@ def _called_symbols(ll_path: str) -> set[str]:
     return {quoted or plain for quoted, plain in matches}
 
 
+def _nexapack_link_args() -> list[str]:
+    """qint<N> lowers to calls into the checked-out packed-level kernels."""
+    args = [os.path.join(REPO_ROOT, "runtime", "nexapack", "q4.c")]
+    if platform.system() != "Windows":
+        args.append("-lm")
+    return args
+
+
 def _turboquant_link_args() -> list[str]:
     """Compile the checked-out source for this host, never a bundled binary."""
     runtime_dir = os.path.join(REPO_ROOT, "runtime")
@@ -116,6 +124,8 @@ def _native_link_cmd(ll_out: str, exe_out: str, opt: str) -> list[str]:
     symbols = _called_symbols(ll_out)
     if any(name.startswith("tq_") for name in symbols):
         cmd.extend(_turboquant_link_args())
+    if any(name.startswith("nexa_qpack_") for name in symbols):
+        cmd.extend(_nexapack_link_args())
     if any(name.startswith("__nexa_") for name in symbols) or (os.name == "nt" and "sched_yield" in symbols):
         cmd.append(os.path.join(REPO_ROOT, "runtime", "nexa_async.c"))
         if platform.system() == "Windows":
