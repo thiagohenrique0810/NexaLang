@@ -120,6 +120,9 @@ jobs:
           python tools/nexa_inspect.py artifacts/models/ci-dense --verify
           python tools/nexa_run.py artifacts/models/ci-dense --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB --report artifacts/reports/ci-dense.json
 
+      - name: Execute Q8 paged KV through the shared codec kernel
+        run: python tools/nexa_run.py artifacts/models/ci-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec q8 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 96KiB --report artifacts/reports/ci-kv-q8.json
+
       - name: Convert and run a Q3 weight bundle
         run: |
           python tools/nexa_convert.py --checkpoint artifacts/checkpoints/ci-tiny --out artifacts/models/ci-q3 --matrix-codec q3 --group-size 8 --block-rows 3

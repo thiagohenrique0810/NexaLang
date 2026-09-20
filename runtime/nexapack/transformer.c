@@ -676,6 +676,83 @@ int nexa_q3_quantize(const float *weights, size_t weight_count,
     return NEXA_Q4_OK;
 }
 
+int nexa_q8_quantize(const float *weights, size_t weight_count,
+                    size_t rows, size_t cols, size_t group_size,
+                    uint8_t *packed, size_t packed_bytes) {
+    if (!weights || !packed || !rows || !cols || !group_size) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, row_bytes, total_bytes, elements, input_bytes;
+    if (group_size > SIZE_MAX - 4) return NEXA_Q4_OVERFLOW;
+    group_bytes = 4 + group_size;
+    groups = cols / group_size + (cols % group_size != 0);
+    if (!checked_mul(groups, group_bytes, &row_bytes) ||
+        !checked_mul(rows, row_bytes, &total_bytes) ||
+        !checked_mul(rows, cols, &elements) || !float_bytes(elements, &input_bytes))
+        return NEXA_Q4_OVERFLOW;
+    if (weight_count < elements || packed_bytes < total_bytes)
+        return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(weights, input_bytes, packed, total_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    if (!finite_input(weights, elements)) return NEXA_Q4_INVALID_DATA;
+    for (size_t row = 0; row < rows; row++) {
+        size_t start = 0;
+        for (size_t group = 0; group < groups; group++) {
+            size_t valid = cols - start < group_size ? cols - start : group_size;
+            const float *values = weights + row * cols + start;
+            uint8_t *record = packed + row * row_bytes + group * group_bytes;
+            float maximum = 0.0f;
+            for (size_t lane = 0; lane < valid; lane++) {
+                float magnitude = fabsf(values[lane]);
+                if (magnitude > maximum) maximum = magnitude;
+            }
+            float scale = (float)((double)maximum / 127.0);
+            if (maximum > 0.0f && scale == 0.0f) return NEXA_Q4_NUMERIC_RANGE;
+            q3_store_scale(record, scale);
+            memset(record + 4, 0, group_bytes - 4);
+            if (scale > 0.0f) {
+                for (size_t lane = 0; lane < valid; lane++) {
+                    double value = (double)values[lane] / (double)scale;
+                    int quantized;
+                    if (value >= 127.0) quantized = 127;
+                    else if (value <= -127.0) quantized = -127;
+                    else quantized = (int)(value >= 0.0 ? value + 0.5 : value - 0.5);
+                    record[4 + lane] = (uint8_t)(quantized & 0xFF);
+                }
+            }
+            start += valid;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
+static double q8_lane(const uint8_t *row, size_t lane, size_t group_size, size_t group_bytes) {
+    const uint8_t *group = row + (lane / group_size) * group_bytes;
+    float scale;
+    memcpy(&scale, group, sizeof(scale));
+    return (double)scale * (double)(int8_t)group[4 + lane % group_size];
+}
+
+static int valid_q8_rows(const uint8_t *page, size_t rows, size_t cols,
+                         size_t group_size, size_t group_bytes, size_t row_bytes) {
+    size_t groups = cols / group_size + (cols % group_size != 0);
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *record = page + row * row_bytes;
+        size_t start = 0;
+        for (size_t group = 0; group < groups; group++) {
+            const uint8_t *data = record + group * group_bytes;
+            float scale;
+            memcpy(&scale, data, sizeof(scale));
+            if (!isfinite(scale) || scale < 0.0f) return 0;
+            size_t valid = cols - start < group_size ? cols - start : group_size;
+            for (size_t lane = 0; lane < group_size; lane++) {
+                int value = (int8_t)data[4 + lane];
+                if (value == -128) return 0;
+                if ((lane >= valid || scale == 0.0f) && value != 0) return 0;
+            }
+            start += valid;
+        }
+    }
+    return 1;
+}
+
 static int valid_q3_rows(const uint8_t *page, size_t rows, size_t cols,
                          size_t group_size, size_t group_bytes, size_t row_bytes) {
     unsigned int tail_bits = (unsigned int)((group_size * 3) % 8);
@@ -828,6 +905,12 @@ static int kv_row_layout(int codec, size_t dim, size_t group_size,
         size_t groups;
         return q3_layout(dim, group_size, &groups, group_bytes, row_bytes);
     }
+    if (codec == 8) {
+        if (group_size > SIZE_MAX - 4) return NEXA_Q4_OVERFLOW;
+        *group_bytes = 4 + group_size;
+        size_t groups = dim / group_size + (dim % group_size != 0);
+        return checked_mul(groups, *group_bytes, row_bytes) ? NEXA_Q4_OK : NEXA_Q4_OVERFLOW;
+    }
     return NEXA_Q4_INVALID_ARGUMENT;
 }
 
@@ -835,6 +918,7 @@ static double kv_lane(const uint8_t *row, int codec, size_t lane,
                        size_t group_size, size_t group_bytes) {
     if (codec == 4) return q4_lane(row, lane, group_size, group_bytes);
     if (codec == 3) return q3_lane(row, lane, group_size, group_bytes);
+    if (codec == 8) return q8_lane(row, lane, group_size, group_bytes);
     float value;
     memcpy(&value, row + lane * sizeof(float), sizeof(value));
     return (double)value;
@@ -844,6 +928,7 @@ static int valid_kv_rows(const uint8_t *data, int codec, size_t rows, size_t dim
                          size_t group_size, size_t group_bytes, size_t row_bytes) {
     if (codec == 4) return valid_q4_rows(data, rows, dim, group_size, group_bytes, row_bytes);
     if (codec == 3) return valid_q3_rows(data, rows, dim, group_size, group_bytes, row_bytes);
+    if (codec == 8) return valid_q8_rows(data, rows, dim, group_size, group_bytes, row_bytes);
     for (size_t row = 0; row < rows; row++) {
         for (size_t lane = 0; lane < dim; lane++) {
             if (!isfinite(kv_lane(data + row * row_bytes, codec, lane, group_size, group_bytes)))
@@ -865,6 +950,105 @@ static double mixed_score(const float *query, const uint8_t *const *pages,
     for (size_t lane = 0; lane < dim; lane++)
         dot += (double)query[lane] * kv_lane(row, codec, lane, group_size, group_bytes[codec]);
     return dot * scale;
+}
+
+/* One homogeneous codec across every page, read through the shared accessors.
+ * The reduction order matches the per-codec kernels: maxima, then exponential
+ * weights into the caller's scratch, then one value lane at a time. */
+int nexa_causal_gqa_attention_paged_codec(
+    const float *query, size_t query_count,
+    const uint8_t *const *key_pages, size_t key_page_count,
+    const uint8_t *const *value_pages, size_t value_page_count,
+    int codec, size_t page_tokens, size_t page_bytes, size_t group_size,
+    size_t past_length, size_t sequence, size_t query_heads, size_t kv_heads, size_t head_dim,
+    float *scratch, size_t scratch_count,
+    float *output, size_t output_count) {
+    if (!query || !key_pages || !value_pages || !scratch || !output || !page_tokens || !group_size ||
+        !sequence || !query_heads || !kv_heads || !head_dim || query_heads % kv_heads)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    if (past_length > SIZE_MAX - sequence) return NEXA_Q4_OVERFLOW;
+    size_t cache_length = past_length + sequence;
+    size_t needed_pages = cache_length / page_tokens + (cache_length % page_tokens != 0);
+    size_t row_bytes, group_bytes;
+    int status = kv_row_layout(codec, head_dim, group_size, &row_bytes, &group_bytes);
+    if (status) return status;
+    size_t q_width, q_elements, q_bytes, token_bytes, required_page_bytes;
+    size_t table_bytes, scratch_bytes;
+    if (!checked_mul(query_heads, head_dim, &q_width) ||
+        !checked_mul(sequence, q_width, &q_elements) || !float_bytes(q_elements, &q_bytes) ||
+        !checked_mul(kv_heads, row_bytes, &token_bytes) ||
+        !checked_mul(page_tokens, token_bytes, &required_page_bytes) ||
+        !checked_mul(needed_pages, sizeof(*key_pages), &table_bytes) ||
+        !float_bytes(cache_length, &scratch_bytes)) return NEXA_Q4_OVERFLOW;
+    if (query_count < q_elements || output_count < q_elements || scratch_count < cache_length ||
+        key_page_count < needed_pages || value_page_count < needed_pages ||
+        page_bytes < required_page_bytes) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(query, q_bytes, output, q_bytes) ||
+        !disjoint(query, q_bytes, scratch, scratch_bytes) ||
+        !disjoint(output, q_bytes, scratch, scratch_bytes) ||
+        !disjoint(key_pages, table_bytes, output, q_bytes) ||
+        !disjoint(value_pages, table_bytes, output, q_bytes) ||
+        !disjoint(key_pages, table_bytes, scratch, scratch_bytes) ||
+        !disjoint(value_pages, table_bytes, scratch, scratch_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    if (!finite_input(query, q_elements)) return NEXA_Q4_INVALID_DATA;
+    size_t remaining = cache_length;
+    for (size_t page = 0; page < needed_pages; page++) {
+        const uint8_t *key = key_pages[page], *value = value_pages[page];
+        if (!key || !value) return NEXA_Q4_INVALID_ARGUMENT;
+        size_t visible_tokens = remaining < page_tokens ? remaining : page_tokens;
+        size_t visible_bytes = visible_tokens * token_bytes;
+        if (!disjoint(key, visible_bytes, output, q_bytes) ||
+            !disjoint(value, visible_bytes, output, q_bytes) ||
+            !disjoint(key, visible_bytes, scratch, scratch_bytes) ||
+            !disjoint(value, visible_bytes, scratch, scratch_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+        if (!valid_kv_rows(key, codec, visible_tokens * kv_heads, head_dim, group_size,
+                           group_bytes, row_bytes) ||
+            !valid_kv_rows(value, codec, visible_tokens * kv_heads, head_dim, group_size,
+                           group_bytes, row_bytes)) return NEXA_Q4_INVALID_DATA;
+        remaining -= visible_tokens;
+    }
+    double scale = 1.0 / sqrt((double)head_dim);
+    size_t repeats = query_heads / kv_heads;
+    for (size_t position = 0; position < sequence; position++) {
+        size_t causal_end = past_length + position;
+        for (size_t head = 0; head < query_heads; head++) {
+            const float *q = query + position * q_width + head * head_dim;
+            size_t kv_head = head / repeats;
+            double maximum = -INFINITY;
+            for (size_t past = 0; past <= causal_end; past++) {
+                const uint8_t *key = paged_q4_row(key_pages, past, page_tokens, token_bytes,
+                                                  row_bytes, kv_head);
+                double dot = 0.0;
+                for (size_t lane = 0; lane < head_dim; lane++)
+                    dot += (double)q[lane] * kv_lane(key, codec, lane, group_size, group_bytes);
+                double score = dot * scale;
+                if (!isfinite(score)) return NEXA_Q4_NUMERIC_RANGE;
+                if (score > maximum) maximum = score;
+            }
+            double denominator = 0.0;
+            for (size_t past = 0; past <= causal_end; past++) {
+                const uint8_t *key = paged_q4_row(key_pages, past, page_tokens, token_bytes,
+                                                  row_bytes, kv_head);
+                double dot = 0.0;
+                for (size_t lane = 0; lane < head_dim; lane++)
+                    dot += (double)q[lane] * kv_lane(key, codec, lane, group_size, group_bytes);
+                scratch[past] = (float)exp(dot * scale - maximum);
+                denominator += (double)scratch[past];
+            }
+            for (size_t lane = 0; lane < head_dim; lane++) {
+                double sum = 0.0;
+                for (size_t past = 0; past <= causal_end; past++) {
+                    const uint8_t *value = paged_q4_row(value_pages, past, page_tokens, token_bytes,
+                                                        row_bytes, kv_head);
+                    sum += (double)scratch[past] * kv_lane(value, codec, lane, group_size, group_bytes);
+                }
+                status = write_float(output + position * q_width + head * head_dim + lane,
+                                     sum / denominator);
+                if (status) return status;
+            }
+        }
+    }
+    return NEXA_Q4_OK;
 }
 
 int nexa_causal_gqa_attention_paged_mixed(

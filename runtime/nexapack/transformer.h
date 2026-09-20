@@ -168,6 +168,24 @@ NEXA_Q4_API int nexa_q3_quantize(
  * the visible prefix is validated/read. Scale*code stays double, without a
  * decoded float32 vector, page concatenation or heap allocation.
  */
+/* Quantize rows into the Q8 KV page layout: per-group float32 scale then one
+ * signed byte per coordinate. Matches nexa_q3_quantize's contract. */
+NEXA_Q4_API int nexa_q8_quantize(
+    const float *weights, size_t weight_count,
+    size_t rows, size_t cols, size_t group_size,
+    uint8_t *packed, size_t packed_bytes);
+
+/* Homogeneous paged attention for any supported KV codec id (0 f32, 3 q3,
+ * 4 q4, 8 q8), dispatching on the stored layout without expanding a page. */
+NEXA_Q4_API int nexa_causal_gqa_attention_paged_codec(
+    const float *query, size_t query_count,
+    const uint8_t *const *key_pages, size_t key_page_count,
+    const uint8_t *const *value_pages, size_t value_page_count,
+    int codec, size_t page_tokens, size_t page_bytes, size_t group_size,
+    size_t past_length, size_t sequence, size_t query_heads, size_t kv_heads, size_t head_dim,
+    float *scratch, size_t scratch_count,
+    float *output, size_t output_count);
+
 NEXA_Q4_API int nexa_causal_gqa_attention_paged_q3(
     const float *query, size_t query_count,
     const uint8_t *const *key_pages, size_t key_page_count,

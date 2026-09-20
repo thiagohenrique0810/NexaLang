@@ -34,8 +34,9 @@ def _packed_head_row_bytes(head_dim, group_size, codec):
     _integer(group_size, "group_size", 1)
     if group_size > MAX_Q4_GROUP_SIZE:
         raise ValueError(f"Packed KV group_size exceeds {MAX_Q4_GROUP_SIZE}")
-    bits = {"q4": 4, "q3": 3}[codec]
-    return ((head_dim + group_size - 1) // group_size) * (4 + (bits * group_size + 7) // 8)
+    # Q8 stores whole bytes; the bit-packed codecs share the rounded formula.
+    payload = group_size if codec == "q8" else ({"q4": 4, "q3": 3}[codec] * group_size + 7) // 8
+    return ((head_dim + group_size - 1) // group_size) * (4 + payload)
 
 
 _PACKED_LAYOUT_FIELDS = {"codec", "codec_id", "codec_version", "layout", "logical_dtype", "group_size",
@@ -60,8 +61,8 @@ class PagedKVCachePlan:
             raise ValueError("Paged KV config must be a ModelConfig")
         _integer(self.capacity, "KV capacity", 1)
         _integer(self.page_tokens, "page_tokens", 1)
-        if self.codec not in ("f32", "q4", "q3", "tq"):
-            raise ValueError("Paged KV codec must be f32, q4, q3 or tq")
+        if self.codec not in ("f32", "q4", "q3", "q8", "tq"):
+            raise ValueError("Paged KV codec must be f32, q4, q3, q8 or tq")
         if self.codec != "tq" and any(value is not None for value in
                                       (self.bits, self.seed, self.codebook_f32le)):
             raise ValueError("bits, seed and codebook_f32le require the TQ KV codec")
@@ -287,10 +288,10 @@ class PagedKVAction:
             if bindings["codec"] == "tq" and set(bindings) == _CACHE_BINDINGS | _TQ_BINDINGS:
                 validate_tq_parameters(head_dim, bindings["bits"], bindings["seed"])
                 row_bytes = tq_row_bytes(head_dim, bindings["bits"])
-            elif bindings["codec"] in ("q4", "q3") and set(bindings) == _CACHE_BINDINGS | _PACKED_BINDINGS:
+            elif bindings["codec"] in ("q4", "q3", "q8") and set(bindings) == _CACHE_BINDINGS | _PACKED_BINDINGS:
                 row_bytes = _packed_head_row_bytes(head_dim, bindings["group_size"], bindings["codec"])
             else:
-                raise ValueError("Packed KV bindings require consistent q4, q3 or tq codec parameters")
+                raise ValueError("Packed KV bindings require consistent q4, q3, q8 or tq codec parameters")
             if (head_dim % 2 or bindings["kv_width"] % head_dim
                     or bindings["head_row_bytes"] != row_bytes
                     or bindings["token_bytes"] != bindings["kv_width"] // head_dim * row_bytes):

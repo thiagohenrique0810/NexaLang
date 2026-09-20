@@ -17,6 +17,9 @@ from .incremental import IncrementalTransformerSession
 from .transformer import ALIGNMENT, TransformerSession, _positive
 from .tq_kv import TQKVContext, TQKernelDispatch, tq_kv_memory
 
+# Codec ids the native KV accessors dispatch on; f32 is zero.
+_KV_CODEC_IDS = {"f32": 0, "q3": 3, "q4": 4, "q8": 8}
+
 
 class _KVPage:
     """One page allocation, owned by one sequence or shared by several.
@@ -69,10 +72,10 @@ class PagedTransformerSession(IncrementalTransformerSession):
                  kv_codec="f32", kv_group_size=None, kv_bits=None, kv_seed=None,
                  kv_codebook_f32le=None, **kwargs):
         self.page_tokens = _positive(page_tokens, "page_tokens")
-        if kv_codec not in ("f32", "q4", "q3", "tq"):
-            raise ValueError("kv_codec must be f32, q4, q3 or tq")
-        if kv_codec not in ("q4", "q3") and kv_group_size is not None:
-            raise ValueError("kv_group_size requires the q4 or q3 KV codec")
+        if kv_codec not in ("f32", "q4", "q3", "q8", "tq"):
+            raise ValueError("kv_codec must be f32, q4, q3, q8 or tq")
+        if kv_codec not in ("q4", "q3", "q8") and kv_group_size is not None:
+            raise ValueError("kv_group_size requires the q4, q3 or q8 KV codec")
         if kv_codec != "tq" and any(value is not None for value in (kv_bits, kv_seed, kv_codebook_f32le)):
             raise ValueError("kv_bits/kv_seed/kv_codebook_f32le require the tq KV codec")
         self.kv_codec = kv_codec
@@ -345,6 +348,18 @@ class PagedTransformerSession(IncrementalTransformerSession):
                  self.page_tokens * self._cache_plan.token_bytes, bindings["past_length"], length,
                  attributes["num_heads"], attributes["num_key_value_heads"], attributes["head_dim"],
                  attention, len(attention), vector, len(vector), accumulator, len(accumulator), out, len(out))
+            return
+        if self.kv_codec == "q8":
+            # One homogeneous codec through the shared per-layout accessors,
+            # instead of a kernel duplicated for every packed KV codec.
+            call("nexa_causal_gqa_attention_paged_codec", query, len(query),
+                 ctypes.cast(key_table, pointer_table), count,
+                 ctypes.cast(value_table, pointer_table), count,
+                 _KV_CODEC_IDS[self.kv_codec], self.page_tokens,
+                 self.page_tokens * self._cache_plan.token_bytes, self.kv_group_size,
+                 bindings["past_length"], length, attributes["num_heads"],
+                 attributes["num_key_value_heads"], attributes["head_dim"],
+                 attention, len(attention), out, len(out))
             return
         capacity = ((self.page_tokens * self._cache_plan.token_bytes, self.kv_group_size)
                     if self.kv_codec != "f32" else (self.page_tokens * self._cache_plan.kv_width,))

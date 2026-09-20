@@ -258,6 +258,17 @@ a pergunta: o plano mais barato que fica sob um teto de erro, em vez do melhor
 plano sob um teto de bytes. Passaram **665 regressões + 110 testes bootstrap =
 775 testes**, sem falhas ou skips. Checklist: **44 concluídos e 106 pendentes**.
 
+**Vigésimo quarto incremento implementado e validado:** despacho de atenção por
+layout no KV e páginas Q8. Em vez de uma quarta cópia do mesmo kernel,
+`nexa_causal_gqa_attention_paged_codec` usa os acessores genéricos que os tiers
+já tinham (`kv_row_layout`, `kv_lane`, `valid_kv_rows`) e recebe o id do codec.
+Uma regressão roda o kernel dedicado e o compartilhado sobre os mesmos bytes e
+exige o mesmo resultado — um despacho novo não pode mudar um número que já tinha
+kernel. Q8 no cache custa 16 B/token contra 32 B do F32 e 12 B do Q4/Q3, com
+erro 25 vezes menor que o Q4 na fixture. Prefill em chunks continua equivalente
+ao prefill único. Passaram **674 regressões + 110 testes bootstrap = 784
+testes**, sem falhas ou skips. Checklist: **45 concluídos e 105 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -274,13 +285,13 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.03d — atenção packed para os demais codecs de KV.** A
-escala de pesos está completa e planejável; o cache KV ainda executa F32, Q4, Q3
-e TQ, sem Q8 nem meia precisão, e o despacho por layout na atenção é o que
-M4.03d pede. Os codecs já existem no formato; o trabalho é o quantizador de
-página e o kernel de atenção correspondente, sem expansão integral e com
-temporários contabilizados. Alternativas em aberto: M6.01d (conjunto
-representativo e calibração por grupo), M4.06c e M5.01 com modelo real.
+**Próxima tarefa: M4.04 — integrar KV no prefill/decode real e remover a
+duplicação de cache para métricas.** É o item que resta antes do gate M4 junto
+de M4.05d e M4.06c: hoje o KV incremental é opcional por flag e o baseline por
+recomputação continua sendo o caminho padrão da CLI, o que mantém dois modos
+vivos só para comparação. Decidir qual passa a ser o caminho real, e o que a
+comparação ainda precisa medir, é o trabalho. Alternativas em aberto: M6.01d
+(conjunto representativo e calibração por grupo), M4.06c e M5.01 com modelo real.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -682,8 +693,9 @@ transferidos e limite máximo documentados.
   head/página/prefixo, oracle independente e compatibilidade F32/Q4 validados.
 - [x] M4.03c Atenção CPU TQ02 com reconstrução de um head por vez, sem heap,
   scratch/acumulador planejados, oracle independente e compatibilidade F32/Q4/Q3.
-- [ ] M4.03d Atenção packed para demais codecs e despacho conforme seus layouts,
-  sem expansão integral e com temporários contabilizados.
+- [x] M4.03d Atenção packed com despacho por layout: kernel homogêneo sobre os
+  acessores por codec, páginas Q8 por token/head, equivalência com os kernels
+  dedicados e sem expansão de página, head ou prefixo.
 - [ ] M4.04 Integrar no prefill/decode real; remover duplicação de cache para métricas.
 - [x] M4.05a Recodificação CPU por página, transacional, scratch limitado,
   custo/bytes e erro local medidos, com oracle que reproduz o histórico de chunks.
@@ -1551,6 +1563,33 @@ Décimo primeiro incremento:
   [calibração](NEXALM_CALIBRACAO.md). Checklist: **44 concluídos e 106
   pendentes**; M6.01b foi dividido preservando grupo e corpus em M6.01d.
 
+## Registro do vigésimo quarto incremento — despacho por codec no KV
+
+- Concluído M4.03d: `nexa_causal_gqa_attention_paged_codec` executa qualquer
+  codec suportado através de `kv_row_layout`/`kv_lane`/`valid_kv_rows`, os
+  mesmos acessores que a atenção mista dos tiers já usava.
+- Equivalência verificada: o kernel dedicado Q4 e o compartilhado produzem o
+  mesmo resultado sobre os mesmos bytes, e o compartilhado bate com um oracle
+  Python independente em Q8 e Q4.
+- `nexa_q8_quantize` escreve páginas Q8 por token/head, com escala F32 por grupo
+  e um byte com sinal por coordenada; a atenção lê os códigos sem expandir
+  página, head ou prefixo, e `-128` continua reservado.
+- `--kv-codec q8 --kv-group-size G` na CLI. Medição na fixture tiny com páginas
+  de 2 tokens e grupo 4: 12 B/token e erro 0,506 (Q3), 12 B e 0,245 (Q4), 16 B e
+  0,0096 (Q8), 32 B e 0 (F32). Com grupo 4 a escala domina e Q3 não economiza
+  sobre Q4 — o mesmo efeito já registrado nos pesos.
+- Limites: a política de idade mantém os tiers fixos F32/Q4/Q3 e o backing store
+  segue gravando cold Q3; encaixar Q8 num tier é decidir qual degrau ele
+  substitui, o que pertence a M4.05d. Meia precisão e Q2 no cache exigiriam
+  mudar o contrato de escrita por página.
+- Validação macOS ARM64/Python 3.14.5: **674 regressões + 110 bootstrap = 784
+  testes, zero falhas e zero skips**. Os 9 novos cobrem layout e rejeições do
+  plano, o kernel contra oracle, a equivalência com o kernel dedicado, codec
+  desconhecido e scratch pequeno, a escala de bytes/erro entre codecs, prefill
+  em chunks e a CLI.
+- Guia: [codecs de KV](NEXALM_KV_CODECS_CPU.md). Checklist: **45 concluídos e
+  105 pendentes**; M4.03d fechou sem deixar subitem.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1603,6 +1642,10 @@ python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q8 --matrix-codec q8 --group-size 4 --block-rows 3
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
+
+# KV Q8 paginado com despacho por layout.
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5 --decode-tokens 7 --kv-cache --kv-page-tokens 2 --kv-codec q8 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 96KiB
+python3 -m unittest discover -s tests -p 'test_q8_kv_regressions.py' -v
 
 # Escala completa de codecs de peso e plano por teto de qualidade.
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-f16 --matrix-codec f16 --group-size 8 --block-rows 3
@@ -1842,6 +1885,14 @@ Décimo quarto incremento acrescenta:
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
+Vigésimo quarto incremento acrescenta:
+
+- `runtime/nexapack/transformer.c/.h`: `nexa_q8_quantize`, acessores Q8 e
+  `nexa_causal_gqa_attention_paged_codec`.
+- `compiler/paged_kv_plan.py` e `runtime/nexapack/paged.py`: layout e despacho
+  Q8; `tools/nexa_run.py --kv-codec q8`.
+- `tests/test_q8_kv_regressions.py` e `docs/NEXALM_KV_CODECS_CPU.md`.
+
 Vigésimo terceiro incremento acrescenta:
 
 - `runtime/nexapack/format.py`: `Q2_GROUPED` e o encoder/decoder de bits
@@ -1916,6 +1967,9 @@ Décimo sexto incremento acrescenta:
 - `tests/test_tokenizer_regressions.py` e `vocab_size`/`max_position_embeddings`
   parametrizáveis na fixture de bundle.
 - `docs/NEXALM_TOKENIZER.md`: formato, segmentação, reprodutibilidade e limites.
+
+O cache KV paginado homogêneo executa F32, Q4, Q3, Q8 e TQ, com despacho por
+layout.
 
 Limites atuais: DSL e pipeline de modelos separados de nxc; executor C scalar
 orquestrado em Python, uma sequência, baseline por recomputação e KV incremental

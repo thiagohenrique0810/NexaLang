@@ -50,7 +50,7 @@ def main(argv=None):
     parser.add_argument("--kv-cache", action="store_true", help="Use transactional incremental F32 KV instead of recomputing the prefix")
     parser.add_argument("--prefill-chunk-size", type=int, help="Bound activation/logit buffers by processing the prompt in chunks; requires --kv-cache")
     parser.add_argument("--kv-page-tokens", type=int, help="Use on-demand KV pages with this token capacity per page; requires --kv-cache")
-    parser.add_argument("--kv-codec", choices=("f32", "q4", "q3", "tq"), default="f32", help="KV storage codec; q4/q3/tq require --kv-cache and --kv-page-tokens")
+    parser.add_argument("--kv-codec", choices=("f32", "q4", "q3", "q8", "tq"), default="f32", help="KV storage codec; q4/q3/q8/tq require --kv-cache and --kv-page-tokens")
     parser.add_argument("--kv-group-size", type=int, help="Group size within each KV head for q4/q3 (default: 32)")
     parser.add_argument("--kv-bits", type=int, help="TQ bits per coordinate, 1 to 8 (default: 3)")
     parser.add_argument("--kv-seed", type=int, help="TQ signed-int32 transform seed (default: 42)")
@@ -79,8 +79,9 @@ def main(argv=None):
         parser.error("--kv-page-tokens requires --kv-cache and a positive size")
     if args.kv_codec != "f32" and (not args.kv_cache or args.kv_page_tokens is None):
         parser.error(f"--kv-codec {args.kv_codec} requires --kv-cache and --kv-page-tokens")
-    if args.kv_group_size is not None and ((args.kv_policy != "age" and args.kv_codec not in ("q4", "q3")) or args.kv_group_size <= 0):
-        parser.error("--kv-group-size requires --kv-codec q4/q3 or --kv-policy age and a positive size")
+    if args.kv_group_size is not None and ((args.kv_policy != "age" and args.kv_codec not in ("q4", "q3", "q8"))
+                                          or args.kv_group_size <= 0):
+        parser.error("--kv-group-size requires --kv-codec q4/q3/q8 or --kv-policy age and a positive size")
     if args.kv_policy == "age":
         if not args.kv_cache or args.kv_page_tokens is None:
             parser.error("--kv-policy age requires --kv-cache and --kv-page-tokens")
