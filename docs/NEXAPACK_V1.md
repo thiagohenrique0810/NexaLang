@@ -5,8 +5,9 @@ o contêiner comum e a execução Q4; o [contrato TQ portátil](NEXAPACK_TQ_V1.m
 documenta armazenamento/conversão TQ02, sem kernel de matriz TQ. A
 [atenção KV TQ](NEXALM_KV_TQ_CPU.md) usa registros desse codec em páginas próprias. O
 [manifesto de modelo](NEXALM_IMPORTACAO.md) reúne vários arquivos V1 sem alterar
-este contrato. O contêiner `.nxp` é independente do formato TQ01. O futuro `.nxb`
-deve agregar plano, tensores e kernels e ainda não está implementado.
+este contrato. O contêiner `.nxp` é independente do formato TQ01. O
+[pacote `.nxb`](NEXALM_PACOTE_NXB.md) agrega os arquivos de um bundle num
+arquivo só, sem reconverter nada; plano e kernels continuam fora dele.
 
 ## Contêiner
 
@@ -76,7 +77,8 @@ Python em `runtime/nexapack/format.py`:
 - `write_q4_matrix(path, rows, cols, group_size, row_source, block_rows=64)`:
   consome um iterador por grupos, escreve arquivo temporário, sincroniza e substitui
   o destino somente após sucesso.
-- `NexaPackReader(path)`: context manager; abrir carrega somente índice limitado.
+- `NexaPackReader(path, *, window_offset=0, window_bytes=None)`: context manager;
+  abrir carrega somente índice limitado.
 - `read_rows_into(start, count, destination)`: preenche um buffer exato fornecido
   pelo chamador. Usa 64 KiB de scratch fixo para ler/verificar blocos intersectados.
 - `read_rows(start, count)`: conveniência que aloca o resultado; o executor usa

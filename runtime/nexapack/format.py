@@ -724,8 +724,24 @@ class NexaPackReader:
     Use repeated requests for larger ranges. Checksums for intersecting blocks
     are streamed in 64 KiB chunks, including when only part of a block is asked
     for. No external paths or object deserialization exist in the format.
+
+    A matrix may live inside a larger file, such as a section of a `.nxb`
+    container. window_offset/window_bytes name that slice, and the window then
+    replaces the physical file as the unit of verification: the header's total
+    size is compared with window_bytes instead of the file size, every seek is
+    relative to window_offset, and a window that would reach past the file is
+    refused at open, before any payload byte is read. Without that, a shifted
+    window would read the neighbouring section and still satisfy this matrix's
+    own checksums, because index offsets and payload slide together.
     """
-    def __init__(self, path):
+    def __init__(self, path, *, window_offset=0, window_bytes=None):
+        if type(window_offset) is not int or not 0 <= window_offset <= MAX_INTEGER:
+            raise NexaPackError('window_offset must be a nonnegative integer')
+        if window_bytes is not None and (type(window_bytes) is not int
+                                         or not 0 <= window_bytes <= MAX_INTEGER):
+            raise NexaPackError('window_bytes must be a nonnegative integer or None')
+        self._window_offset = window_offset
+        self._window_bytes = window_bytes
         # Unbuffered reads keep payload scratch accounting explicit: one fixed
         # READ_CHUNK_BYTES bytearray, without a hidden BufferedReader buffer.
         self._stream = open(path, 'rb', buffering=0)
@@ -738,7 +754,12 @@ class NexaPackReader:
 
     def _load_metadata(self):
         size = os.fstat(self._stream.fileno()).st_size
-        prefix = self._stream.read(HEADER.size)
+        if self._window_bytes is None:
+            self._window_bytes = max(size - self._window_offset, 0)
+        if self._window_offset + self._window_bytes > size:
+            raise NexaPackError('NexaPack window is outside the file')
+        self._stream.seek(self._window_offset)
+        prefix = self._stream.read(min(HEADER.size, self._window_bytes))
         if len(prefix) != HEADER.size:
             raise NexaPackError('Truncated NexaPack header')
         magic, version, flags, length, payload_offset, total_size, expected_digest = HEADER.unpack(prefix)
@@ -748,7 +769,7 @@ class NexaPackReader:
             raise NexaPackError('Invalid or oversized metadata length')
         if payload_offset != _align(HEADER.size + length):
             raise NexaPackError('Invalid NexaPack payload offset')
-        if total_size != size or not payload_offset < total_size <= MAX_INTEGER:
+        if total_size != self._window_bytes or not payload_offset < total_size <= MAX_INTEGER:
             raise NexaPackError('Truncated file or inconsistent file size')
         encoded = self._stream.read(length)
         if len(encoded) != length or hashlib.sha256(encoded).digest() != expected_digest:
@@ -901,6 +922,16 @@ class NexaPackReader:
         """Actual payload bytes read, including checksum reads outside returned rows."""
         return self._payload_bytes_read
 
+    @property
+    def window_offset(self):
+        """Where this matrix starts inside its file; zero for a standalone `.nxp`."""
+        return self._window_offset
+
+    @property
+    def window_bytes(self):
+        """Bytes this matrix owns; the header's total size has to match it exactly."""
+        return self._window_bytes
+
     def _request_size(self, start, count):
         if self._stream.closed:
             raise NexaPackError('NexaPack reader is closed')
@@ -944,7 +975,9 @@ class NexaPackReader:
                 digest = hashlib.sha256()
                 low = max(start - block.start_row, 0) * self.row_bytes
                 high = min(end - block.start_row, block.row_count) * self.row_bytes
-                self._stream.seek(block.offset)
+                # Block offsets are relative to the matrix, which may start
+                # partway into a container file.
+                self._stream.seek(self._window_offset + block.offset)
                 consumed = 0
                 while consumed < block.size:
                     chunk = scratch_view[:min(READ_CHUNK_BYTES, block.size - consumed)]
