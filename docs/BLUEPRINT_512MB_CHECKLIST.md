@@ -129,6 +129,40 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo primeiro incremento — bloco paralelo, onda 3: contêiner `.nxb`.**
+Um agente sozinho, dono exclusivo de `format.py` e `bundle.py` pela duração,
+porque o modo de falha desta mudança é silencioso: uma janela aplicada num lugar
+e esquecida noutro lê o payload do tensor vizinho e ainda passa no próprio SHA,
+já que os offsets deslizam juntos. As quatro recusas de janela têm teste próprio.
+**863 testes** (831 + 32), zero falhas, zero skips.
+
+**O `.nxb` não economiza bytes, e o número foi publicado como é.** Contra a soma
+dos `file_bytes` do diretório: **+134,17%** na fixture tiny (36.732 → 86.016) e
+**+1,60%** no modelo pequeno de 4 camadas (2.438.960 → 2.478.080). A causa é
+alinhar toda seção a 4096 — inclusive vetores de 32 bytes e assets de 20 —
+decisão declarada como preferência por um `mmap` que ninguém usa ainda, não como
+otimização provada. Medido contra `st_blocks * 512`, o que o sistema de arquivos
+realmente aloca, o custo real é **+4.096 B** (tiny) e **+8.192 B** (pequeno):
+uma e duas páginas. O ganho verdadeiro é 12 e 39 arquivos virando **1**.
+
+Falsificação: 17 bugs injetados, **16 pegos**. O não pego é uma cláusula
+genuinamente redundante em `format.py` (`offset + block_size > total_size`),
+cuja remoção não derruba nenhum teste porque a checagem de cobertura duas linhas
+adiante recusa o mesmo arquivo — registrado como redundância declarada em vez de
+fingir isolamento. Uma injeção obrigou a **consertar o teste**: virar um byte
+qualquer do índice JSON quebrava o parse de todo jeito, então a prova foi
+reescrita para trocar um dígito hex dentro de um `sha256` de seção, o único byte
+que sobrevive ao parse e às checagens de layout — só o digest do cabeçalho pega.
+
+Ressalva do próprio autor, registrada: o oráculo de execução entregue **não é o
+que foi pedido**. Em vez de identidade de bits entre a referência Python e a
+sessão nativa, ele entregou identidade de bits entre três execuções nativas
+(diretório, `.nxb`, diretório restaurado) e entre Python-sobre-diretório e
+Python-sobre-`.nxb`, mantendo nativo × Python na tolerância da casa. A razão é
+boa — o oráculo é torch float64 e o kernel é C escalar; exigir bits iguais entre
+os dois é afirmação insustentável — e a substituição está declarada como decisão
+dele, não aprovação de ninguém.
+
 **Trigésimo incremento implementado e validado — bloco paralelo, onda 2.** Três
 itens independentes executados ao mesmo tempo em worktrees isolados, com
 fronteiras de arquivo escritas em `AGENTS.md` antes de começar: nenhum conflito
@@ -747,7 +781,23 @@ medições. Telemetria e baseline de modelos continuam pendentes.
 - [ ] M1.09 Importadores GGUF e ONNX com rejeição explícita de operações incompatíveis.
 - [x] M1.10a Múltiplos tensores, manifesto versionado, aliases tied, normas F32,
   checksums, leitura parcial e publicação atômica sem alterar o formato V1 de matriz.
-- [ ] M1.10b Pacote executável `.nxb` com plano, kernels, variantes e fallback.
+- [x] M1.10b1 Contêiner `.nxb` V1, um arquivo só, e execução direta a partir
+  dele: prefixo de 64 bytes, índice JSON com `kind`/`path`/`offset`/`bytes`/
+  `sha256` por seção, todo padding verificado como zero, `kind` desconhecido
+  recusado (o gancho versionado por onde plano e kernels entram em V2), janela
+  em `NexaPackReader` com as quatro recusas provadas, e `ModelBundleReader`
+  aceitando diretório ou `.nxb` sem mudar a API pública.
+- [ ] M1.10c Plano e variantes no pacote: `lower_model` recebe o comprimento como
+  argumento de execução, então um plano persistido vale para um comprimento só —
+  ou o pacote fixa os argumentos e recusa execução fora deles, ou é só uma dica.
+  A invariante que dá valor: o plano recomputado tem de bater byte a byte com o
+  gravado. Depende da fronteira de M2.02.
+- [ ] M1.10d Kernels e fallback no pacote: hoje há exatamente UMA implementação
+  por kernel, compilada pelo clang do host na primeira chamada. Uma tabela de
+  variantes com uma entrada, escolhendo sempre a si mesma, é infalsificável;
+  exige um segundo alvo real (M2.01/M2.03). A exigência do PDF da Primeira LLM
+  §8.3 — nunca depender de Python no runtime final — continua não atendida
+  enquanto o leitor do `.nxb` for Python.
 - [x] M1.11a Tipos `qint<N>`/`PackedVector<N>` como armazenamento/ABI para N em
   {2,3,4,8}, com pack/unpack byte-idêntico aos codecs agrupados de `format.py`,
   seis intrínsecos `qpack::`, contrato de FFI escrito e prova de identidade em
