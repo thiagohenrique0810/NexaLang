@@ -55,3 +55,6 @@ __pycache__/
 !whitepaper.md
 !roadmap.md
 !requirements.txt
+
+# Worktrees temporários de agentes paralelos
+.claude/worktrees/

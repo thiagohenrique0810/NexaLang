@@ -129,6 +129,40 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo incremento implementado e validado — bloco paralelo, onda 2.** Três
+itens independentes executados ao mesmo tempo em worktrees isolados, com
+fronteiras de arquivo escritas em `AGENTS.md` antes de começar: nenhum conflito
+nos três merges. **831 testes** (743 + 88), zero falhas, zero skips.
+
+**M4.06e** — duas sessões construídas de forma independente, nunca derivadas uma
+da outra, compartilham as páginas de KV em que seus prompts coincidem.
+`adopt_prefix(source, token_ids)` calcula o prefixo comum de páginas; as páginas
+adotadas são byte-idênticas a um controle que só executou o prefixo. Residência:
+45.662 B duplicados → 24.174 B únicos, `copied_bytes` = 0 — a mesma aritmética já
+registrada para `fork`, agora sem parentesco. **O checklist registrava o motivo da
+recusa sob idade ao contrário**: truncar um prefixo torna as páginas mais novas,
+exigindo promoção, não mais velhas; a recusa passou a ser medida página a página.
+
+**M1.11a** — `qint<N>`/`PackedVector<N>` como armazenamento/ABI para N em
+{2,3,4,8}, com pack/unpack byte-idêntico aos codecs de `format.py`. Prova em três
+vias contra um oráculo novo que importa só `math` e `struct`, 420 casos por modo,
+nativo e `--jit`. A escala de 4 bytes custa exatamente +1 bit por valor em grupo
+32 e +4 bits em grupo 8. Bug real corrigido de quebra: `visit_ExternBlock` era
+`pass` no semantic e no codegen, então `extern "Fortran-77"` compilava e saía 0.
+
+**M6.08a + M6.05a** — um agente só, porque os dois precisavam do mesmo avaliador
+independente. Oráculo contra oráculo (C escalar float32 × Python float64, mesmos
+pesos decodificados): pior caso 4,77e-07 abs / 9,64e-06 rel contra tolerância
+declarada antes de medir. **Os dois zeros pedidos vieram como zeros**: os três
+passes algébricos casam zero sítios no grafo Llama real (33, 243 e 483 ops), e as
+StreamingRegions compram 2,27% da arena e não 94%, porque os logits são 97,7% do
+pico. Os 38% da fixture tiny foram publicados como aviso de fixture escolhida,
+não como resultado.
+
+Checklist: **54 concluídos e 104 pendentes** — quatro itens fechados e quatro
+sub-itens novos (M1.11b, M4.06f, M6.05c, M6.08b), então o saldo de pendentes não
+muda. Isso é o comportamento esperado deste projeto, não um fracasso do bloco.
+
 **Vigésimo nono incremento implementado e validado:** seleção de precisão por
 custo físico. O planejador otimizava o **payload** — os bytes que o codec
 codifica. O container NexaPack cobra um overhead fixo por tensor empacotado que
@@ -347,6 +381,13 @@ Ao retomar:
    Consulte o PDF/páginas e o guia de ajustes vinculados ao ID escolhido; ao parar,
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
+
+**Limite declarado que merece destaque: `PackedVector<N>` curto é corrupção de
+memória.** O kernel C valida `packed_bytes < total`, mas o codegen passa o
+tamanho que o layout **exige** como se fosse o **disponível**, porque a linguagem
+não enxerga a capacidade de um buffer cru. A checagem do kernel é portanto
+inalcançável pela linguagem. Corrigir exige a semântica carregar capacidade no
+tipo; ficou em M1.11b e está escrito em `docs/NEXALM_FFI_CONTRATO.md`.
 
 **Próxima tarefa: M1.10b — pacote executável `.nxb`.** Plano, kernels, variantes
 e fallback num container só, versionado e verificável, que é o que falta para um
@@ -707,7 +748,17 @@ medições. Telemetria e baseline de modelos continuam pendentes.
 - [x] M1.10a Múltiplos tensores, manifesto versionado, aliases tied, normas F32,
   checksums, leitura parcial e publicação atômica sem alterar o formato V1 de matriz.
 - [ ] M1.10b Pacote executável `.nxb` com plano, kernels, variantes e fallback.
-- [ ] M1.11 Tipos `qint<N>`/PackedVector na linguagem e contrato de FFI documentado.
+- [x] M1.11a Tipos `qint<N>`/`PackedVector<N>` como armazenamento/ABI para N em
+  {2,3,4,8}, com pack/unpack byte-idêntico aos codecs agrupados de `format.py`,
+  seis intrínsecos `qpack::`, contrato de FFI escrito e prova de identidade em
+  três vias (linguagem / `format.py` / oráculo independente) em 420 casos por
+  modo, nativo e `--jit`. Corrigido de quebra um bug real: `visit_ExternBlock`
+  era `pass`, então `extern "Fortran-77"` compilava e saía 0.
+- [ ] M1.11b Aritmética sobre `qint<N>`, matmul e integração com tensores/bundles;
+  **capacidade no tipo** — hoje `PackedVector<N>` não carrega a capacidade do
+  buffer, o codegen passa o tamanho exigido pelo layout como se fosse o
+  disponível, e um buffer curto é corrupção de memória em vez de diagnóstico;
+  `cast::<qint<N>>` de inteiro em runtime trunca sem verificar.
 
 **Gate CPU/Q4 de M1 aprovado:** matriz packed maior que o orçamento de buffers
 processada por blocos, resultado comparado à referência e nenhuma expansão
@@ -806,10 +857,15 @@ transferidos e limite máximo documentados.
   superior declarado por sessão, devolução no close e admissão segura entre
   threads; `cancel()` de outra thread com rollback completo da transação,
   inclusive durante migração e evicção, e chamada concorrente recusada.
-- [ ] M4.06e Reuso de prefixo entre sessões que não derivam uma da outra:
-  adoção de prefixo **parcial** (as primeiras K páginas em comum), descoberta do
-  maior prefixo comum e re-envelhecimento na adoção, já que truncar o prefixo
-  muda as idades e portanto os codecs canônicos sob `--kv-policy age`.
+- [x] M4.06e Reuso de prefixo entre sessões que não derivam uma da outra:
+  `common_page_prefix` puro, `adopt_prefix(source, token_ids)` público no
+  executor paginado, páginas adotadas byte-idênticas a um controle que só
+  executou o prefixo, e recusa medida página a página sob a política de idade —
+  cujo motivo o checklist registrava **ao contrário**: truncar torna as páginas
+  mais novas, exigindo promoção, não mais velhas.
+- [ ] M4.06f Descoberta automática do maior prefixo comum entre sessões (hoje
+  quem chama escolhe a origem), reuso sob política de idade com orçamento de
+  retenção admitido na adoção, e reuso sob backing store.
 
 **Gate M4:** melhoria de bytes/token comprovada no cache usado pela atenção,
 com qualidade, latência e temporários contabilizados.
@@ -860,10 +916,27 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
   arquivo, e metadados por bloco heterogêneo tendem a aumentá-lo.
 - [ ] M6.03 CompressionPlanner escolhe codec/sparsity/low-rank sem presumir speedup.
 - [ ] M6.04 Fusões dequant+GEMM, RMSNorm+QKV, QKV+RoPE e FFN/SwiGLU por custo.
-- [ ] M6.05 StreamingRegions entre operações com dependências e register pressure.
+- [x] M6.05a StreamingRegions como análise pura: regra de corte falsificável
+  (só `CausalAttention` lê linhas anteriores, logo encerra uma região),
+  `detect_streaming_regions`, `derive_streamed_activation_requests` e identidade
+  byte a byte entre avaliação inteira e dirigida tile a tile. Economia medida no
+  modelo real: **2,27%**, não 94% — os logits são 97,7% do pico.
+- [ ] M6.05c Execução em streaming de fato: não há tiling nos kernels C nem laço
+  de tiles no executor, e o ganho fica preso em 2,3% enquanto não existir um
+  consumidor de logits em streaming.
 - [ ] M6.06 SparseBlock, block-zero/N:M, activation tile skipping e fallback dense.
 - [ ] M6.07 Pruning/low-rank/permutações offline e equivalência/qualidade validadas.
-- [ ] M6.08 Otimizações algébricas de grafo com provas locais/testes de tolerância.
+- [x] M6.08a Avaliador independente de `ModelGraph` em float64 puro
+  (`compiler/graph_eval.py`), pass manager que mede a promessa de cada reescrita
+  antes de aceitá-la, `DeadOpElimination`/`CSE` exatos e um fold por tolerância.
+  Oráculo contra oráculo: C escalar float32 × Python float64, pior caso
+  4,77e-07 abs / 9,64e-06 rel contra tolerância declarada antes. Os três passes
+  casam **zero** sítios no grafo Llama real (33, 243 e 483 ops) — o valor da
+  entrega é o verificador, não o ganho.
+- [ ] M6.08b Passes que dariam ganho real num Llama — fusão RMSNorm+projeção,
+  RoPE dentro da projeção Q/K, `Add` residual sobre o matmul — todos dependentes
+  de kernels fundidos que não existem; e execução do grafo dobrado, já que o
+  runtime não lê `ConstantDerivation`.
 
 ## M7 — backends e autotuner (PDF fase 9, P09–10/P27/P29)
 
@@ -1389,6 +1462,37 @@ Décimo primeiro incremento:
   **32 concluídos e 107 pendentes**; a divisão de M4.05 e as duas tarefas CC
   acrescentadas na mesma revisão aumentam a contagem, sem equivaler a percentual
   de conclusão ou prazo. Próximo incremento técnico: M4.05d.
+
+## Registro do trigésimo incremento — bloco paralelo, onda 2
+
+- Precedido de um reconhecimento com 21 agentes sobre os 17 itens desbloqueados.
+  Ele **matou 7 deles** com verificação no código: M6.04 (a fusão principal já
+  está feita, `full_dequantized_weight_buffer_bytes` já é 0, e as outras três são
+  recusadas por 87 sítios `disjoint()` em `transformer.c`); M6.06 (o codec 2:4 em
+  grupo 32 custa 16 B/grupo, idêntico ao Q3, errando mais — nunca seria
+  escolhido); M9.06 (todo formato está na versão 1, um guia v1→v2 não tem
+  sujeito); CC.01, M2.02, PL.04 e OMNI.01 (valor depende de GPU, checkpoint
+  treinado ou modelo baixado). Esses descartes são o que tornou o resto
+  paralelo: liberaram `transformer.py`, `q4.c` e `bundle.py` para um dono cada.
+- `AGENTS.md` ganhou as fronteiras de trabalho paralelo. Dez propostas colidiam
+  em ~30 linhas de imports e links markdown, não em engenharia.
+- Cada agente foi obrigado a **tentar quebrar os próprios testes**. Em M4.06e
+  isso pegou um oráculo inerte: os dois prompts divergiam exatamente na fronteira
+  de página, então teto e piso coincidiam e um bug de teto passava. A fixture foi
+  corrigida para divergir no meio da terceira página, e só então o teste falhou
+  com o bug injetado. Dez bugs injetados, um por teste.
+- Ressalvas que os próprios autores levantaram e que ficam registradas: o oráculo
+  de `qint` é independente na derivação, não na forma — o contrapeso real é
+  `format.py`, código preexistente; `MatMulProjectionFold` nunca foi executado
+  fora do avaliador, porque o runtime não lê `ConstantDerivation`; e
+  `MAX_EVAL_ELEMENTS` impede verificar as arquiteturas reais, de modo que o zero
+  do M6.08 prova que nada casa, não que nada quebraria se casasse.
+- Suíte integrada: **831 testes**, zero falhas, zero skips, em
+  `python3 -m unittest discover -s tests`, mais `make -C runtime all test`.
+- Guias: [reuso sem parentesco](NEXALM_KV_SEQUENCIAS_CPU.md),
+  [contrato de FFI](NEXALM_FFI_CONTRATO.md),
+  [álgebra de grafo](NEXALM_GRAFO_ALGEBRA.md),
+  [regiões de streaming](NEXALM_STREAMING_REGIOES.md).
 
 ## Registro do vigésimo nono incremento — custo físico na seleção de precisão
 
