@@ -140,6 +140,9 @@ class PagedTransformerSession(IncrementalTransformerSession):
         """Everything a derived sequence needs to reproduce this exact layout."""
         packed = self.kv_codec in ("q4", "q3")
         return {"memory_budget": self.budget, "reserve_bytes": self.reserve,
+                # A derived sequence admits its own bound against the same
+                # ceiling: sharing lowers residence, never the reservation.
+                "memory_pool": self._pool,
                 "max_sequence_length": self.max_sequence_length, "tile_rows": self.tile_rows,
                 "page_tokens": self.page_tokens, "max_chunk_length": self._requested_chunk_length,
                 "kv_codec": self.kv_codec, "kv_group_size": self.kv_group_size if packed else None,

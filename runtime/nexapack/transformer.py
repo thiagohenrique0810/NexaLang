@@ -6,12 +6,14 @@ tokenizer assets, or lists of logits retained by the caller. PyTorch is not used
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import ctypes
 from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 
 from compiler.hardware_profile import HardwareProfile
@@ -91,6 +93,10 @@ def _positive(value, label):
     return value
 
 
+class SessionCancelled(RuntimeError):
+    """A call was cancelled from another thread; the committed prefix is intact."""
+
+
 class TransformerSession:
     """Single-sequence, causal Llama evaluation with transactional token history.
 
@@ -100,11 +106,19 @@ class TransformerSession:
     Instances are synchronous and must not be used concurrently.
     """
     def __init__(self, bundle_path, *, memory_budget="512MiB", max_sequence_length=None,
-                 tile_rows=32, reserve_bytes=0):
+                 tile_rows=32, reserve_bytes=0, memory_pool=None):
         self._closed = False
         self._tokens = ()
         self._last_report = None
         self._workspace_template = None
+        self._pool = memory_pool
+        self._reservation = None
+        self._admission_bytes = 0
+        # cancel() is the one method another thread may call while this one
+        # executes; everything it touches is guarded here.
+        self._call_lock = threading.Lock()
+        self._running = False
+        self._cancel_requested = False
         self.path = Path(bundle_path)
         self.budget = parse_memory_size(memory_budget)
         self.reserve = parse_memory_size(reserve_bytes)
@@ -162,7 +176,11 @@ class TransformerSession:
             graph, plan = self._make_plan(self.max_sequence_length)
             self._capacity_plan = plan.to_dict()
             self._last_report = self._report(graph, plan, executed=False)
+            # The session's own admission passed; the shared ceiling comes next,
+            # still before any weight, arena or KV page exists.
+            self._admit()
         except BaseException:
+            self._release_reservation()
             self._bundle.close()
             self._closed = True
             raise
@@ -307,6 +325,9 @@ class TransformerSession:
 
         def call(name, *args):
             nonlocal compute_seconds
+            # Every native kernel goes through here, so one check covers each
+            # matmul tile and each embedding row without a check per operator.
+            self._check_cancelled()
             tick = time.perf_counter()
             status = getattr(kernels, name)(*args)
             compute_seconds += time.perf_counter() - tick
@@ -314,6 +335,7 @@ class TransformerSession:
                 raise ArithmeticError(f"Native {name} failed with status {status}")
 
         for op, action in self._execution_steps(graph, execution_context):
+            self._check_cancelled()
             if op is None:
                 self._state_action(action, buffer, execution_context, call)
                 continue
@@ -434,7 +456,8 @@ class TransformerSession:
     def prefill(self, token_ids):
         self._check_open()
         tokens = self._validate_tokens(token_ids)
-        output, report = self._execute(tokens)
+        with self._call_guard():
+            output, report = self._execute(tokens)
         self._tokens, self._last_report = tokens, report
         return output
 
@@ -443,7 +466,8 @@ class TransformerSession:
         if not self._tokens:
             raise ValueError("decode requires a successful prefill first")
         tokens = self._validate_tokens([*self._tokens, token_id])
-        output, report = self._execute(tokens)
+        with self._call_guard():
+            output, report = self._execute(tokens)
         self._tokens, self._last_report = tokens, report
         return output[-1]
 
@@ -455,10 +479,68 @@ class TransformerSession:
 
     def report(self):
         self._check_open()
-        return json.loads(json.dumps(self._last_report, allow_nan=False))
+        report = json.loads(json.dumps(self._last_report, allow_nan=False))
+        if self._pool is not None:
+            report["memory"]["session_admission_bytes"] = self.admission_bytes
+            report["memory_pool"] = self._pool.to_dict()
+        return report
+
+    @property
+    def admission_bytes(self):
+        """Upper bound this session reserves against a shared ceiling.
+
+        Fixed at construction from the session capacity plan: a reservation
+        that drifted per call would stop matching what the pool holds.
+        """
+        return self._admission_bytes
+
+    def _admit(self):
+        memory = self._last_report["memory"]
+        self._admission_bytes = memory.get("capacity_managed_buffers_bound_bytes",
+                                           memory["managed_buffers_peak_bound_bytes"])
+        if self._pool is not None:
+            self._reservation = self._pool.admit(str(self.path), self._admission_bytes)
+
+    def _release_reservation(self):
+        if self._pool is not None and self._reservation is not None:
+            self._pool.release(self._reservation)
+            self._reservation = None
+
+    def cancel(self):
+        """Ask a call in flight to stop; returns whether one was running.
+
+        Safe to call from another thread, and the only method that is. A
+        cancelled call rolls back exactly like a failed one: the committed
+        prefix, its pages and its report are the ones from before the call.
+        """
+        with self._call_lock:
+            if not self._running:
+                return False
+            self._cancel_requested = True
+            return True
+
+    @contextmanager
+    def _call_guard(self):
+        """Own the cancellation flag for one call, and refuse a concurrent one."""
+        with self._call_lock:
+            if self._running:
+                raise ValueError("This session is already executing a call; sessions are single-threaded")
+            self._running, self._cancel_requested = True, False
+        try:
+            yield
+        finally:
+            with self._call_lock:
+                self._running, self._cancel_requested = False, False
+
+    def _check_cancelled(self):
+        # Read without the lock: a stale False only delays the stop by one step,
+        # and CPython publishes the flag before the cancelling thread returns.
+        if self._cancel_requested:
+            raise SessionCancelled("The call was cancelled; the committed prefix is unchanged")
 
     def close(self):
         if not self._closed:
+            self._release_reservation()
             self._bundle.close()
             self._tokens = ()
             self._closed = True

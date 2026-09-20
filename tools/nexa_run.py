@@ -49,6 +49,8 @@ def main(argv=None):
     parser.add_argument("--eos-token", type=int, help="Stop greedy generation when this ID is selected")
     parser.add_argument("--max-sequence-length", type=int)
     parser.add_argument("--memory-budget", default="512MiB")
+    parser.add_argument("--memory-pool", help="Joint ceiling shared by this session and any "
+                                              "sequence derived from it (e.g. 512MiB)")
     parser.add_argument("--reserve", default="0B")
     parser.add_argument("--tile-rows", type=int, default=32)
     parser.add_argument("--kv-cache", action="store_true",
@@ -194,6 +196,11 @@ def main(argv=None):
                         session_options.update({"kv_bits": args.kv_bits, "kv_seed": args.kv_seed})
             if args.prefill_chunk_size is not None:
                 session_options["max_chunk_length"] = min(args.prefill_chunk_size, capacity)
+        pool = None
+        if args.memory_pool is not None:
+            from runtime.nexapack.admission import SessionMemoryPool
+            pool = SessionMemoryPool(args.memory_pool)
+            session_options["memory_pool"] = pool
         with session_type(args.bundle, memory_budget=args.memory_budget,
                                 max_sequence_length=capacity, tile_rows=args.tile_rows,
                                 reserve_bytes=args.reserve, **session_options) as session:
@@ -311,6 +318,8 @@ def main(argv=None):
                         "managed_buffers_peak_bound_bytes": memory["managed_buffers_peak_bound_bytes"],
                         "scope": "second sequence sharing the complete pages of this prefix",
                     }
+                    if pool is not None:
+                        report["derived_sequence"]["memory_pool"] = pool.to_dict()
                 finally:
                     derived.close()
             if args.verify:

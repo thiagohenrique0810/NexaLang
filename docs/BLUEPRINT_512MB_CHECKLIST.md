@@ -129,6 +129,23 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Vigésimo oitavo incremento implementado e validado:** admissão conjunta e
+cancelamento. `SessionMemoryPool` é o termo compartilhado que faltava: cada
+sessão admitia só o próprio orçamento, então duas de 300 MiB passavam nas duas
+admissões e juntas estouravam um processo de 512 MiB. A sessão reserva
+`capacity_managed_buffers_bound_bytes` — o limite superior que já publicava —
+fixado na construção, depois do plano de capacidade e antes de qualquer peso,
+arena ou página. Compartilhar prefixo reduz residência e **não** reduz a reserva:
+a derivada pode dar `append` e as páginas deixam de ser compartilhadas. Dezesseis
+threads disputando dez vagas admitem exatamente dez. `cancel()` é o único método
+que outra thread pode chamar durante uma execução; a verificação fica no laço de
+operadores, dentro de `call()` (por onde passa todo kernel nativo) e no laço de
+migração, e o guard envolve a transação inteira — cancelar durante a migração
+descarta tudo e devolve o prefixo byte a byte. Chamada concorrente de verdade é
+recusada com `ValueError`. Falta o reuso de prefixo entre sessões não derivadas,
+que ficou em M4.06e por não ser um `fork` generalizado. Passaram **725 testes**,
+sem falhas ou skips. Checklist: **49 concluídos e 104 pendentes**.
+
 **Vigésimo sétimo incremento implementado e validado:** critérios de qualidade
 para as transições de idade. `--kv-quality-max-rmse T --kv-retain-pages N` mede o
 erro de re-encode **por página** antes de publicar qualquer coisa e descarta o
@@ -315,21 +332,30 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.06d — cancelamento de chamada em andamento e admissão
-conjunta.** É o que resta de M4 junto de M4.05e. Cancelar exige executar a
-chamada fora da thread que cancela; hoje só há rollback de falhas. Admissão
-conjunta por processo é o passo que falta para várias sessões coexistirem sob um
-único teto de 512 MB, já que hoje cada sessão admite o próprio orçamento e o
-compartilhamento reduz residência real sem reduzir a reserva. Alternativas em
-aberto: M4.05e (importância por página, que depende de M6.01), M6.01d (conjunto
-representativo) e M5.01 com modelo real.
+**Próxima tarefa: M6.02c — PrecisionMap por bloco e seleção por custo físico.**
+O planejador já escolhe codec por tensor sob orçamento de bytes ou teto de RMSE;
+falta escolher por bloco dentro do tensor e trocar o custo nominal pelo custo
+físico, que é o que de fato vai à memória. É autocontido e mede-se na fixture,
+sem depender de GPU nem de checkpoint treinado. Alternativas em aberto: M1.10b
+(pacote `.nxb`), M4.06e (reuso de prefixo parcial), M4.05e e M6.01d — ambos
+dependentes da calibração em modelo treinado — e M5.01 com modelo real, que
+continua sendo o maior desbloqueio e depende de uma decisão de qual checkpoint
+baixar, sob qual licença e onde guardar os pesos fora do Git.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
 revisão/hash em M0.08 e medir prefill/decode e qualidade sem PyTorch. Sem
 modelo baixado no repositório: registrar origem, revisão e hashes.
 
-**Também pendente: M4.06c — sequências derivadas sob backing store, cancelamento
+**Também pendente: M4.06e — reuso de prefixo entre sessões não derivadas.**
+Não é `fork` generalizado: `fork` adota o prefixo inteiro, e aqui interessa
+adotar um prefixo **parcial**. No executor homogêneo é direto; sob a política de
+idade o codec vem da distância até o fim, então truncar o prefixo muda todas as
+idades e a página adotada ficaria acima da precisão que a nova idade lhe dá —
+o mecanismo de retenção de M4.05d, com orçamento limitado. Exige re-envelhecer
+na adoção, pagando re-encode, ou recusar prefixo parcial sob idade.
+
+**Histórico: M4.06c — sequências derivadas sob backing store, cancelamento
 e admissão conjunta.** Páginas cold são arquivos de um store privado que os
 remove ao fechar; compartilhá-las exige propriedade por referência sobre os
 arquivos, ou uma cópia explícita, antes de permitir `fork`. Cancelar uma chamada
@@ -759,9 +785,15 @@ transferidos e limite máximo documentados.
 - [x] M4.06c Sequências derivadas sob backing store: arquivos cold com
   propriedade por referência, store com múltiplos donos, qualquer ordem de
   fechamento e retirada que respeita os demais leitores.
-- [ ] M4.06d Cancelamento de uma chamada em andamento, limites e admissão
-  conjunta por processo, e reuso de prefixo entre sessões que não derivam uma
-  da outra.
+- [x] M4.06d Cancelamento de uma chamada em andamento e admissão conjunta por
+  processo: `SessionMemoryPool` com teto compartilhado, reserva do limite
+  superior declarado por sessão, devolução no close e admissão segura entre
+  threads; `cancel()` de outra thread com rollback completo da transação,
+  inclusive durante migração e evicção, e chamada concorrente recusada.
+- [ ] M4.06e Reuso de prefixo entre sessões que não derivam uma da outra:
+  adoção de prefixo **parcial** (as primeiras K páginas em comum), descoberta do
+  maior prefixo comum e re-envelhecimento na adoção, já que truncar o prefixo
+  muda as idades e portanto os codecs canônicos sob `--kv-policy age`.
 
 **Gate M4:** melhoria de bytes/token comprovada no cache usado pela atenção,
 com qualidade, latência e temporários contabilizados.
@@ -1335,6 +1367,40 @@ Décimo primeiro incremento:
   **32 concluídos e 107 pendentes**; a divisão de M4.05 e as duas tarefas CC
   acrescentadas na mesma revisão aumentam a contagem, sem equivaler a percentual
   de conclusão ou prazo. Próximo incremento técnico: M4.05d.
+
+## Registro do vigésimo oitavo incremento — admissão conjunta e cancelamento
+
+- Concluído M4.06d. `runtime/nexapack/admission.py`: `SessionMemoryPool` com
+  teto compartilhado, `admit`/`release` por handle opaco, contadores
+  (reservado, pico, membros, admissões, recusas) e `PoolAdmissionError` com os
+  quatro números do caso. `policy_id` `PROCESS_JOINT_ADMISSION_UPPER_BOUND_V1`.
+- A sessão reserva `capacity_managed_buffers_bound_bytes`, fixado na construção:
+  uma reserva que variasse por chamada deixaria de bater com o que o pool guarda.
+  A admissão ocorre depois do plano de capacidade e antes de peso, arena ou
+  página; uma sessão recusada fecha o bundle e não deixa reserva.
+- Compartilhar prefixo **não** reduz a reserva. A sequência derivada admite o
+  próprio limite contra o mesmo teto, porque pode dar `append` e então as páginas
+  deixam de ser compartilhadas; admitir o número menor seria admitir um estado
+  que as duas sequências são livres de abandonar.
+- `cancel()` é o único método seguro de outra thread. `_call_guard` envolve a
+  transação inteira; `_check_cancelled` fica no laço de operadores, dentro de
+  `call()` — por onde passa todo kernel nativo, o que dá granularidade por tile
+  de matmul e por linha de embedding — e nos laços de migração e de evicção.
+  `SessionCancelled` sai pelo mesmo `finally` que trata falha, então o rollback é
+  o que já existia. Chamada concorrente real é recusada com `ValueError`.
+- `tools/nexa_run.py --memory-pool` compartilha o teto com a sequência derivada
+  de `--fork-tokens` e publica os contadores no relatório.
+- `tests/test_admission_cancel_regressions.py`: 20 regressões — pool puro (6,
+  incluindo dezesseis threads disputando dez vagas atrás de uma barreira),
+  sessão sob pool (7, incluindo fork e CLI) e cancelamento (7, incluindo
+  cancelamento durante a migração com comparação byte a byte do prefixo e o
+  executor baseline). Cinco execuções repetidas sem intermitência.
+- Fora de escopo, registrado em M4.06e: reuso de prefixo entre sessões que não
+  derivam uma da outra exige adoção **parcial**, e truncar o prefixo muda as
+  idades sob `--kv-policy age`.
+- Passaram **725 testes** (`python3 -m unittest discover -s tests`), sem falhas
+  ou skips. Guia: [admissão e cancelamento](NEXALM_ADMISSAO_CANCELAMENTO.md).
+  Checklist: **49 concluídos e 104 pendentes**. Próximo: M6.02c.
 
 ## Registro do vigésimo sétimo incremento — qualidade nas transições
 
@@ -2016,6 +2082,18 @@ Décimo quarto incremento acrescenta:
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
+Vigésimo oitavo incremento acrescenta:
+
+- `runtime/nexapack/admission.py`: `SessionMemoryPool` e `PoolAdmissionError`.
+- `runtime/nexapack/transformer.py`: `memory_pool=`, `admission_bytes`,
+  `cancel()`, `_call_guard`, `_check_cancelled` e `SessionCancelled`.
+- `runtime/nexapack/incremental.py`, `tiered.py` e `offloaded.py`: guard nos
+  pontos de entrada e verificação nos laços de migração e evicção.
+- `runtime/nexapack/paged.py`: o pool viaja em `_fork_options`.
+- `tools/nexa_run.py`: `--memory-pool`.
+- `tests/test_admission_cancel_regressions.py` e
+  `docs/NEXALM_ADMISSAO_CANCELAMENTO.md`.
+
 Vigésimo sétimo incremento acrescenta:
 
 - `compiler/tiered_kv_plan.py`: `quality_max_rmse`/`retain_pages` na política,
@@ -2137,8 +2215,10 @@ Páginas cold podem ser reutilizadas em slots admitidos, e sequências derivadas
 compartilham o prefixo paginado, homogêneo ou por idade. Um teto de RMSE por
 página pode impedir que uma transição de idade seja adotada, dentro de um
 orçamento de retenção admitido. Pesos Q3/TQ, TQ misto, importância por página,
-prefetch e admissão conjunta entre sessões permanecem pendentes; promoção real de
-precisão foi declarada impossível. O cache privado CPU não implementa residência
+prefetch e reuso de prefixo entre sessões não derivadas permanecem pendentes;
+promoção real de precisão foi declarada impossível. Várias sessões podem
+coexistir sob um teto único com `SessionMemoryPool`, e uma chamada em andamento
+pode ser cancelada de outra thread com rollback completo. O cache privado CPU não implementa residência
 GPU de experts, roteamento condicional ou Plastic Learning.
 Há tokenizer byte-level com execução a partir de texto, ainda sem vocabulário
 congelado em corpus real.

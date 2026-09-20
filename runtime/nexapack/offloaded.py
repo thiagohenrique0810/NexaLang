@@ -269,6 +269,7 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
             page = final_pages[index]
             if descriptor.tier != "cold" or isinstance(page, _OffloadedPage):
                 continue
+            self._check_cancelled()
             tick = time.perf_counter()
             ref = self._store.write_page(descriptor, page.address, page.layout.page_extent_bytes)
             try:

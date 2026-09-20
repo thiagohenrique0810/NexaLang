@@ -180,10 +180,14 @@ class IncrementalTransformerSession(TransformerSession):
         return output
 
     def prefill(self, token_ids):
-        return self._perform(token_ids, mode="prefill")
+        # The guard wraps the whole transaction, not just the numerical phase:
+        # migration and page publication are cancellable for the same reason.
+        with self._call_guard():
+            return self._perform(token_ids, mode="prefill")
 
     def append(self, token_ids):
-        return self._perform(token_ids, mode="decode")
+        with self._call_guard():
+            return self._perform(token_ids, mode="decode")
 
     def decode(self, token_id):
         return self.append([token_id])[-1]

@@ -263,6 +263,7 @@ class TieredTransformerSession(PagedTransformerSession):
             scratch = (ctypes.c_float * self.config.head_dim).from_address(ctypes.addressof(scratch_owner))
             stats = (ctypes.c_double * 3).from_address(ctypes.addressof(stats_owner))
             for migration in transition.migrations:
+                self._check_cancelled()
                 index = migration.source.page_index
                 source = pending[index]
                 target = self._allocate_page(migration.target.codec)
