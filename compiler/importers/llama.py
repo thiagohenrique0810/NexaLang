@@ -42,7 +42,8 @@ def _decoded_digest(checkpoint, name):
     return digest.digest()
 
 
-def import_llama_checkpoint(source_dir, destination, *, group_size=32, block_rows=64):
+def import_llama_checkpoint(source_dir, destination, *, group_size=32, block_rows=64,
+                            tensor_codecs=None):
     """Validate an entire local checkpoint schema before publishing a bundle.
 
     Tied lm_head weights may be absent. If present, their decoded float32 values
@@ -102,11 +103,12 @@ def import_llama_checkpoint(source_dir, destination, *, group_size=32, block_row
     provenance['source_config'] = {'path': 'config.json', 'sha256': asset_checksums['config.json']}
     write_model_bundle(destination, config, sources, group_size=group_size,
                        block_rows=block_rows, tokenizer_files=assets, provenance=provenance,
-                       asset_checksums=asset_checksums)
+                       asset_checksums=asset_checksums, tensor_codecs=tensor_codecs)
     return {
         'format': 'NexaModelBundle', 'format_version': 1, 'source_format': 'safetensors',
         'destination': str(Path(destination).resolve()), 'config': config.to_dict(),
         'tensor_count': len(required), 'parameter_count': config.parameter_count(),
         'tensor_aliases': aliases, 'tied_weights_verified': confirmed_aliases,
         'assets': sorted(assets), 'provenance': provenance,
+        'dense_tensors': sorted(name for name, codec in (tensor_codecs or {}).items() if codec == 'f32'),
     }

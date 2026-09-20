@@ -49,10 +49,17 @@ def inspect_artifact(path, *, verify=False):
         with ModelBundleReader(path) as bundle:
             result = bundle.inspect()
             verified = []
-            q4_read_bytes = 0
+            q4_read_bytes = dense_read_bytes = 0
+            codecs = {item["name"]: item["codec"] for item in result["tensors"]}
             if verify:
                 for name, shape in bundle.config.required_tensor_shapes().items():
-                    if len(shape) == 2:
+                    if codecs[name] == "RAW_F32_MATRIX":
+                        # Verify each stored block, which is the unit the
+                        # executor reads and the unit a checksum covers.
+                        for index, block in enumerate(bundle.matrix_blocks(name)):
+                            dense_read_bytes += bundle.read_matrix_block_into(
+                                name, index, bytearray(block["bytes"]))
+                    elif len(shape) == 2:
                         with bundle.open_q4(name) as reader:
                             q4_read_bytes += verify_matrix(reader)
                     else:
@@ -61,6 +68,7 @@ def inspect_artifact(path, *, verify=False):
             result["validation"].update({"payloads_verified": verify, "verified_tensors": verified,
                                          "checksums_verified": verify, "q4_codec_validated": verify,
                                          "q4_payload_bytes_read": q4_read_bytes,
+                                         "dense_payload_bytes_read": dense_read_bytes,
                                          "model_quality_measured": False})
             return result
     with NexaPackReader(path) as reader:

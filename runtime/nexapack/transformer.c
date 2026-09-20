@@ -49,6 +49,43 @@ static int binary_buffers(const float *left, size_t left_count,
     return NEXA_Q4_OK;
 }
 
+/* Dense F32 weights, same reduction order and accumulator as nexa_q4_matmul,
+ * so a tensor kept in F32 differs from its packed form only by quantization.
+ * The weight tile is read from the bundle; nothing is dequantized or copied. */
+int nexa_f32_matmul(const float *inputs, size_t input_count, size_t batch,
+                    const float *weights, size_t weight_count,
+                    size_t rows, size_t cols,
+                    float *output, size_t output_count) {
+    if (!inputs || !weights || !output || !rows || !cols || !batch)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    size_t weight_elements, input_elements, output_elements;
+    size_t weight_bytes, input_bytes, output_bytes;
+    if (!checked_mul(rows, cols, &weight_elements) ||
+        !checked_mul(batch, cols, &input_elements) ||
+        !checked_mul(batch, rows, &output_elements) ||
+        !float_bytes(weight_elements, &weight_bytes) ||
+        !float_bytes(input_elements, &input_bytes) ||
+        !float_bytes(output_elements, &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (input_count < input_elements || weight_count < weight_elements ||
+        output_count < output_elements) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(inputs, input_bytes, output, output_bytes) ||
+        !disjoint(weights, weight_bytes, output, output_bytes))
+        return NEXA_Q4_INVALID_ARGUMENT;
+    if (!finite_input(inputs, input_elements) || !finite_input(weights, weight_elements))
+        return NEXA_Q4_INVALID_DATA;
+    for (size_t item = 0; item < batch; item++) {
+        const float *input = inputs + item * cols;
+        for (size_t row = 0; row < rows; row++) {
+            const float *record = weights + row * cols;
+            double sum = 0.0;
+            for (size_t i = 0; i < cols; i++) sum += (double)input[i] * (double)record[i];
+            int status = write_float(output + item * rows + row, sum);
+            if (status) return status;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
 int nexa_add(const float *left, size_t left_count,
              const float *right, size_t right_count,
              size_t elements, float *output, size_t output_count) {

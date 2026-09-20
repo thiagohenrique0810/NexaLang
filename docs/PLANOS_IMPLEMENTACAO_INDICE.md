@@ -29,7 +29,7 @@ implementação concluída.
 | Módulo / tarefa | Referências de origem | Como usar |
 | --- | --- | --- |
 | ModelIR, tensores, HardwareProfile e MemoryPlan — M0, M2 | Blueprint [pp.3–5, §§3–4](NexaLang_Blueprint_Tecnico_512MB.pdf#page=3), [p.14, §6](NexaLang_Blueprint_Tecnico_512MB.pdf#page=14); Primeira LLM [p.6, §4](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=6), [p.11, §9](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=11) | Partir de `compiler/model_ir.py`, `model_lowering.py` e `planner/memory.py`. KernelIR e integração com `nxc` continuam gates próprios. |
-| NexaPack, importação, codecs, pacotes executáveis — M1 | Blueprint [p.4, §4.3](NexaLang_Blueprint_Tecnico_512MB.pdf#page=4); Primeira LLM [p.10, §8](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=10); Treinamento [p.10, §16](NexaLang_Plano_Implementacao_Treinamento_LLMs.pdf#page=10) | Consultar também os guias [V1](NEXAPACK_V1.md), [TQ](NEXAPACK_TQ_V1.md) e [importação](NEXALM_IMPORTACAO.md). Não confundir `.nxm` ilustrativo com formato já suportado. |
+| NexaPack, importação, codecs, pacotes executáveis — M1 | Blueprint [p.4, §4.3](NexaLang_Blueprint_Tecnico_512MB.pdf#page=4); Primeira LLM [p.10, §8](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=10); Treinamento [p.10, §16](NexaLang_Plano_Implementacao_Treinamento_LLMs.pdf#page=10) | Consultar também os guias [V1](NEXAPACK_V1.md), [TQ](NEXAPACK_TQ_V1.md), [codecs de peso](NEXALM_CODECS_PESOS.md) e [importação](NEXALM_IMPORTACAO.md). Não confundir `.nxm` ilustrativo com formato já suportado. |
 | Kernels, streaming e backends — M2/M3/M7 | Blueprint [pp.14–16, §§6–10](NexaLang_Blueprint_Tecnico_512MB.pdf#page=14); Primeira LLM [pp.11–14, §§9–12](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=11) | Contar temporários, cópias e reservas por tier; GPU depende de hardware e telemetria reais. |
 | KV, paginação, codecs e residência — M4 | Blueprint [p.15, §7.3](NexaLang_Blueprint_Tecnico_512MB.pdf#page=15); Primeira LLM [p.13, §11](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=13) | Ler [tiers CPU](NEXALM_KV_TIERS_CPU.md) e [backing store CPU](NEXALM_KV_BACKING_CPU.md) antes de modificar o contrato atual. Reuso e residência de páginas cold estão em [reuso CPU](NEXALM_KV_RELOAD_CPU.md); promoção de precisão e critérios de qualidade permanecem em M4.05d. Sequências derivadas com prefixo compartilhado, homogêneas ou por idade, estão em [sequências CPU](NEXALM_KV_SEQUENCIAS_CPU.md); backing store e cancelamento ficaram em M4.06c. |
 | Arquiteturas R0/v1 e migração do frontend — LLM.01 | Primeira LLM [pp.3–6, §§1–4](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=3), [pp.21–22, §§19–20](NexaLang_Plano_Implementacao_Primeira_LLM.pdf#page=21) | Preservar `models/nexalm512/architecture.nxl`; mudanças de shapes/experts criam variantes versionadas. |
@@ -64,7 +64,7 @@ permissões distintas. Os mapas detalhados por fase estão nos ajustes de
 
 1. Localizar o ID no checklist e abrir este índice, o PDF/páginas indicados e o
    guia de ajustes correspondente. Confirmar pré-requisitos e o estado real no código.
-2. Manter a trilha de runtime registrada no checkpoint (M4.06c). Em paralelo,
+2. Manter a trilha de runtime registrada no checkpoint (M6.01). Em paralelo,
    contratos de CC.C0 e PL.P0/P1 podem começar com fixtures locais e sem treino longo.
 3. Antes de rotas condicionais aprendidas, estabelecer teacher/baselines e trainer
    necessários. Adicionar uma dimensão de sparsity por experimento, com fallback.

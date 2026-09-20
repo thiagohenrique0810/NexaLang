@@ -220,6 +220,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", nargs="?", type=Path, help="Row-major float32 little-endian matrix")
     parser.add_argument("--checkpoint", type=Path, help="Local Llama Safetensors/config/tokenizer directory")
+    parser.add_argument("--dense-tensor", action="append", dest="dense_tensors", metavar="NAME",
+                        help="Store this matrix as RAW_F32 instead of Q4; repeat per tensor. Reference "
+                             "and calibration format: it costs eight times the packed form")
+    parser.add_argument("--dense-all", action="store_true",
+                        help="Store every matrix as RAW_F32; requires --checkpoint")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--rows", type=int)
     parser.add_argument("--cols", type=int)
@@ -237,6 +242,10 @@ def main(argv=None):
         parser.error("Supply either a float32 input or --checkpoint")
     if args.input is not None and (args.rows is None or args.cols is None):
         parser.error("Float32 input requires --rows and --cols")
+    if (args.dense_tensors or args.dense_all) and args.checkpoint is None:
+        parser.error("--dense-tensor/--dense-all require --checkpoint")
+    if args.dense_tensors and args.dense_all:
+        parser.error("pass either --dense-all or specific --dense-tensor names")
     if args.checkpoint is not None and (args.rows is not None or args.cols is not None):
         parser.error("--checkpoint gets shapes from the architecture; do not pass --rows/--cols")
     tq_options = any(value is not None for value in
@@ -256,8 +265,21 @@ def main(argv=None):
         group_size = 32 if args.group_size is None else args.group_size
         if args.checkpoint is not None:
             from compiler.importers.llama import import_llama_checkpoint
-            result = import_llama_checkpoint(args.checkpoint, args.out,
-                                             group_size=group_size, block_rows=args.block_rows)
+            codecs = None
+            if args.dense_all or args.dense_tensors:
+                from compiler.model_config import ModelConfig
+                from compiler.importers.safetensors import read_json, safe_child
+                shapes = ModelConfig.from_hf_config(
+                    read_json(safe_child(Path(args.checkpoint).resolve(strict=True),
+                                         'config.json'))).required_tensor_shapes()
+                matrices = [name for name, shape in shapes.items() if len(shape) == 2]
+                requested = matrices if args.dense_all else args.dense_tensors
+                unknown = sorted(set(requested) - set(matrices))
+                if unknown:
+                    parser.error(f"--dense-tensor names no matrix of this model: {', '.join(unknown)}")
+                codecs = {name: "f32" for name in requested}
+            result = import_llama_checkpoint(args.checkpoint, args.out, group_size=group_size,
+                                             block_rows=args.block_rows, tensor_codecs=codecs)
         elif args.legacy_tq01:
             result = convert_tq01(args.input, args.out, args.rows, args.cols, bits, seed, codebook,
                                   source_endianness=args.source_endianness, block_rows=args.block_rows,

@@ -36,6 +36,7 @@ def _load_kernels():
     signatures = {
         "nexa_q4_matmul": [fp, sz, sz, bp, sz, sz, sz, sz, fp, sz],
         "nexa_q4_decode_row": [bp, sz, sz, sz, fp, sz],
+        "nexa_f32_matmul": [fp, sz, sz, fp, sz, sz, sz, fp, sz],
         "nexa_q4_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_q3_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_rmsnorm": [fp, sz, fp, sz, sz, sz, dbl, fp, sz],
@@ -105,9 +106,11 @@ class TransformerSession:
             summary = self._bundle.inspect()
             self._storage = {}
             self._matrix_layouts = {}
+            self._dense_matrices = set()
             for item in summary["tensors"]:
                 name, shape = item["name"], tuple(item["shape"])
                 q4 = item["codec"] == "Q4_GROUPED"
+                dense = item["codec"] == "RAW_F32_MATRIX"
                 self._storage[name] = TensorDesc(name, shape, storage_dtype="q4" if q4 else "f32",
                                                  storage_nbytes=item["packed_payload_bytes"])
                 if q4:
@@ -116,6 +119,16 @@ class TransformerSession:
                     if not rows:
                         raise ValueError("Packed weight row exceeds the reader limit")
                     self._matrix_layouts[name] = (rows, row_bytes)
+                elif dense:
+                    # A dense matrix is verified per stored block, so the block
+                    # the writer chose is also the tile this reader consumes.
+                    blocks = self._bundle.matrix_blocks(name)
+                    row_bytes = shape[1] * 4
+                    rows = max(block["row_count"] for block in blocks)
+                    if rows * row_bytes > MAX_READ_BYTES:
+                        raise ValueError("Dense weight block exceeds the reader limit; convert with fewer block_rows")
+                    self._matrix_layouts[name] = (rows, row_bytes)
+                    self._dense_matrices.add(name)
             self._weights_bytes = summary["packed_payload_bytes"]
             manifest = json.dumps(self._bundle.manifest, sort_keys=True, separators=(",", ":"))
             self._manifest_sha256 = hashlib.sha256(manifest.encode()).hexdigest()
@@ -281,7 +294,38 @@ class TransformerSession:
                 continue
             kind, attributes = op.kind.value, op.attributes
             out = buffer(op.outputs[0])
-            if kind in ("Embedding", "MatMul"):
+            if kind in ("Embedding", "MatMul") and op.inputs[1] in self._dense_matrices:
+                weight_name = op.inputs[1]
+                rows, cols = self._storage[weight_name].shape
+                blocks = self._bundle.matrix_blocks(weight_name)
+                left = buffer(op.inputs[0]) if kind == "MatMul" else None
+                for index, block in enumerate(blocks):
+                    count, size = block["row_count"], block["bytes"]
+                    if kind == "Embedding" and not any(
+                            block["start_row"] <= token < block["start_row"] + count for token in tokens):
+                        continue
+                    tick = time.perf_counter()
+                    io["raw_payload_bytes_read"] += self._bundle.read_matrix_block_into(
+                        weight_name, index, packed_view[:size])
+                    read_seconds += time.perf_counter() - tick
+                    io["packed_bytes_consumed"] += size
+                    weights = (ctypes.c_float * (count * cols)).from_address(ctypes.addressof(packed))
+                    if kind == "Embedding":
+                        for position, token in enumerate(tokens):
+                            if not block["start_row"] <= token < block["start_row"] + count:
+                                continue
+                            ctypes.memmove(ctypes.addressof(out) + position * cols * 4,
+                                           ctypes.addressof(packed) + (token - block["start_row"]) * cols * 4,
+                                           cols * 4)
+                            io["embedding_rows_read"] += 1
+                        continue
+                    call("nexa_f32_matmul", left, len(left), length, weights, len(weights),
+                         count, cols, tile_output, length * count)
+                    for row in range(length):
+                        ctypes.memmove(ctypes.addressof(out) + (row * rows + block["start_row"]) * 4,
+                                       ctypes.addressof(tile_output) + row * count * 4, count * 4)
+                    io["matmul_tiles"] += 1
+            elif kind in ("Embedding", "MatMul"):
                 weight_name = op.inputs[1]
                 with self._bundle.open_q4(weight_name) as reader:
                     if kind == "Embedding":

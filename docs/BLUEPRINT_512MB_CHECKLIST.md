@@ -167,6 +167,20 @@ Passaram **583 regressões + 110 testes bootstrap = 693 testes**, sem falhas ou
 skips. Falta congelar 32768 com corpus real (LLM.02c2). Checklist: **35
 concluídos e 107 pendentes**.
 
+**Décimo sétimo incremento implementado e validado:** segundo codec de peso e
+despacho por tensor. Até aqui toda matriz era Q4 e o executor só chamava
+`nexa_q4_matmul`; agora um tensor pode ser guardado em `RAW_F32_MATRIX`, com
+blocos de linhas que são ao mesmo tempo unidade de checksum e de leitura, e um
+bundle pode misturar os dois codecs. `nexa_f32_matmul` mantém a ordem de redução
+e o acumulador do kernel Q4, então a diferença entre os caminhos é apenas a
+quantização: com pesos que Q4 representa exatamente, os logits e o SHA-256 são
+idênticos. `--dense-all`/`--dense-tensor` na conversão e verificação bloco a
+bloco em `nexa_inspect`. Isso não é formato de distribuição — custa oito vezes a
+forma Q4 — mas é a referência exata que faltava e o executor que M6.01/M6.02
+precisavam para consumir um precision map. Passaram **595 regressões + 110
+testes bootstrap = 705 testes**, sem falhas ou skips. Checklist: **36 concluídos
+e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -183,7 +197,14 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M5.01 com um modelo real.** Com o tokenizer pronto, falta
+**Próxima tarefa: M6.01 — calibração de sensibilidade por tensor.** Com o
+despacho por codec e a referência densa, dá para medir o efeito real de
+quantizar cada tensor: executar o modelo com todos os pesos densos, depois com
+um único tensor em Q4, e comparar logits. O custo é O(tensores) execuções;
+registrar isso e amostrar quando necessário. Perplexidade de modelo treinado
+continua fora do alcance até LLM.04b.
+
+**Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
 revisão/hash em M0.08 e medir prefill/decode e qualidade sem PyTorch. Sem
 modelo baixado no repositório: registrar origem, revisão e hashes.
@@ -500,7 +521,11 @@ medições. Telemetria e baseline de modelos continuam pendentes.
 - [x] M1.02 Codec Q4 por grupo com escalas, padding, erros numéricos e interoperabilidade C/Python.
 - [x] M1.03 GEMV/GEMM CPU fundido, sem matriz de pesos desquantizada nem alocação oculta.
 - [x] M1.04 Conversor inicial de matriz float32 LE para NexaPack e benchmark em tiles.
-- [ ] M1.05 Kernels Q2/Q3/Q8 e RAW-F16, despacho por codec, caudas e comparação numérica.
+- [x] M1.05a Despacho de peso por codec no executor e matrizes `RAW_F32_MATRIX`
+  com blocos verificados; bundles mistos, conversão por tensor, verificação
+  bloco a bloco e equivalência exata com Q4 quando a quantização é exata.
+- [ ] M1.05b Kernels Q2/Q3/Q8 e RAW-F16 de pesos, caudas e comparação numérica,
+  usando o despacho por codec já existente.
 - [x] M1.06 Integrar armazenamento TurboQuant MSE no NexaPack: TQ02 portátil,
   dimensão/bits/seed/SRHT/codebook explícitos, norma F32LE e migração TQ01 com
   endian de origem. Atenção TQ e kernels de matriz permanecem em gates próprios.
@@ -1240,6 +1265,30 @@ Décimo primeiro incremento:
 - Guia: [tokenizer](NEXALM_TOKENIZER.md). Checklist: **35 concluídos e 107
   pendentes**; LLM.02c foi dividido preservando o congelamento em LLM.02c2.
 
+## Registro do décimo sétimo incremento — codecs de peso
+
+- Concluído M1.05a: `RAW_F32_MATRIX` no bundle, `nexa_f32_matmul` no runtime
+  nativo e despacho por codec no executor, inclusive para embedding.
+- Blocos de linhas são a unidade de checksum e de leitura: uma leitura parcial
+  não poderia verificar os bytes consumidos, então `--block-rows` da escrita
+  define o tile do executor. A abertura exige que os blocos cubram cada linha
+  exatamente uma vez, em ordem.
+- Equivalência provada sem Torch: com pesos múltiplos de 0,5 em grupos cujo
+  máximo é 3,5 — escala exata de 0,5 — denso e Q4 produzem os mesmos logits e o
+  mesmo SHA-256. Com pesos arbitrários, a diferença é o erro de quantização.
+- `tools/nexa_convert.py --dense-all/--dense-tensor`, `nexa_inspect --verify`
+  com `dense_payload_bytes_read` e relatórios que separam bytes Q4 de bytes raw.
+- Custo declarado: oito vezes a forma Q4 em disco, tile de
+  `block_rows × cols × 4` no orçamento, e um bloco inteiro lido por token de
+  embedding alcançado. É formato de referência e calibração, não de distribuição.
+- Validação macOS ARM64/Python 3.14.5: **595 regressões + 110 bootstrap = 705
+  testes, zero falhas e zero skips**. Os 12 novos cobrem equivalência exata,
+  determinismo, bundle misto, leitura seletiva do embedding, corrupção e
+  truncamento de bloco, manifesto com blocos inválidos, bloco acima do limite do
+  leitor, mapas de codec inválidos e as três CLIs.
+- Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **36 concluídos e
+  107 pendentes**; M1.05 foi dividido preservando Q2/Q3/Q8/F16 em M1.05b.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1282,6 +1331,12 @@ python3 -m unittest discover -s tests -p 'test_reload_cache_regressions.py' -v
 # Sequência derivada que continua o prefixo sem recomputá-lo.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/kv-sequencias-tiny.json
 python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
+
+# Codec de peso por tensor: referência densa e bundle misto.
+python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-dense --dense-all --block-rows 3
+python3 tools/nexa_inspect.py artifacts/models/nexalm-dense --verify
+python3 tools/nexa_run.py artifacts/models/nexalm-dense --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB
+python3 -m unittest discover -s tests -p 'test_dense_weights_regressions.py' -v
 
 # Tokenizer: treino determinístico, verificação e execução a partir de texto.
 python3 tools/nexa_tokenizer.py train --corpus CORPUS --out artifacts/tokenizers/demo --vocab-size 400
@@ -1494,6 +1549,16 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Décimo sétimo incremento acrescenta:
+
+- `runtime/nexapack/bundle.py`: escrita/validação/leitura de `RAW_F32_MATRIX`
+  por blocos e `tensor_codecs` no writer.
+- `runtime/nexapack/transformer.c/.h`: `nexa_f32_matmul`; `transformer.py`
+  despacha por codec e contabiliza os dois caminhos de leitura.
+- `compiler/importers/llama.py`, `tools/nexa_convert.py --dense-all/--dense-tensor`
+  e `tools/nexa_inspect.py` com verificação bloco a bloco.
+- `tests/test_dense_weights_regressions.py` e `docs/NEXALM_CODECS_PESOS.md`.
 
 Décimo sexto incremento acrescenta:
 
