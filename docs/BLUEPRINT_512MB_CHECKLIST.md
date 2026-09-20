@@ -129,6 +129,54 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo terceiro incremento — bloco paralelo, onda 4b: codecs mistos.**
+**965 testes** (945 + 20), zero falhas, zero skips. O contêiner passou a poder
+carregar um codec por bloco de linhas, e os quatro arquivos homogêneos saem
+byte a byte idênticos — SHA-256 fixados do escritor anterior.
+
+**O incremento remove uma impossibilidade estrutural e põe um preço na mesa; não
+demonstra ganho.** O leitor re-derivava todo offset por multiplicação, então um
+passo heterogêneo era estruturalmente impossível. Agora cada bloco declara seu
+codec, o leitor **recomputa** a largura e recusa o valor declarado que discorde.
+
+**O número fácil era o número errado, e isso foi medido.** O reconhecimento
+estimou +41 B por bloco no índice e concluiu que, por causa do alinhamento de
+4096, os bytes extras de arquivo seriam zero abaixo de ~64 blocos. Medido: o
+custo real é **+35 a 39 B por bloco**, e o zero é **falso acima de 23 blocos** —
+o delta é um dente de serra, não um degrau (0 em 22 blocos, +4.096 em 23, 0 de
+novo em 61, +40.960 em 1.024).
+
+**Onde a mistura para de pagar** (1.024 linhas, 64 colunas, grupo 32, metade dos
+blocos rebaixada q4→q2, payload economizado fixo em 8.192 B em todas as linhas —
+só o número de blocos varia, para que nenhum ganho venha da escolha de codec):
+
+| Blocos | Δ índice | Δ arquivo | Veredito |
+| ---: | ---: | ---: | --- |
+| 64 | +2.487 | −8.192 | paga |
+| 256 | +9.847 | 0 | empata |
+| 512 | +20.215 | +12.288 | **perde** |
+| 1.024 | +39.927 | +32.768 | **perde 4× o que economizou** |
+
+Regra de break-even medida: um bloco só paga o próprio índice se o rebaixamento
+economizar mais de ~35 bytes — 17 linhas por bloco com 8 colunas, 3 com 64, uma
+com 256 ou mais. **Segundo caso em que misturar perde sem contrapartida:** a tampa
+de 1 MiB de metadados fecha antes de `MAX_BLOCKS`, e fecha mais cedo para o índice
+mais largo — uniforme 7.716 blocos, misto 5.996. Misturar custa **22% da
+capacidade de índice**: uma matriz que o formato uniforme descreve é recusada
+como mista.
+
+A fixture foi escolhida **sem estrutura por bloco** de propósito — todas as linhas
+com as mesmas estatísticas — e o atalho foi recusado por escrito: não se construiu
+matriz com primeiras linhas quase-zero e resto outlier para mostrar que q2+q8
+vence um codec único. Isso não demonstraria nada sobre um modelo.
+
+Falsificação: 14 bugs injetados, 14 pegos, depois de **consertar dois testes** que
+passavam com o bug. Um usava `mock.Mock()` como fonte de linhas; como Mock não é
+iterável, toda entrada inválida falhava pelo motivo errado e a validação de plano
+podia ser removida sem quebrar nada. O outro usava `assertRaises` genérico onde a
+cláusula era redundante para a **recusa** mas não para a **mensagem** — sem ela o
+leitor acusa `group_size` e manda o operador procurar no campo errado.
+
 **Trigésimo segundo incremento — bloco paralelo, onda 4a.** Dois agentes em
 paralelo com a onda 3, possível porque suas únicas colisões com o contêiner eram
 arquivos que as fronteiras do `AGENTS.md` já proíbem tocar. **945 testes**
@@ -1014,10 +1062,18 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
   `physical_saved_bytes` da mesma variante real que mede sensibilidade, e
   `--cost physical` planeja contra o que o arquivo ocupa, com o custo no
   `policy_id` (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
-- [ ] M6.02d Misturar codecs **dentro** do tensor: formato versionado com codec,
-  offset e identidade por bloco, despacho que troque de kernel dentro do mesmo
-  matmul, e demonstração de ganho — o overhead fixo medido em M6.02c é por
-  arquivo, e metadados por bloco heterogêneo tendem a aumentá-lo.
+- [x] M6.02d1 Codecs mistos por bloco de linhas na camada de formato:
+  `MIXED_GROUPED` com conjunto próprio de chaves, `codec_id`/`row_bytes` por
+  bloco recomputados e recusados quando mentem, `write_mixed_matrix` na mesma
+  passagem única de streaming, e os quatro arquivos homogêneos **byte a byte
+  inalterados**. O preço da mistura está medido e às vezes é proibitivo.
+- [ ] M6.02d2 Executar um tensor misto: `bundle.py`, `executor.py` e
+  `transformer.py` leem `reader.row_bytes`, que é `None` num arquivo misto, e o
+  despacho de kernel por bloco dentro do mesmo matmul não foi feito. Hoje só a
+  API Python escreve um arquivo misto e nada o executa.
+- [ ] M6.02d3 **Qual bloco recebe qual codec** — a pergunta que decide o item.
+  Depende de sensibilidade por bloco em pesos reais (M6.01d), bloqueada em
+  checkpoint treinado; sem ela toda atribuição de codec a bloco é arbitrária.
 - [x] M6.03a `CompressionPlanner` sobre o eixo medido, com o **tempo real de
   decodificação por codec** medido no kernel que o executor roda, teto
   `--max-decode-ns` ortogonal aos tetos de bytes e de erro, fronteira de
