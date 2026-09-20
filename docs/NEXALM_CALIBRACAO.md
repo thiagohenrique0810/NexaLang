@@ -6,7 +6,8 @@ São duas medições separadas de propósito, porque respondem coisas diferentes
 1. **Estática** — distribuição, outliers e erro de round-trip do codec. Lê o
    checkpoint, não executa nada, custa uma passagem por tensor.
 2. **Sensibilidade** — executa o modelo com **todos** os pesos densos e depois
-   com **um único** tensor empacotado, e mede quanto os logits andaram.
+   com **um único** tensor empacotado, em cada codec medido, e mede quanto os
+   logits andaram.
 
 Nenhuma das duas é perplexidade. O erro estático não diz como o erro se propaga
 pelo grafo, e um delta de logits sobre pesos não treinados não fala de qualidade
@@ -49,11 +50,16 @@ incompleto para trás.
 ## Métricas do relatório
 
 Por tensor: `statistics` (min, max, média, RMS, desvio, `max_abs`,
-`median_row_max_abs` e `outlier_ratio`), `quantization` (erro máximo, RMSE,
-RMSE relativo e SNR em dB), `dense_bytes`, `packed_bytes`, `saved_bytes`,
-`sensitivity` (delta máximo, RMSE e RMSE relativo dos logits) e
-`cost_per_saved_kib` — o custo em logits por KiB economizado, que é a ordenação
-que um precision map precisa.
+`median_row_max_abs` e `outlier_ratio`), `dense_bytes` e um bloco `codecs` com
+uma entrada por codec medido. Cada entrada traz `quantization` (erro máximo,
+RMSE, RMSE relativo e SNR em dB), `packed_bytes`, `saved_bytes`, `sensitivity`
+(delta máximo, RMSE e RMSE relativo dos logits) e `cost_per_saved_kib` — o
+custo em logits por KiB economizado, que é a ordenação que o plano usa.
+
+`--codec` restringe os codecs medidos; sem ele, a calibração mede Q4 e Q8. Numa
+fixture com grupo 4, o modelo inteiro em Q4 moveu os logits 0,2167 de RMSE,
+contra 0,0065 em Q8, economizando 0,31 KiB e 0,25 KiB por tensor — é essa
+diferença que dá ao plano um degrau intermediário real.
 
 `outlier_ratio` compara o pico da pior linha com o da linha mediana: é o que
 torna um tensor difícil de quantizar com uma escala só.
@@ -83,10 +89,12 @@ vive num diretório temporário que é removido ao final.
 
 ## PrecisionMap: escolher codecs sob um teto de bytes
 
-O décimo nono incremento consome esse relatório. `select_precision` parte de
-**tudo empacotado** — a configuração mais barata — e gasta o orçamento restante
-promovendo a denso os tensores com maior sensibilidade por byte extra. Um
-tensor que o codec não encolhe fica denso de graça.
+`select_precision` consome esse relatório. Cada tensor começa no **codec mais
+barato medido** e, enquanto houver orçamento, aplica-se o degrau com melhor
+erro evitado por byte extra, em qualquer ponto do modelo. Um tensor pode subir
+mais de um degrau (Q4 → Q8 → denso, ou direto para denso), e um degrau que não
+melhora nada nunca é comprado: opções dominadas — que custam mais e erram igual
+ou mais — são descartadas antes da escolha.
 
 ```bash
 python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json \
@@ -97,8 +105,9 @@ python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/pla
 ```
 
 O mapa é versionado (`schema_version`, `policy_id`) e carrega a proveniência da
-decisão: checkpoint, tokens de calibração, `group_size`, baseline empacotado,
-bytes planejados, sobra e a lista de promoções com o RMSE que cada uma evita.
+decisão: checkpoint, tokens de calibração, `group_size`, codecs medidos,
+baseline no codec mais barato, bytes planejados, sobra, contagem por codec e a
+lista de degraus com o RMSE que cada um evita.
 Um mapa com versão, política ou campos diferentes é recusado em vez de
 reinterpretado.
 
@@ -109,13 +118,15 @@ qualidade do conjunto, e `quality_measured` permanece `false`. A seleção tamb�
 é gulosa sobre uma razão — com escolha binária por tensor, é heurística, não
 ótimo.
 
-Hoje o espaço de escolha tem dois codecs de peso, Q4 e denso. Q2/Q3/Q8/F16
-entram em M1.05b e ampliam esse espaço sem mudar o contrato do mapa.
+O espaço de escolha tem hoje três pontos por tensor: Q4, Q8 e denso. Num teto
+apertado o plano mistura Q4 e Q8; com mais bytes, sobe para denso onde o ganho
+por byte é maior. Q2/Q3/F16 entram em M1.05c e ampliam a escala sem mudar o
+contrato do mapa.
 
 ## Limites
 
-O custo é **uma execução do modelo por tensor medido**, mais duas de
-referência. Para um modelo grande isso é caro em tempo e em disco (o bundle
+O custo é **uma execução do modelo por tensor e por codec medido**, mais uma
+referência densa e uma por codec. Para um modelo grande isso é caro em tempo e em disco (o bundle
 denso ocupa oito vezes o empacotado), então use `--tensor` ou rode por camada.
 
 O prompt de calibração define o que está sendo medido: tokens diferentes

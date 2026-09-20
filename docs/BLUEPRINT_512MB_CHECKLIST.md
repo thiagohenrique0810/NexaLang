@@ -217,6 +217,19 @@ e Q8 por max/127. `--matrix-codec` e `--tensor-codec NAME=CODEC` na conversão.
 Passaram **630 regressões + 110 testes bootstrap = 740 testes**, sem falhas ou
 skips. Checklist: **39 concluídos e 107 pendentes**.
 
+**Vigésimo primeiro incremento implementado e validado:** calibração e plano com
+mais de um codec. A calibração mede erro e sensibilidade por codec — Q4 e Q8 por
+padrão, restringíveis com `--codec` — e o PrecisionMap deixou de escolher entre
+dois valores: cada tensor começa no codec mais barato medido e sobe o degrau com
+melhor erro evitado por byte extra, podendo subir mais de um. Opções dominadas,
+que custam mais sem errar menos, são descartadas antes da escolha. Na fixture, o
+modelo inteiro em Q4 move os logits 0,2167 de RMSE contra 0,0065 em Q8; com teto
+apertado o plano mistura Q4 e Q8, e com mais bytes sobe para denso onde o ganho
+por byte é maior. A política do mapa virou `GREEDY_SENSITIVITY_PER_BYTE_V2`, e
+relatórios de um codec só continuam planejando. Passaram **634 regressões + 110
+testes bootstrap = 744 testes**, sem falhas ou skips. Checklist: **41 concluídos
+e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -233,12 +246,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M6.01c/M6.02b — calibrar e planejar com Q8 no espaço de
-escolha.** O executor já guarda três codecs de peso, mas a calibração mede
-apenas Q4 contra denso e o PrecisionMap escolhe entre dois valores. Medir a
-sensibilidade por codec custa uma execução a mais por tensor e transforma a
-seleção binária numa escala de degraus; o contrato do mapa não muda, apenas
-ganha mais um valor por tensor. Depois disso, M1.05c acrescenta Q2/Q3/F16.
+**Próxima tarefa: M1.05c — codecs de peso Q2/Q3 e RAW-F16.** A escala de
+decisão já funciona com três pontos por tensor; cada codec novo acrescenta um
+degrau sem mudar o contrato do mapa. Q3 já existe para KV, com quantizador e
+referência próprios, então o trabalho é o writer de pesos, o matmul sem
+expansão integral e as caudas. Isso também destrava M4.03d. Alternativas em
+aberto: M6.01b (calibração por grupo e conjunto representativo) e M4.06c.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -688,13 +701,17 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
 - [x] M6.01a Calibração por tensor: distribuição e outliers, erro de round-trip
   do codec e sensibilidade medida nos logits contra referência densa, com
   variantes atômicas que reusam payloads e custo por byte economizado.
+- [x] M6.01c Calibração por codec: erro estático e sensibilidade medidos para
+  cada codec empacotado disponível, com seleção de codecs por execução.
 - [ ] M6.01b Calibração por grupo dentro do tensor, conjunto de calibração
   representativo por domínio e orçamento de qualidade; sensibilidade em
   checkpoint treinado com perplexidade, dependente de LLM.04b.
 - [x] M6.02a PrecisionMap versionado por tensor e seleção sob teto de bytes a
   partir de sensibilidade medida, com proveniência da decisão, aplicação na
   conversão e limites da estimativa declarados.
-- [ ] M6.02b PrecisionMap Q2/Q3/Q8/F16 e por bloco, e seleção por custo físico
+- [x] M6.02b PrecisionMap com escala de codecs por tensor e seleção que sobe
+  degraus por erro evitado/byte, descartando opções dominadas.
+- [ ] M6.02c PrecisionMap Q2/Q3/F16 e por bloco, e seleção por custo físico
   medido; misturar codecs dentro do tensor exige formato versionado, identidade/
   offsets por bloco e despacho compatível (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
 - [ ] M6.03 CompressionPlanner escolhe codec/sparsity/low-rank sem presumir speedup.
@@ -1411,6 +1428,35 @@ Décimo primeiro incremento:
 - Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **39 concluídos e
   107 pendentes**; M1.05b foi dividido preservando Q2/Q3/F16 em M1.05c.
 
+## Registro do vigésimo primeiro incremento — calibração e plano multi-codec
+
+- Concluídos M6.01c e M6.02b: `quantization_error(rows, group_size, codec)`,
+  medição de sensibilidade por codec em `tools/nexa_calibrate.py --codec`, e
+  seleção por degraus em `compiler/precision_map.py`.
+- O relatório passou a ter um bloco `codecs` por tensor, com bytes, erro
+  estático, sensibilidade e custo por KiB economizado de cada codec, além de
+  `measured_codecs` e `all_packed` por codec. A ordenação usa o pior caso entre
+  os codecs medidos.
+- A seleção começa no codec mais barato de cada tensor e aplica o degrau com
+  melhor erro evitado por byte extra, em qualquer ponto do modelo; um tensor
+  pode subir mais de um degrau. Opções dominadas são removidas antes da escolha,
+  e um degrau sem ganho nunca é comprado.
+- Desempate determinístico: tensores em ordem de nome, degraus do mais barato ao
+  mais caro, comparação estrita — o mesmo relatório sempre produz o mesmo mapa.
+- A política virou `GREEDY_SENSITIVITY_PER_BYTE_V2`; mapas da V1 são recusados
+  em vez de reinterpretados, e relatórios de calibração com um codec só
+  continuam planejando normalmente.
+- Medição na fixture: modelo inteiro em Q4 move os logits 0,2167 de RMSE contra
+  0,0065 em Q8. Com teto de 1.200 B o plano ficou 4 tensores Q4 e 4 Q8; com
+  1.800 B, 4 densos e 4 Q8; com 4.096 B, todos densos.
+- Validação macOS ARM64/Python 3.14.5: **634 regressões + 110 bootstrap = 744
+  testes, zero falhas e zero skips**. Cobrem degraus, múltiplos degraus num
+  tensor, opção dominada, relatório de um codec só, ordenação por pior codec,
+  erro estático menor em Q8 e o fluxo completo até a execução.
+- Guia: [calibração e PrecisionMap](NEXALM_CALIBRACAO.md). Checklist:
+  **41 concluídos e 107 pendentes**; M6.02 ganhou o subitem M6.02c com os
+  codecs restantes e a seleção por bloco.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1463,6 +1509,10 @@ python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q8 --matrix-codec q8 --group-size 4 --block-rows 3
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
+
+# Calibração por codec e plano com escala Q4/Q8/denso.
+python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibracao.json
+python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json --budget 1800B --out artifacts/precision/map.json
 
 # PrecisionMap: planejar sob teto de bytes e converter pelo plano.
 python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json --budget 2KiB --out artifacts/precision/map.json
@@ -1687,6 +1737,15 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo primeiro incremento acrescenta:
+
+- `compiler/calibration.py`: erro de round-trip por codec empacotado e variantes
+  para qualquer codec.
+- `tools/nexa_calibrate.py --codec`: medição por codec, referências por codec e
+  relatório com bloco `codecs` por tensor.
+- `compiler/precision_map.py`: escala de opções por tensor, fronteira sem
+  dominadas, seleção por degraus e proveniência com contagem por codec.
 
 Vigésimo incremento acrescenta:
 

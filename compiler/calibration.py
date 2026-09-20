@@ -22,9 +22,17 @@ import os
 from pathlib import Path
 import shutil
 
-from runtime.nexapack.format import decode_q4_row, quantize_q4_row
+from runtime.nexapack.bundle import PACKED_CODECS
+from runtime.nexapack.format import (
+    decode_q4_row, decode_q8_row, quantize_q4_row, quantize_q8_row,
+)
 
 MAX_CALIBRATION_TENSORS = 4096
+# Round-trip helpers per packed weight codec; dense needs none by definition.
+_CODEC_ROUND_TRIP = {
+    "q4": (quantize_q4_row, decode_q4_row),
+    "q8": (quantize_q8_row, decode_q8_row),
+}
 
 
 def _finite(values, label):
@@ -69,16 +77,19 @@ def row_statistics(rows):
             "outlier_ratio": largest / median if median else math.inf}
 
 
-def quantization_error(rows, group_size):
-    """Round-trip error of the Q4 codec, row by row, without holding the matrix."""
+def quantization_error(rows, group_size, codec="q4"):
+    """Round-trip error of one packed codec, row by row, without the matrix."""
     if type(group_size) is not int or group_size < 1:
         raise ValueError("group_size must be a positive integer")
+    if codec not in _CODEC_ROUND_TRIP:
+        raise ValueError(f"Unsupported packed codec for calibration: {codec!r}")
+    quantize, decode = _CODEC_ROUND_TRIP[codec]
     count = 0
     squared = reference_squared = 0.0
     worst = 0.0
     for row in rows:
         values = _finite(row, "Tensor row")
-        decoded = decode_q4_row(quantize_q4_row(values, group_size), len(values), group_size)
+        decoded = decode(quantize(values, group_size), len(values), group_size)
         for original, restored in zip(values, decoded):
             delta = original - restored
             squared += delta * delta
@@ -89,7 +100,7 @@ def quantization_error(rows, group_size):
         raise ValueError("Tensor must have at least one value")
     rmse = math.sqrt(squared / count)
     reference_rms = math.sqrt(reference_squared / count)
-    return {"codec": "Q4_GROUPED", "group_size": group_size, "values": count,
+    return {"codec": PACKED_CODECS[codec], "group_size": group_size, "values": count,
             "max_abs_error": worst, "rmse": rmse, "reference_rms": reference_rms,
             "relative_rmse": rmse / reference_rms if reference_rms else math.inf,
             # Signal-to-noise in dB; higher is a tensor the codec handles well.
@@ -136,7 +147,7 @@ def build_variant(dense_dir, packed_dir, tensor, destination):
         raise ValueError(f"Unknown tensor for calibration: {tensor}")
     if dense["tensors"][tensor]["codec"] != "RAW_F32_MATRIX":
         raise ValueError(f"The reference tensor must be dense: {tensor}")
-    if packed["tensors"][tensor]["codec"] != "Q4_GROUPED":
+    if packed["tensors"][tensor]["codec"] not in PACKED_CODECS.values():
         raise ValueError(f"The measured tensor must be packed: {tensor}")
     if destination.exists():
         raise FileExistsError(f"Variant destination already exists: {destination}")

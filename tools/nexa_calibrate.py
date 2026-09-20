@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Measure what quantizing each tensor costs: bytes, codec error and logits.
 
-Builds a dense reference bundle and a packed one from the same checkpoint, then
-runs the model once per tensor with only that tensor packed. Sensitivity is
-therefore O(tensors) executions; --tensor restricts it to the ones in question.
+Builds a dense reference bundle and one bundle per packed codec from the same
+checkpoint, then runs the model once per (tensor, codec) with only that tensor
+packed. Sensitivity therefore costs O(tensors x codecs) executions; --tensor
+and --codec restrict it to the ones in question.
 
 The logit delta is measured on the weights given. On an untrained checkpoint it
 shows how error propagates through the graph, not answer quality: perplexity
@@ -58,6 +59,8 @@ def main(argv=None):
     parser.add_argument("--memory-budget", default="512MiB")
     parser.add_argument("--tensor", action="append", dest="tensors",
                         help="Measure only these tensors; repeat per tensor")
+    parser.add_argument("--codec", action="append", dest="codecs", choices=("q4", "q8"),
+                        help="Packed codecs to measure (default: q4 and q8)")
     parser.add_argument("--static-only", action="store_true",
                         help="Report distribution and codec error without executing the model")
     parser.add_argument("--work-dir", type=Path, help="Keep intermediate bundles here instead of a temp dir")
@@ -79,69 +82,85 @@ def main(argv=None):
         if len(selected) > MAX_CALIBRATION_TENSORS:
             raise ValueError("Too many tensors requested for one calibration run")
 
+        codecs = tuple(dict.fromkeys(args.codecs or ("q4", "q8")))
         tensors = []
         for name in selected:
             statistics = row_statistics(source.iter_rows(name))
-            error = quantization_error(source.iter_rows(name), args.group_size)
             dense_bytes = statistics["values"] * 4
+            measured = {codec: {"quantization": quantization_error(source.iter_rows(name),
+                                                                   args.group_size, codec)}
+                        for codec in codecs}
             tensors.append({"name": name, "shape": list(shapes[name]),
                             "dense_bytes": dense_bytes, "statistics": statistics,
-                            "quantization": error})
+                            "codecs": measured})
 
         report = {"checkpoint": str(checkpoint), "tokens": args.tokens,
                   "group_size": args.group_size, "tensors": tensors,
-                  "sensitivity_measured": not args.static_only,
-                  "scope": ("static distribution and codec round-trip error"
+                  "measured_codecs": list(codecs), "sensitivity_measured": not args.static_only,
+                  "scope": ("static distribution and per-codec round-trip error"
                             if args.static_only else
-                            "codec error plus the logit delta of packing one tensor at a time"),
+                            "per-codec error plus the logit delta of packing one tensor at a time"),
                   "quality_measured": False,
                   "quality_note": "logit deltas on these weights; perplexity needs a trained checkpoint"}
 
+        def rank(entry):
+            """Worst case across measured codecs; the cheapest one bounds it."""
+            return max(item.get("sensitivity", {}).get("rmse", 0.0) for item in entry["codecs"].values())
+
         if not args.static_only:
             dense = work / "reference-dense"
-            packed = work / "reference-packed"
             if not dense.exists():
                 import_llama_checkpoint(checkpoint, dense, group_size=args.group_size,
                                         block_rows=args.block_rows,
                                         tensor_codecs={name: "f32" for name in matrices})
-            if not packed.exists():
-                import_llama_checkpoint(checkpoint, packed, group_size=args.group_size,
-                                        block_rows=args.block_rows)
             reference, dense_report = run_model(dense, args.tokens, memory_budget=args.memory_budget,
                                                 tile_rows=args.tile_rows)
-            packed_logits, packed_report = run_model(packed, args.tokens,
-                                                     memory_budget=args.memory_budget,
-                                                     tile_rows=args.tile_rows)
-            with ModelBundleReader(packed) as bundle:
-                packed_bytes = {item["name"]: item["packed_payload_bytes"]
-                                for item in bundle.inspect()["tensors"]}
-            for entry in tensors:
-                variant = work / f"variant-{entry['name'].replace('.', '_')}"
-                if variant.exists():
-                    shutil.rmtree(variant)
-                build_variant(dense, packed, entry["name"], variant)
-                try:
-                    logits, _ = run_model(variant, args.tokens, memory_budget=args.memory_budget,
-                                          tile_rows=args.tile_rows)
-                finally:
-                    if not args.work_dir:
-                        shutil.rmtree(variant, ignore_errors=True)
-                entry["packed_bytes"] = packed_bytes[entry["name"]]
-                entry["saved_bytes"] = entry["dense_bytes"] - packed_bytes[entry["name"]]
-                entry["sensitivity"] = logit_delta(reference, logits)
-                saved = max(entry["saved_bytes"], 1)
-                # What one tensor's quantization costs per byte it saves: the
-                # ranking a precision map needs, not an absolute quality claim.
-                entry["cost_per_saved_kib"] = entry["sensitivity"]["rmse"] / (saved / 1024)
-            tensors.sort(key=lambda item: item["sensitivity"]["rmse"], reverse=True)
-            report.update({
-                "reference": {"codec": "RAW_F32_MATRIX", "logits_sha256": dense_report["logits_sha256"]},
-                "all_packed": {"codec": "Q4_GROUPED", "logits_sha256": packed_report["logits_sha256"],
-                               "sensitivity": logit_delta(reference, packed_logits)},
-                "most_sensitive": [entry["name"] for entry in tensors[:5]],
-                "ranking": "tensors sorted by the logit RMSE their own quantization causes"})
+            report["reference"] = {"codec": "RAW_F32_MATRIX",
+                                   "logits_sha256": dense_report["logits_sha256"]}
+            report["all_packed"] = {}
+            for codec in codecs:
+                packed = work / f"reference-{codec}"
+                if not packed.exists():
+                    import_llama_checkpoint(checkpoint, packed, group_size=args.group_size,
+                                            block_rows=args.block_rows,
+                                            tensor_codecs={name: codec for name in matrices})
+                packed_logits, packed_report = run_model(packed, args.tokens,
+                                                         memory_budget=args.memory_budget,
+                                                         tile_rows=args.tile_rows)
+                report["all_packed"][codec] = {
+                    "logits_sha256": packed_report["logits_sha256"],
+                    "sensitivity": logit_delta(reference, packed_logits)}
+                with ModelBundleReader(packed) as bundle:
+                    sizes = {item["name"]: item["packed_payload_bytes"]
+                             for item in bundle.inspect()["tensors"]}
+                for entry in tensors:
+                    name = entry["name"]
+                    variant = work / f"variant-{codec}-{name.replace('.', '_')}"
+                    if variant.exists():
+                        shutil.rmtree(variant)
+                    build_variant(dense, packed, name, variant)
+                    try:
+                        logits, _ = run_model(variant, args.tokens, memory_budget=args.memory_budget,
+                                              tile_rows=args.tile_rows)
+                    finally:
+                        if not args.work_dir:
+                            shutil.rmtree(variant, ignore_errors=True)
+                    measurement = entry["codecs"][codec]
+                    measurement["packed_bytes"] = sizes[name]
+                    measurement["saved_bytes"] = entry["dense_bytes"] - sizes[name]
+                    measurement["sensitivity"] = logit_delta(reference, logits)
+                    saved = max(measurement["saved_bytes"], 1)
+                    # Logit error per byte this codec saves on this tensor: the
+                    # ranking a precision map needs, not a quality claim.
+                    measurement["cost_per_saved_kib"] = (measurement["sensitivity"]["rmse"] /
+                                                         (saved / 1024))
+            tensors.sort(key=rank, reverse=True)
+            report["most_sensitive"] = [entry["name"] for entry in tensors[:5]]
+            report["ranking"] = ("tensors sorted by the worst logit RMSE any measured codec "
+                                 "causes on that tensor alone")
         else:
-            tensors.sort(key=lambda item: item["quantization"]["relative_rmse"], reverse=True)
+            tensors.sort(key=lambda item: max(codec["quantization"]["relative_rmse"]
+                                              for codec in item["codecs"].values()), reverse=True)
 
         encoded = json.dumps(report, indent=2, sort_keys=True)
         if args.report is not None:

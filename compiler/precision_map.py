@@ -18,8 +18,8 @@ import math
 from types import MappingProxyType
 
 SCHEMA_VERSION = 1
-POLICY_ID = "GREEDY_SENSITIVITY_PER_BYTE_V1"
-CODECS = ("q4", "f32")
+POLICY_ID = "GREEDY_SENSITIVITY_PER_BYTE_V2"
+CODECS = ("q4", "q8", "f32")
 MAX_MAP_TENSORS = 4096
 
 
@@ -83,74 +83,118 @@ class PrecisionMap:
         return cls.from_dict(json.loads(text))
 
 
+def _rmse(value, label):
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"Calibration report lacks a finite sensitivity for {label}")
+    return float(value)
+
+
+def _options(name, entry):
+    """Codec choices for one tensor, cheapest first, dominated ones removed.
+
+    Dense is always available at its own size with zero measured error, since
+    it is the reference every sensitivity was measured against.
+    """
+    dense_bytes = entry.get("dense_bytes")
+    if type(dense_bytes) is not int or dense_bytes <= 0:
+        raise ValueError(f"Calibration report lacks a valid dense_bytes for {name}")
+    measured = entry.get("codecs")
+    if measured is None and "packed_bytes" in entry:
+        # A report from the single-codec calibration still plans correctly.
+        measured = {"q4": {"packed_bytes": entry["packed_bytes"],
+                           "sensitivity": entry.get("sensitivity", {})}}
+    if not isinstance(measured, dict) or not measured:
+        raise ValueError(f"Calibration report lacks measured codecs for {name}")
+    choices = []
+    for codec, item in measured.items():
+        if codec not in CODECS or codec == "f32":
+            raise ValueError(f"Unsupported measured codec for {name}: {codec!r}")
+        size = item.get("packed_bytes")
+        if type(size) is not int or size <= 0:
+            raise ValueError(f"Calibration report lacks a valid packed_bytes for {name}/{codec}")
+        choices.append({"codec": codec, "bytes": size,
+                        "sensitivity": _rmse(item.get("sensitivity", {}).get("rmse"), f"{name}/{codec}")})
+    choices.append({"codec": "f32", "bytes": dense_bytes, "sensitivity": 0.0})
+    choices.sort(key=lambda item: (item["bytes"], item["sensitivity"], item["codec"]))
+    # Drop a choice that costs more and is not more accurate than a cheaper one.
+    frontier, best = [], math.inf
+    for choice in choices:
+        if choice["sensitivity"] < best:
+            frontier.append(choice)
+            best = choice["sensitivity"]
+    return frontier
+
+
 def _measured(report):
     tensors = report.get("tensors")
     if not isinstance(tensors, list) or not tensors:
         raise ValueError("Calibration report contains no tensors")
     if not report.get("sensitivity_measured"):
         raise ValueError("Selection requires a calibration report with measured sensitivity")
-    rows = {}
-    for entry in tensors:
-        name = _text(entry.get("name"), "tensor name")
-        for key in ("dense_bytes", "packed_bytes"):
-            size = entry.get(key)
-            if type(size) is not int or size <= 0:
-                raise ValueError(f"Calibration report lacks a valid {key} for {name}")
-        sensitivity = entry.get("sensitivity", {}).get("rmse")
-        if not isinstance(sensitivity, (int, float)) or not math.isfinite(sensitivity) or sensitivity < 0:
-            raise ValueError(f"Calibration report lacks a finite sensitivity for {name}")
-        rows[name] = {"dense": entry["dense_bytes"], "packed": entry["packed_bytes"],
-                      "sensitivity": float(sensitivity)}
-    return rows
+    return {_text(entry.get("name"), "tensor name"): _options(_text(entry.get("name"), "tensor name"), entry)
+            for entry in tensors}
 
 
 def select_precision(report, budget_bytes):
-    """Choose codecs under a byte budget, keeping the costliest tensors dense.
+    """Choose a codec per tensor under a byte budget, from measured error.
 
-    Every tensor starts packed, which is the cheapest configuration. Whatever
-    budget remains promotes tensors to dense in order of sensitivity per extra
-    byte, so the bytes spent buy the most avoided logit error.
+    Every tensor starts at its cheapest measured codec. While budget remains,
+    the upgrade with the best avoided error per extra byte is applied, anywhere
+    in the model; a tensor can climb more than one step, and a step that buys
+    no accuracy is never taken.
 
-    The selection is greedy over a ratio: with a binary choice per tensor this
-    is a heuristic, not an optimum, and the estimate assumes errors add, which
-    they do not. It ranks; it does not certify quality.
+    The selection is greedy over a ratio, so it is a heuristic, not an optimum.
+    The estimate also assumes errors add, which they do not: it ranks plans, it
+    does not certify quality.
     """
     if type(budget_bytes) is not int or budget_bytes < 0:
         raise ValueError("budget_bytes must be a non-negative integer")
     rows = _measured(report)
-    packed_total = sum(row["packed"] for row in rows.values())
-    if packed_total > budget_bytes:
-        raise ValueError(f"Budget {budget_bytes} is below {packed_total} bytes with every tensor packed")
-    codecs = {name: "q4" for name in rows}
-    remaining = budget_bytes - packed_total
-    promotions = []
-    # Ties break on the tensor name so the same report always plans the same map.
-    order = sorted(rows.items(),
-                   key=lambda item: (-item[1]["sensitivity"] / max(item[1]["dense"] - item[1]["packed"], 1),
-                                     item[0]))
-    for name, row in order:
-        extra = row["dense"] - row["packed"]
-        if extra <= 0:
-            # A codec that does not shrink this tensor: dense costs nothing.
-            codecs[name] = "f32"
-            promotions.append({"tensor": name, "extra_bytes": max(extra, 0),
-                               "avoided_rmse": row["sensitivity"]})
-            continue
-        if extra > remaining or not row["sensitivity"]:
-            continue
-        codecs[name] = "f32"
-        remaining -= extra
-        promotions.append({"tensor": name, "extra_bytes": extra, "avoided_rmse": row["sensitivity"]})
+    baseline = sum(options[0]["bytes"] for options in rows.values())
+    if baseline > budget_bytes:
+        raise ValueError(f"Budget {budget_bytes} is below {baseline} bytes at the cheapest codecs")
+    chosen = {name: 0 for name in rows}
+    remaining = budget_bytes - baseline
+    upgrades = []
+    while True:
+        best = None
+        for name in sorted(rows):
+            options = rows[name]
+            current = options[chosen[name]]
+            for index in range(chosen[name] + 1, len(options)):
+                candidate = options[index]
+                extra = candidate["bytes"] - current["bytes"]
+                avoided = current["sensitivity"] - candidate["sensitivity"]
+                if avoided <= 0 or extra > remaining:
+                    continue
+                # A free upgrade is always worth taking; otherwise rank by the
+                # error it avoids per extra byte, breaking ties by name.
+                ratio = math.inf if extra <= 0 else avoided / extra
+                # Tensors are visited in name order and steps cheapest first,
+                # so a strict comparison keeps the first of any tie.
+                key = (ratio, -extra)
+                if best is None or key > best[0]:
+                    best = (key, name, index, extra, avoided, candidate["codec"])
+        if best is None:
+            break
+        _, name, index, extra, avoided, codec = best
+        chosen[name] = index
+        remaining -= max(extra, 0)
+        upgrades.append({"tensor": name, "codec": codec, "extra_bytes": max(extra, 0),
+                         "avoided_rmse": avoided})
+    codecs = {name: rows[name][index]["codec"] for name, index in chosen.items()}
     provenance = {
         "policy": POLICY_ID, "budget_bytes": budget_bytes,
-        "packed_baseline_bytes": packed_total,
+        "cheapest_baseline_bytes": baseline,
         "planned_bytes": budget_bytes - remaining,
         "unused_budget_bytes": remaining,
         "checkpoint": report.get("checkpoint"),
         "calibration_tokens": report.get("tokens"),
         "group_size": report.get("group_size"),
-        "promotions": promotions,
-        "estimated_avoided_rmse_sum": sum(item["avoided_rmse"] for item in promotions),
+        "measured_codecs": report.get("measured_codecs", ["q4"]),
+        "codec_counts": {codec: sum(value == codec for value in codecs.values()) for codec in CODECS},
+        "upgrades": upgrades,
+        "estimated_avoided_rmse_sum": sum(item["avoided_rmse"] for item in upgrades),
         "estimate_scope": ("sum of individually measured logit RMSE; errors do not add, "
                            "so this ranks plans and does not predict combined quality"),
         "quality_measured": False,
