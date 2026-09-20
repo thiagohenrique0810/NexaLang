@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compiler.calibration import (
     build_variant, logit_delta, quantization_error, row_statistics,
 )
+from compiler.codec_speed import DECODE_RATE_POLICY_ID, SPEED_CODECS, rate_table
 from test_dense_weights_regressions import _DenseFixture, exact_q4_value
 
 
@@ -249,6 +250,27 @@ class CalibrationCLIRegressions(_DenseFixture):
         self.assertEqual(report["measured_codecs"], ["q8"])
         self.assertEqual(set(report["all_packed"]), {"q8"})
         self.assertEqual(set(report["tensors"][0]["codecs"]), {"q8"})
+
+    def test_the_report_publishes_a_measured_decode_rate_for_the_whole_ladder(self):
+        report = self.run_cli("--checkpoint", str(self.checkpoint), "--tokens", "1,3",
+                              "--group-size", "4", "--static-only", "--decode-time-trials", "3")
+        timing = report["decode_time"]
+        self.assertEqual(timing["policy_id"], DECODE_RATE_POLICY_ID)
+        # A rate belongs to the host and the kernel, not to the tensors this
+        # run happened to calibrate, so the whole ladder is timed either way.
+        self.assertEqual(set(timing["codecs"]), set(SPEED_CODECS))
+        self.assertEqual(timing["kernel_shape"]["group_size"], 4)
+        self.assertEqual(timing["kernel_shape"]["cols"] % 4, 0)
+        for codec, entry in timing["codecs"].items():
+            with self.subTest(codec=codec):
+                self.assertEqual(entry["kernel"], f"nexa_{codec}_matmul")
+                self.assertGreater(entry["ns_per_byte"], 0.0)
+                self.assertGreater(entry["repeats"], 0)
+        self.assertEqual(timing["trials"], 3)
+        self.assertEqual(rate_table(report).keys(), timing["codecs"].keys())
+        skipped = self.run_cli("--checkpoint", str(self.checkpoint), "--tokens", "1,3",
+                               "--group-size", "4", "--static-only", "--decode-time-trials", "0")
+        self.assertNotIn("decode_time", skipped)
 
     def test_unknown_tensors_and_missing_checkpoints_are_rejected(self):
         for arguments in (("--checkpoint", str(self.checkpoint), "--tokens", "1", "--tensor", "model.norm.weight"),
