@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from runtime.nexapack.bundle import DENSE_CODECS, ModelBundleReader
 from runtime.nexapack.container import is_container
-from runtime.nexapack.format import NexaPackReader
+from runtime.nexapack.format import MIXED_CODEC_ID, NexaPackReader
 
 
 def verify_matrix(reader):
@@ -47,6 +47,55 @@ def verify_matrix(reader):
             tile.release()
         view.release()
         scratch = view = tile = record = None
+
+
+def verify_mixed_matrix(reader):
+    """Validate a heterogeneous matrix one block at a time, under its codec.
+
+    Blocks are the unit here because they are the unit that owns a codec and a
+    checksum; a tile that spanned two of them would have no single row width.
+    """
+    for block in reader.blocks:
+        width = block["row_bytes"]
+        tile_rows = min(block["row_count"], max(1, (1024 * 1024) // width))
+        scratch = bytearray(tile_rows * width)
+        view = memoryview(scratch)
+        tile = record = None
+        try:
+            end = block["start_row"] + block["row_count"]
+            for start in range(block["start_row"], end, tile_rows):
+                count = min(tile_rows, end - start)
+                tile = view[:count * width]
+                reader.read_rows_into(start, count, tile)
+                tile.release()
+                tile = None
+                for row in range(count):
+                    record = view[row * width:(row + 1) * width]
+                    try:
+                        reader.validate_row(record, codec_id=block["codec_id"])
+                    finally:
+                        record.release()
+                        record = None
+        finally:
+            if tile is not None:
+                tile.release()
+            if record is not None:
+                record.release()
+            view.release()
+            scratch = view = tile = record = None
+    return reader.payload_bytes_read
+
+
+def mixed_composition(reader):
+    """How many blocks, rows and payload bytes each codec holds."""
+    composition = {}
+    for block in reader.blocks:
+        entry = composition.setdefault(block["codec_id"],
+                                       {"blocks": 0, "rows": 0, "payload_bytes": 0})
+        entry["blocks"] += 1
+        entry["rows"] += block["row_count"]
+        entry["payload_bytes"] += block["size"]
+    return composition
 
 
 def inspect_artifact(path, *, verify=False):
@@ -86,6 +135,21 @@ def inspect_artifact(path, *, verify=False):
                                          "model_quality_measured": False})
             return result
     with NexaPackReader(path) as reader:
+        if reader.codec_id == MIXED_CODEC_ID:
+            read = verify_mixed_matrix(reader) if verify else 0
+            return {"format": "NexaPack", "format_version": 1,
+                    "shape": [reader.rows, reader.cols], "group_size": reader.group_size,
+                    "codec": reader.codec_id, "codec_version": reader.codec_version,
+                    "packed_payload_bytes": sum(block["size"] for block in reader.blocks),
+                    "file_bytes": path.stat().st_size,
+                    "composition": mixed_composition(reader),
+                    "blocks": [{key: block[key] for key in
+                                ("start_row", "row_count", "codec_id", "row_bytes", "size")}
+                               for block in reader.blocks],
+                    "metadata": reader.metadata,
+                    "validation": {"payloads_verified": verify, "payload_bytes_read": read,
+                                   "checksums_verified": verify, "codec_validated": verify,
+                                   "model_quality_measured": False}}
         result = {"format": "NexaPack", "format_version": 1,
                   "shape": [reader.rows, reader.cols], "group_size": reader.group_size,
                   "packed_payload_bytes": reader.rows * reader.row_bytes,

@@ -6,6 +6,12 @@ The JSON index precedes zero padding to a 4096-byte boundary. Payload blocks
 are contiguous. Each index entry carries row bounds, absolute byte bounds,
 and SHA-256. Checksums detect corruption; they do not authenticate a publisher.
 
+A MIXED_GROUPED matrix carries a different grouped codec per row block. Its
+index moves `row_bytes` from the file level into each block, beside that
+block's `codec_id`, and the reader recomputes both instead of multiplying one
+file-wide width by a row count. The four uniform codecs keep their own key set
+and their files are unchanged, byte for byte.
+
 Q4 groups contain a little-endian float32 scale followed by ceil(group_size/2)
 bytes. The low nibble comes first, and signed values use two's complement in
 [-7, 7]. Both missing coordinates and an unused high nibble are zero.
@@ -38,6 +44,8 @@ Q2_CODEC_VERSION = 1
 _GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8', Q3_CODEC_ID: 'q3', Q2_CODEC_ID: 'q2'}
 # Codes per group: the scale is max|v| / levels, and -(levels + 1) is reserved.
 _CODEC_LEVELS = {CODEC_ID: 7, Q8_CODEC_ID: 127, Q3_CODEC_ID: 3, Q2_CODEC_ID: 1}
+MIXED_CODEC_ID = 'MIXED_GROUPED'
+MIXED_CODEC_VERSION = 1
 TQ_CODEC_ID = 'TQ_MSE_SRHT'
 TQ_CODEC_VERSION = 1
 TQ_TRANSFORM_ID = 'SRHT_XOSHIRO256SS_V1'
@@ -60,11 +68,35 @@ _METADATA_KEYS = {
 _TQ_METADATA_KEYS = (_METADATA_KEYS - {'group_size'}) | {
     'bits', 'seed', 'transform_id', 'codebook_f32le',
 }
+# A mixed matrix has no single row width, so 'row_bytes' leaves the file level
+# and joins each block, next to the codec that determines it. A separate key
+# set is what keeps the four homogeneous files byte-identical to what they
+# were: their metadata gains nothing and loses nothing.
+_MIXED_METADATA_KEYS = _METADATA_KEYS - {'row_bytes'}
 _BLOCK_KEYS = {'start_row', 'row_count', 'offset', 'size', 'sha256'}
+_MIXED_BLOCK_KEYS = _BLOCK_KEYS | {'codec_id', 'row_bytes'}
+_CODEC_BY_STORAGE_DTYPE = {dtype: codec for codec, dtype in _GROUPED_CODECS.items()}
+_CODEC_VERSIONS = {codec: CODEC_VERSION for codec in _GROUPED_CODECS}
+_CODEC_VERSIONS[MIXED_CODEC_ID] = MIXED_CODEC_VERSION
+_CODEC_VERSIONS[TQ_CODEC_ID] = TQ_CODEC_VERSION
 
 
 class NexaPackError(ValueError):
     """Invalid matrix, unsupported format, corrupted data, or exceeded limit."""
+
+
+def _block_codec(name):
+    """Name one grouped codec as either its storage dtype or its codec id.
+
+    Callers plan in storage dtypes ('q3') while the index stores codec ids, and
+    one normaliser keeps a typo from becoming a third spelling of a codec.
+    """
+    if isinstance(name, str):
+        if name in _GROUPED_CODECS:
+            return name
+        if name in _CODEC_BY_STORAGE_DTYPE:
+            return _CODEC_BY_STORAGE_DTYPE[name]
+    raise NexaPackError(f'Unsupported grouped codec: {name!r}')
 
 
 def _integer(value, name, *, minimum=1, maximum=MAX_INTEGER):
@@ -436,6 +468,29 @@ def _align(value):
     return ((value + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
 
 
+def _resolve_layout(metadata):
+    """Place contiguous blocks after an index whose own size depends on them.
+
+    Offsets widen the JSON that stores them, which can push payload_offset past
+    the next alignment boundary and move every offset again. Iterating to a
+    fixed point before the source is consumed is what keeps the writer to a
+    single streaming pass, for a uniform codec and for a mixed one alike.
+    """
+    blocks = metadata['blocks']
+    payload_offset = _align(HEADER.size + len(_json_bytes(metadata)))
+    while True:
+        offset = payload_offset
+        for block in blocks:
+            block['offset'] = offset
+            offset += block['size']
+        if offset > MAX_INTEGER:
+            raise NexaPackError('Encoded file size exceeds the v1 integer limit')
+        wanted_offset = _align(HEADER.size + len(_json_bytes(metadata)))
+        if wanted_offset == payload_offset:
+            return metadata, payload_offset, offset
+        payload_offset = wanted_offset
+
+
 def _new_metadata(rows, cols, group_size, block_rows, codec=CODEC_ID):
     _integer(rows, 'rows')
     _integer(block_rows, 'block_rows')
@@ -457,20 +512,43 @@ def _new_metadata(rows, cols, group_size, block_rows, codec=CODEC_ID):
         'endianness': 'little', 'checksum': 'sha256', 'row_bytes': row_bytes,
         'block_rows': block_rows, 'blocks': blocks,
     }
-    # The checksum strings keep their width. Resolve header alignment before
-    # consuming the source, so the writer only needs one streaming pass.
-    payload_offset = _align(HEADER.size + len(_json_bytes(metadata)))
-    while True:
-        offset = payload_offset
-        for block in blocks:
-            block['offset'] = offset
-            offset += block['size']
-        if offset > MAX_INTEGER:
-            raise NexaPackError('Encoded file size exceeds the v1 integer limit')
-        wanted_offset = _align(HEADER.size + len(_json_bytes(metadata)))
-        if wanted_offset == payload_offset:
-            return metadata, payload_offset, offset
-        payload_offset = wanted_offset
+    # The checksum strings keep their width, so the index cannot grow again
+    # once the payload has been written.
+    return _resolve_layout(metadata)
+
+
+def _new_mixed_metadata(rows, cols, group_size, block_rows, block_codecs):
+    """Index a matrix whose codec changes from one row block to the next.
+
+    block_codecs names one codec per block, in block order, and its length has
+    to match the block count exactly. Deriving the count instead would let a
+    caller who miscounted still publish a file, with the rows silently grouped
+    the other way.
+    """
+    _integer(rows, 'rows')
+    _integer(block_rows, 'block_rows')
+    block_count = (rows + block_rows - 1) // block_rows
+    if block_count > MAX_BLOCKS:
+        raise NexaPackError(f'More than {MAX_BLOCKS} blocks; increase block_rows')
+    if not isinstance(block_codecs, (list, tuple)) or len(block_codecs) != block_count:
+        raise NexaPackError(f'block_codecs must name exactly {block_count} blocks')
+    codecs = [_block_codec(name) for name in block_codecs]
+    widths = [_row_bytes(cols, group_size, codec) for codec in codecs]
+    starts = range(0, rows, block_rows)
+    blocks = [
+        {'start_row': start, 'row_count': min(block_rows, rows - start),
+         'codec_id': codec, 'row_bytes': width, 'offset': 0,
+         'size': min(block_rows, rows - start) * width, 'sha256': '0' * 64}
+        for start, codec, width in zip(starts, codecs, widths)
+    ]
+    metadata = {
+        'format': 'NexaPack', 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
+        'logical_dtype': 'f32', 'storage_dtype': 'mixed', 'codec_id': MIXED_CODEC_ID,
+        'codec_version': MIXED_CODEC_VERSION, 'group_size': group_size,
+        'endianness': 'little', 'checksum': 'sha256',
+        'block_rows': block_rows, 'blocks': blocks,
+    }
+    return _resolve_layout(metadata)
 
 
 def write_q8_matrix(path, rows: int, cols: int, group_size: int,
@@ -495,7 +573,28 @@ def write_grouped_matrix(path, rows: int, cols: int, group_size: int,
                          row_source: Iterable[Iterable[float]], *,
                          block_rows: int = 64, codec: str = CODEC_ID) -> None:
     """Shared streaming writer for the grouped codecs; one group at a time."""
-    metadata, payload_offset, total_size = _new_metadata(rows, cols, group_size, block_rows, codec)
+    _write_blocks(path, _new_metadata(rows, cols, group_size, block_rows, codec),
+                  rows, cols, group_size, row_source)
+
+
+def write_mixed_matrix(path, rows: int, cols: int, group_size: int,
+                       row_source: Iterable[Iterable[float]], *,
+                       block_codecs, block_rows: int = 64) -> None:
+    """Write one matrix whose codec changes from row block to row block.
+
+    The same single streaming pass as write_grouped_matrix, over the same
+    encoders: the codec is read once per block instead of once per file. A
+    second encoder would be a second spelling of a codec, and the payload of a
+    mixed file would stop being comparable byte for byte with the uniform one.
+    """
+    _write_blocks(path, _new_mixed_metadata(rows, cols, group_size, block_rows, block_codecs),
+                  rows, cols, group_size, row_source)
+
+
+def _write_blocks(path, layout, rows, cols, group_size, row_source):
+    """Encode rows block by block under each block's own declared codec."""
+    metadata, payload_offset, total_size = layout
+    uniform = metadata['codec_id'] if metadata['codec_id'] != MIXED_CODEC_ID else None
     try:
         source = iter(row_source)
     except TypeError as error:
@@ -508,6 +607,7 @@ def write_grouped_matrix(path, rows: int, cols: int, group_size: int,
             stream.seek(payload_offset)
             for block in metadata['blocks']:
                 digest = hashlib.sha256()
+                codec = uniform or block['codec_id']
                 for row_index in range(block['start_row'], block['start_row'] + block['row_count']):
                     try:
                         values = next(source)
@@ -568,18 +668,7 @@ def _new_tq_metadata(rows, cols, bits, seed, codebook_f32le, block_rows):
         'endianness': 'little', 'checksum': 'sha256', 'row_bytes': row_bytes,
         'block_rows': block_rows, 'blocks': blocks,
     }
-    payload_offset = _align(HEADER.size + len(_json_bytes(metadata)))
-    while True:
-        offset = payload_offset
-        for block in blocks:
-            block['offset'] = offset
-            offset += block['size']
-        if offset > MAX_INTEGER:
-            raise NexaPackError('Encoded file size exceeds the v1 integer limit')
-        wanted_offset = _align(HEADER.size + len(_json_bytes(metadata)))
-        if wanted_offset == payload_offset:
-            return metadata, payload_offset, offset
-        payload_offset = wanted_offset
+    return _resolve_layout(metadata)
 
 
 def _write_tq_rows(path, layout, row_source, encode_row):
@@ -714,6 +803,10 @@ class _Block:
     offset: int
     size: int
     sha256: str
+    # Uniform files repeat the file's codec and width here, so every read path
+    # below has one shape of block to handle instead of two.
+    codec_id: str
+    row_bytes: int
 
 
 class NexaPackReader:
@@ -784,6 +877,8 @@ class NexaPackReader:
         codec = metadata.get('codec_id')
         if codec in _GROUPED_CODECS:
             keys, storage_dtype = _METADATA_KEYS, _GROUPED_CODECS[codec]
+        elif codec == MIXED_CODEC_ID:
+            keys, storage_dtype = _MIXED_METADATA_KEYS, 'mixed'
         elif codec == TQ_CODEC_ID:
             keys, storage_dtype = _TQ_METADATA_KEYS, 'tq_mse'
         else:
@@ -792,7 +887,7 @@ class NexaPackReader:
             raise NexaPackError('Unexpected NexaPack metadata fields')
         expected = {'format': 'NexaPack', 'format_version': FORMAT_VERSION,
                     'logical_dtype': 'f32', 'storage_dtype': storage_dtype, 'codec_id': codec,
-                    'codec_version': CODEC_VERSION if codec in _GROUPED_CODECS else TQ_CODEC_VERSION,
+                    'codec_version': _CODEC_VERSIONS[codec],
                     'endianness': 'little', 'checksum': 'sha256'}
         if codec == TQ_CODEC_ID:
             expected['transform_id'] = TQ_TRANSFORM_ID
@@ -810,6 +905,11 @@ class NexaPackReader:
         if codec in _GROUPED_CODECS:
             self._group_size = _integer(metadata['group_size'], 'group_size', maximum=MAX_GROUP_SIZE)
             self._row_bytes = _row_bytes(self._cols, self._group_size, codec)
+        elif codec == MIXED_CODEC_ID:
+            self._group_size = _integer(metadata['group_size'], 'group_size', maximum=MAX_GROUP_SIZE)
+            # No single number can stand for a row here, and publishing one
+            # would be the number a caller multiplies by.
+            self._row_bytes = None
         else:
             from .tq import tq_row_bytes, validate_tq_codebook, validate_tq_parameters
             try:
@@ -821,7 +921,7 @@ class NexaPackReader:
             self._seed = metadata['seed']
             self._codebook_f32le = metadata['codebook_f32le']
             self._row_bytes = tq_row_bytes(self._cols, self._bits)
-        if _integer(metadata['row_bytes'], 'row_bytes') != self._row_bytes:
+        if codec != MIXED_CODEC_ID and _integer(metadata['row_bytes'], 'row_bytes') != self._row_bytes:
             raise NexaPackError('row_bytes does not match the matrix shape and codec')
         self._block_rows = _integer(metadata['block_rows'], 'block_rows')
         blocks = metadata['blocks']
@@ -829,9 +929,10 @@ class NexaPackReader:
         if not isinstance(blocks, list) or not 0 < len(blocks) <= MAX_BLOCKS or len(blocks) != expected_count:
             raise NexaPackError('Invalid block index length')
         next_row, next_offset = 0, payload_offset
+        block_keys = _MIXED_BLOCK_KEYS if codec == MIXED_CODEC_ID else _BLOCK_KEYS
         validated = []
         for block in blocks:
-            if not isinstance(block, dict) or set(block) != _BLOCK_KEYS:
+            if not isinstance(block, dict) or set(block) != block_keys:
                 raise NexaPackError('Unexpected block index fields')
             start = _integer(block['start_row'], 'start_row', minimum=0)
             count = _integer(block['row_count'], 'row_count')
@@ -842,9 +943,23 @@ class NexaPackReader:
                 raise NexaPackError('Invalid block checksum')
             if start != next_row or count != min(self._block_rows, self._rows - next_row):
                 raise NexaPackError('Overlapping, missing, or out-of-order matrix rows')
-            if offset != next_offset or block_size != count * self._row_bytes or offset + block_size > total_size:
+            if codec == MIXED_CODEC_ID:
+                block_codec = block['codec_id']
+                if not isinstance(block_codec, str) or block_codec not in _GROUPED_CODECS:
+                    raise NexaPackError('Unsupported block codec_id')
+                # The declared width is checked against the width this block's
+                # own codec implies, never trusted and never derived from the
+                # neighbours: a width that drifted by one group would still
+                # tile the payload, and every later block would be decoded
+                # from bytes belonging to the previous one.
+                width = _row_bytes(self._cols, self._group_size, block_codec)
+                if _integer(block['row_bytes'], 'row_bytes') != width:
+                    raise NexaPackError('Block row_bytes does not match its codec')
+            else:
+                block_codec, width = codec, self._row_bytes
+            if offset != next_offset or block_size != count * width or offset + block_size > total_size:
                 raise NexaPackError('Overlapping, truncated, or invalid block byte range')
-            validated.append(_Block(start, count, offset, block_size, checksum))
+            validated.append(_Block(start, count, offset, block_size, checksum, block_codec, width))
             next_row += count
             next_offset += block_size
         if next_row != self._rows or next_offset != total_size:
@@ -859,6 +974,18 @@ class NexaPackReader:
     def metadata(self):
         # Return a detached copy; callers cannot change the validated I/O plan.
         return json.loads(json.dumps(self._metadata))
+
+    @property
+    def blocks(self):
+        """Row bounds, byte bounds, codec and width of every block; a copy.
+
+        A uniform file reports its own codec on each block, so a caller reading
+        the composition does not need to know which kind of file it holds.
+        """
+        return tuple({'start_row': block.start_row, 'row_count': block.row_count,
+                      'codec_id': block.codec_id, 'row_bytes': block.row_bytes,
+                      'offset': block.offset, 'size': block.size,
+                      'sha256': block.sha256} for block in self._blocks)
 
     @property
     def rows(self):
@@ -892,19 +1019,25 @@ class NexaPackReader:
     def codebook_f32le(self):
         return self._codebook_f32le
 
-    def validate_row(self, data) -> None:
+    def validate_row(self, data, *, codec_id=None) -> None:
         """Validate codec structure without native code or decoded row storage.
 
         This complements container checksums. Like the original Q4 reader,
         read_rows returns packed bytes; callers select when to validate values.
+        A mixed matrix has no file-wide row codec, so its caller names the
+        block's: guessing one would measure a row against the wrong width and
+        report corruption where there is none.
         """
-        if self.codec_id == CODEC_ID:
+        codec = self._codec_id if codec_id is None else _block_codec(codec_id)
+        if codec == MIXED_CODEC_ID:
+            raise NexaPackError('A mixed matrix validates per block; name that block codec_id')
+        if codec == CODEC_ID:
             validate_q4_row(data, self.cols, self.group_size)
-        elif self.codec_id == Q8_CODEC_ID:
+        elif codec == Q8_CODEC_ID:
             validate_q8_row(data, self.cols, self.group_size)
-        elif self.codec_id == Q3_CODEC_ID:
+        elif codec == Q3_CODEC_ID:
             validate_q3_row(data, self.cols, self.group_size)
-        elif self.codec_id == Q2_CODEC_ID:
+        elif codec == Q2_CODEC_ID:
             validate_q2_row(data, self.cols, self.group_size)
         else:
             from .tq import validate_tq_row
@@ -915,6 +1048,7 @@ class NexaPackReader:
 
     @property
     def row_bytes(self):
+        """Bytes per packed row, or None when the codec changes per block."""
         return self._row_bytes
 
     @property
@@ -932,6 +1066,23 @@ class NexaPackReader:
         """Bytes this matrix owns; the header's total size has to match it exactly."""
         return self._window_bytes
 
+    def _range_bytes(self, start, count):
+        """Add up the widths the index declares for a row range.
+
+        Summing the blocks a request touches gives the same answer as
+        multiplying by one file-wide width, and keeps giving the right answer
+        when there is no file-wide width to multiply by.
+        """
+        if not count:
+            return 0
+        end = start + count
+        total = 0
+        for block in self._blocks[start // self._block_rows:(end - 1) // self._block_rows + 1]:
+            low = max(start, block.start_row)
+            high = min(end, block.start_row + block.row_count)
+            total += (high - low) * block.row_bytes
+        return total
+
     def _request_size(self, start, count):
         if self._stream.closed:
             raise NexaPackError('NexaPack reader is closed')
@@ -939,7 +1090,7 @@ class NexaPackReader:
         _integer(count, 'count', minimum=0)
         if start > self.rows or count > self.rows - start:
             raise NexaPackError('Requested rows are outside the matrix')
-        requested_size = count * self.row_bytes
+        requested_size = self._range_bytes(start, count)
         if requested_size > MAX_READ_BYTES:
             raise NexaPackError(f'Row request exceeds {MAX_READ_BYTES} bytes; use smaller batches')
         return requested_size
@@ -973,8 +1124,8 @@ class NexaPackReader:
             end = start + count
             for block in self._blocks[start // self._block_rows:(end - 1) // self._block_rows + 1]:
                 digest = hashlib.sha256()
-                low = max(start - block.start_row, 0) * self.row_bytes
-                high = min(end - block.start_row, block.row_count) * self.row_bytes
+                low = max(start - block.start_row, 0) * block.row_bytes
+                high = min(end - block.start_row, block.row_count) * block.row_bytes
                 # Block offsets are relative to the matrix, which may start
                 # partway into a container file.
                 self._stream.seek(self._window_offset + block.offset)
