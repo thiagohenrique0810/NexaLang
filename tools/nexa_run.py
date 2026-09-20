@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute a local Llama Q4 bundle on token IDs using native CPU kernels.
+"""Execute a local Llama Q4 bundle, directory or `.nxb`, on token IDs using native CPU kernels.
 
 By default decode recomputes the prefix; --kv-cache enables incremental F32 KV.
 Tokenization is not implemented. Optional PyTorch verification is outside the CPU budget.
@@ -38,7 +38,7 @@ def token_list(text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path)
+    parser.add_argument("bundle", type=Path, help="Bundle directory or single-file .nxb container")
     parser.add_argument("--tokens", type=token_list, help="Prompt as explicit IDs; use --prompt for text")
     parser.add_argument("--prompt", help="Prompt as text, encoded by --tokenizer")
     parser.add_argument("--tokenizer", type=Path, help="NexaTokenizer asset directory")
@@ -151,8 +151,13 @@ def main(argv=None):
         parser.error("--kv-seed must fit signed int32")
     try:
         for source in (args.bundle, args.reference_checkpoint):
-            if (source is not None and args.report is not None
-                    and args.report.resolve().is_relative_to(source.resolve())):
+            # A `.nxb` bundle is a file, so "inside" degenerates to "is": the
+            # guard has to keep the report from overwriting the model itself,
+            # not only from landing in a model directory.
+            if source is None or args.report is None:
+                continue
+            report, origin = args.report.resolve(), source.resolve()
+            if report == origin or (origin.is_dir() and report.is_relative_to(origin)):
                 raise ValueError("Reports must be written outside model and checkpoint directories")
         tokenizer = None
         if args.prompt is not None:

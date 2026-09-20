@@ -4,12 +4,16 @@ The manifest describes physical files and tied-weight aliases. Opening validates
 every Q4 header/index, but weight payload checksums remain lazy. RAW_F32 vectors
 are read explicitly; small tokenizer assets are checked in chunks. No asset is
 executed.
+
+The same bundle reads from a directory or from a single `.nxb` container. A
+backend supplies the manifest bytes and one windowed stream per payload; every
+check above it -- sizes, checksums, codecs, confinement -- is the same code in
+both cases, because a check that ran on only one of the two would be the thing
+that lets a container diverge from the directory it claims to reproduce.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping
-import ctypes
-import errno
 import hashlib
 import json
 import math
@@ -19,10 +23,11 @@ import re
 import shutil
 import stat
 import struct
-import sys
 import tempfile
 
 from compiler.model_config import ModelConfig
+from .container import (NexaContainerError, NexaContainerReader,
+                        publish_directory as _publish_directory, relative_parts)
 from .format import (NexaPackError, NexaPackReader, READ_CHUNK_BYTES,
                      write_grouped_matrix)
 
@@ -146,12 +151,13 @@ def _provenance(value):
 
 
 def _relative_path(value):
-    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value or ":" in value:
-        raise ModelBundleError("Invalid bundle file path")
-    parts = value.split("/")
-    if any(part in ("", ".", "..") for part in parts) or PurePosixPath(value).is_absolute():
-        raise ModelBundleError("Bundle file paths must be confined relative paths")
-    return parts
+    # One rule, shared with the container index, translated into this module's
+    # error type: a path the manifest accepts and the index refuses (or the
+    # reverse) would make a packed bundle unequal to its directory.
+    try:
+        return relative_parts(value)
+    except NexaContainerError as error:
+        raise ModelBundleError(str(error)) from error
 
 
 def _confined_file(directory, value):
@@ -171,26 +177,136 @@ def _confined_file(directory, value):
     return path
 
 
-def _hash_file(path, expected_size, maximum, *, finite_f32=False):
+class _FileStream:
+    """One whole file, carrying the size the manifest will be checked against.
+
+    Unlike a container section, reads are not clamped: a file that grew past
+    its declared size still hands back the extra byte, which is exactly how
+    the readers below notice that it grew.
+    """
+    def __init__(self, stream, size):
+        self._stream = stream
+        self.size = size
+
+    def read(self, count=-1):
+        return self._stream.read(count)
+
+    def readinto(self, buffer):
+        return self._stream.readinto(buffer)
+
+    def seek(self, position, whence=os.SEEK_SET):
+        return self._stream.seek(position, whence)
+
+    def tell(self):
+        return self._stream.tell()
+
+    def close(self):
+        self._stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
+class _DirectoryBackend:
+    """Bundle payloads as separate files under a directory."""
+    kind = "directory"
+
+    def __init__(self, directory):
+        self.root = directory
+
+    def size(self, relative):
+        return _confined_file(self.root, relative).stat().st_size
+
+    def describe(self, relative):
+        # Identity and size from one path walk: hard links and the same file
+        # named twice collapse to one inode.
+        info = _confined_file(self.root, relative).stat()
+        return (info.st_dev, info.st_ino), info.st_size
+
+    def open(self, relative):
+        path = _confined_file(self.root, relative)
+        stream = path.open("rb", buffering=0)
+        try:
+            return _FileStream(stream, os.fstat(stream.fileno()).st_size)
+        except BaseException:
+            stream.close()
+            raise
+
+    def packed(self, relative):
+        path = _confined_file(self.root, relative)
+        # Positional call: a standalone matrix owns its whole file, and tests
+        # that substitute the reader class rely on this exact signature.
+        return path.stat().st_size, lambda: NexaPackReader(path)
+
+    def close(self):
+        pass
+
+
+class _ContainerBackend:
+    """Bundle payloads as windowed sections of one `.nxb` file."""
+    kind = "container"
+
+    def __init__(self, path):
+        self.container = NexaContainerReader(path)
+
+    def size(self, relative):
+        return self.container.section(relative)["bytes"]
+
+    def describe(self, relative):
+        # Two sections cannot start at the same offset: the index refuses
+        # overlaps, so the offset is the section's identity.
+        section = self.container.section(relative)
+        return ("section", section["offset"]), section["bytes"]
+
+    def open(self, relative):
+        return self.container.open_section(relative)
+
+    def packed(self, relative):
+        offset, size = self.container.window(relative)
+        return size, lambda: NexaPackReader(self.container.path,
+                                            window_offset=offset, window_bytes=size)
+
+    def close(self):
+        self.container.close()
+
+
+def _open_backend(source):
+    """Pick the backend from what the path is, never from its spelling."""
+    path = Path(source)
+    if path.is_symlink():
+        raise ModelBundleError("Bundle root must be a directory without a symlink")
+    if path.is_dir():
+        return _DirectoryBackend(path.resolve())
+    if not path.is_file():
+        raise ModelBundleError("Bundle root must be a directory or a container file")
+    try:
+        return _ContainerBackend(path)
+    except NexaContainerError as error:
+        raise ModelBundleError(str(error)) from error
+
+
+def _hash_file(stream, label, expected_size, maximum, *, finite_f32=False):
     _integer(expected_size, "file_bytes", minimum=0, maximum=maximum)
     digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as stream:
-        if os.fstat(stream.fileno()).st_size != expected_size:
-            raise ModelBundleError(f"File size mismatch: {path.name}")
-        consumed = 0
-        while consumed < expected_size:
-            chunk = stream.read(min(READ_CHUNK_BYTES, expected_size - consumed))
-            if not chunk:
-                raise ModelBundleError(f"Truncated file: {path.name}")
-            if finite_f32:
-                if len(chunk) % _F32.size:
-                    raise ModelBundleError(f"Truncated float32 vector: {path.name}")
-                if any(not math.isfinite(item[0]) for item in struct.iter_unpack("<f", chunk)):
-                    raise ModelBundleError(f"Nonfinite float32 vector: {path.name}")
-            digest.update(chunk)
-            consumed += len(chunk)
-        if stream.read(1):
-            raise ModelBundleError(f"File grew during read: {path.name}")
+    if stream.size != expected_size:
+        raise ModelBundleError(f"File size mismatch: {label}")
+    consumed = 0
+    while consumed < expected_size:
+        chunk = stream.read(min(READ_CHUNK_BYTES, expected_size - consumed))
+        if not chunk:
+            raise ModelBundleError(f"Truncated file: {label}")
+        if finite_f32:
+            if len(chunk) % _F32.size:
+                raise ModelBundleError(f"Truncated float32 vector: {label}")
+            if any(not math.isfinite(item[0]) for item in struct.iter_unpack("<f", chunk)):
+                raise ModelBundleError(f"Nonfinite float32 vector: {label}")
+        digest.update(chunk)
+        consumed += len(chunk)
+    if stream.read(1):
+        raise ModelBundleError(f"File grew during read: {label}")
     return digest.hexdigest()
 
 
@@ -224,17 +340,19 @@ def _metadata_sha(reader):
     return hashlib.sha256(_json_bytes(reader.metadata)).hexdigest()
 
 
-def _check_q4(path, entry):
-    if path.stat().st_size != entry["file_bytes"]:
-        raise ModelBundleError(f"Packed file size mismatch: {path.name}")
-    reader = NexaPackReader(path)
+def _check_q4(backend, relative, entry):
+    label = PurePosixPath(relative).name
+    size, open_reader = backend.packed(relative)
+    if size != entry["file_bytes"]:
+        raise ModelBundleError(f"Packed file size mismatch: {label}")
+    reader = open_reader()
     try:
         if reader.codec_id != entry["codec"] or reader.codec_version != 1:
-            raise ModelBundleError(f'Matrix codec differs from its manifest entry: {path.name}')
+            raise ModelBundleError(f'Matrix codec differs from its manifest entry: {label}')
         if [reader.rows, reader.cols] != entry["shape"]:
-            raise ModelBundleError(f"Q4 shape mismatch: {path.name}")
+            raise ModelBundleError(f"Q4 shape mismatch: {label}")
         if _metadata_sha(reader) != entry["metadata_sha256"]:
-            raise ModelBundleError(f"Q4 metadata checksum mismatch: {path.name}")
+            raise ModelBundleError(f"Q4 metadata checksum mismatch: {label}")
         return reader
     except BaseException:
         reader.close()
@@ -349,31 +467,6 @@ def _copy_asset(source, destination):
     return size, digest.hexdigest()
 
 
-def _publish_directory(source, destination):
-    """Atomic publication that never replaces even an empty existing directory."""
-    if os.name == "nt":
-        # MoveFile semantics used by os.rename reject an existing destination.
-        os.rename(source, destination)
-        return
-    library = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        function = library.renamex_np
-        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        arguments = (os.fsencode(source), os.fsencode(destination), 0x4)  # RENAME_EXCL
-    elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
-        function = library.renameat2
-        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # RENAME_NOREPLACE
-    else:
-        raise ModelBundleError("Atomic exclusive directory publication is unavailable on this platform")
-    function.restype = ctypes.c_int
-    if function(*arguments):
-        number = ctypes.get_errno()
-        if number == errno.EEXIST:
-            raise FileExistsError(number, "Bundle destination already exists", str(destination))
-        raise OSError(number, os.strerror(number), str(destination))
-
-
 def write_model_bundle(destination, config: ModelConfig, tensor_sources: Mapping,
                        *, group_size=32, block_rows=64, tokenizer_files=None,
                        provenance=None, asset_checksums=None, tensor_codecs=None) -> None:
@@ -479,30 +572,36 @@ class ModelBundleReader:
     open_q4 returns an independent reader owned by the caller; closing this bundle
     does not close readers already returned. No payload handles are retained by
     preflight. The returned manifest is detached from the validated state.
+
+    The source is either a bundle directory or a single `.nxb` container. The
+    public API is the same for both; only the backend below differs.
     """
-    def __init__(self, directory):
-        original = Path(directory)
-        if original.is_symlink() or not original.is_dir():
-            raise ModelBundleError("Bundle root must be a directory without a symlink")
-        self._directory = original.resolve()
+    def __init__(self, source):
         self._closed = False
         self._q4_summaries = {}
         self._matrix_blocks = {}
-        path = _confined_file(self._directory, MANIFEST_NAME)
-        if path.stat().st_size > MAX_MANIFEST_BYTES:
-            raise ModelBundleError("Bundle manifest exceeds metadata limit")
-        with path.open("rb") as stream:
+        self._backend = _open_backend(source)
+        try:
+            manifest = self._load_manifest()
+            _json_tree(manifest)
+            self._validate(manifest)
+        except BaseException:
+            self._backend.close()
+            raise
+        self._manifest = manifest
+
+    def _load_manifest(self):
+        with self._backend.open(MANIFEST_NAME) as stream:
+            if stream.size > MAX_MANIFEST_BYTES:
+                raise ModelBundleError("Bundle manifest exceeds metadata limit")
             encoded = stream.read(MAX_MANIFEST_BYTES + 1)
         if len(encoded) > MAX_MANIFEST_BYTES:
             raise ModelBundleError("Bundle manifest exceeds metadata limit")
         try:
-            manifest = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_pairs,
-                                  parse_constant=_reject_constant)
+            return json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_pairs,
+                              parse_constant=_reject_constant)
         except (ValueError, UnicodeError, RecursionError) as error:
             raise ModelBundleError(f"Invalid bundle JSON: {error}") from error
-        _json_tree(manifest)
-        self._validate(manifest)
-        self._manifest = manifest
 
     def _validate(self, manifest):
         _keys(manifest, {"format", "format_version", "architecture", "config", "tensors", "aliases",
@@ -533,16 +632,14 @@ class ModelBundleReader:
             if relative.casefold() in used_paths:
                 raise ModelBundleError("Duplicate bundle payload path")
             used_paths.add(relative.casefold())
-            path = _confined_file(self._directory, relative)
-            info = path.stat()
-            identity = info.st_dev, info.st_ino
+            identity, size = self._backend.describe(relative)
             if identity in used_files:
                 raise ModelBundleError("Duplicate bundle payload file")
             used_files.add(identity)
             _integer(entry["file_bytes"], "file_bytes", minimum=0)
-            if info.st_size != entry["file_bytes"]:
+            if size != entry["file_bytes"]:
                 raise ModelBundleError(f"File size mismatch: {relative}")
-            return path
+            return relative
 
         for name, shape in shapes.items():
             entry = tensors[name]
@@ -558,11 +655,11 @@ class ModelBundleReader:
                 raise ModelBundleError(f"Unsupported tensor codec: {name}")
             if not dense:
                 _sha(entry[checksum_key], name)
-            path = payload(entry)
+            relative = payload(entry)
             if dense:
                 self._matrix_blocks[name] = _check_dense_blocks(name, entry, shape)
             elif len(shape) == 2:
-                with _check_q4(path, entry) as reader:
+                with _check_q4(self._backend, relative, entry) as reader:
                     self._q4_summaries[name] = {"group_size": reader.group_size,
                                                 "packed_payload_bytes": reader.rows * reader.row_bytes}
             else:
@@ -580,11 +677,14 @@ class ModelBundleReader:
             folded_names.add(name.casefold())
             _keys(entry, {"path", "file_bytes", "sha256"}, "asset entry")
             _sha(entry["sha256"], name)
-            path = payload(entry)
+            relative = payload(entry)
             total += entry["file_bytes"]
             if total > MAX_ASSETS_TOTAL_BYTES:
                 raise ModelBundleError("Tokenizer assets exceed total size limit")
-            if _hash_file(path, entry["file_bytes"], MAX_ASSET_BYTES) != entry["sha256"]:
+            with self._backend.open(relative) as stream:
+                digest = _hash_file(stream, PurePosixPath(relative).name,
+                                    entry["file_bytes"], MAX_ASSET_BYTES)
+            if digest != entry["sha256"]:
                 raise ModelBundleError(f"Tokenizer checksum mismatch: {name}")
         provenance = manifest["provenance"]
         _keys(provenance, {"schema_version", "data"}, "provenance")
@@ -622,27 +722,24 @@ class ModelBundleReader:
         entry = self._entry(name)
         if entry["codec"] not in PACKED_CODECS.values():
             raise ModelBundleError(f"Tensor is not a packed matrix: {name}")
-        path = _confined_file(self._directory, entry["path"])
-        return _check_q4(path, entry)
+        return _check_q4(self._backend, entry["path"], entry)
 
     def open_q4(self, name):
         entry = self._entry(name)
         if entry["codec"] != "Q4_GROUPED":
             raise ModelBundleError(f"Tensor is not Q4: {name}")
-        path = _confined_file(self._directory, entry["path"])
-        return _check_q4(path, entry)
+        return _check_q4(self._backend, entry["path"], entry)
 
     def read_f32(self, name):
         entry = self._entry(name)
         if entry["codec"] != "RAW_F32":
             raise ModelBundleError(f"Tensor is not RAW_F32: {name}")
-        path = _confined_file(self._directory, entry["path"])
         size = entry["file_bytes"]
         _integer(size, "RAW_F32 size", maximum=MAX_RAW_BYTES)
         digest = hashlib.sha256()
         output = []
-        with path.open("rb", buffering=0) as stream:
-            if os.fstat(stream.fileno()).st_size != size:
+        with self._backend.open(entry["path"]) as stream:
+            if stream.size != size:
                 raise ModelBundleError(f"Vector size mismatch: {name}")
             consumed = 0
             while consumed < size:
@@ -685,13 +782,13 @@ class ModelBundleReader:
         if view.readonly or len(view) != block["bytes"]:
             raise ModelBundleError("Destination must be writable and match the block byte size")
         entry = self._entry(name)
-        path = _confined_file(self._directory, entry["path"])
         cols = entry["shape"][1]
         offset = block["start_row"] * cols * DENSE_WIDTH[entry["codec"]]
         digest = hashlib.sha256()
-        with path.open("rb", buffering=0) as stream:
-            if os.fstat(stream.fileno()).st_size != entry["file_bytes"]:
+        with self._backend.open(entry["path"]) as stream:
+            if stream.size != entry["file_bytes"]:
                 raise ModelBundleError(f"Matrix size mismatch: {name}")
+            # Relative to the tensor, which may be a section of a container.
             stream.seek(offset)
             consumed = 0
             while consumed < block["bytes"]:
@@ -729,10 +826,9 @@ class ModelBundleReader:
         size = entry["file_bytes"]
         if view.readonly or len(view) != size:
             raise ModelBundleError("Destination must be writable and match the vector byte size")
-        path = _confined_file(self._directory, entry["path"])
         digest = hashlib.sha256()
-        with path.open("rb", buffering=0) as stream:
-            if os.fstat(stream.fileno()).st_size != size:
+        with self._backend.open(entry["path"]) as stream:
+            if stream.size != size:
                 raise ModelBundleError(f"Vector size mismatch: {name}")
             consumed = 0
             while consumed < size:
@@ -755,6 +851,44 @@ class ModelBundleReader:
             raise ModelBundleError(f"Vector checksum mismatch: {name}")
         return size
 
+    @property
+    def source_kind(self):
+        """Either "directory" or "container"; nothing else in the API changes with it."""
+        return self._backend.kind
+
+    @property
+    def container(self):
+        """The validated container index, or None when reading a directory."""
+        return getattr(self._backend, "container", None)
+
+    def _storage(self):
+        """Measured file-count and byte cost of this bundle's storage form.
+
+        `nxb_vs_directory_bytes` is signed on purpose. M6.02c measured that the
+        NexaPack container charges a fixed overhead per packed tensor; nesting
+        the same `.nxp` files verbatim keeps every one of those, adds a 4096
+        byte slot boundary per section, and can therefore come out larger than
+        the directory. The number says which way it went, it does not promise
+        a direction.
+        """
+        tensors, assets = self._manifest["tensors"], self._manifest["assets"]
+        manifest_bytes = self._backend.size(MANIFEST_NAME)
+        declared = manifest_bytes + sum(entry["file_bytes"] for entry
+                                        in (*tensors.values(), *assets.values()))
+        files = len(tensors) + len(assets) + 1
+        result = {"source_kind": self._backend.kind, "bundle_file_bytes": declared,
+                  "directory_files": files, "manifest_file_bytes": manifest_bytes}
+        container = self.container
+        if container is None:
+            result.update({"container": None, "stored_files": files,
+                           "container_overhead_bytes": None, "nxb_vs_directory_bytes": None})
+            return result
+        measurements = container.measurements()
+        result.update({"container": measurements, "stored_files": 1,
+                       "container_overhead_bytes": measurements["container_overhead_bytes"],
+                       "nxb_vs_directory_bytes": measurements["file_bytes"] - result["bundle_file_bytes"]})
+        return result
+
     def inspect(self):
         tensors = self._manifest["tensors"]
         summaries = []
@@ -772,6 +906,7 @@ class ModelBundleReader:
                 "physical_tensors": len(tensors), "logical_tensors": len(self.tensor_names),
                 "tensor_names": list(self.tensor_names), "aliases": dict(self._manifest["aliases"]),
                 "tensors": summaries,
+                "storage": self._storage(),
                 "tensor_file_bytes": sum(entry["file_bytes"] for entry in tensors.values()),
                 "packed_payload_bytes": sum(entry["packed_payload_bytes"] for entry in summaries),
                 "logical_f32_bytes": sum(entry["logical_f32_bytes"] for entry in summaries),
@@ -783,6 +918,7 @@ class ModelBundleReader:
 
     def close(self):
         self._closed = True
+        self._backend.close()
 
     def __enter__(self):
         if self._closed:

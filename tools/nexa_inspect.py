@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Inspect a NexaPack matrix or model bundle; payload verification is explicit."""
+"""Inspect a NexaPack matrix, a bundle directory or a `.nxb`; verification is explicit.
+
+A container reports what it costs: the bytes it adds over the sum of the
+bundle's files, the alignment padding of every section, and how many files the
+same model occupies in each form.
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from runtime.nexapack.bundle import DENSE_CODECS, ModelBundleReader
+from runtime.nexapack.container import is_container
 from runtime.nexapack.format import NexaPackReader
 
 
@@ -45,7 +51,9 @@ def verify_matrix(reader):
 
 def inspect_artifact(path, *, verify=False):
     path = Path(path)
-    if path.is_dir():
+    # A container is recognized by its magic, not by its name: an inspection
+    # that trusted the suffix would report on a file it never opened.
+    if path.is_dir() or is_container(path):
         with ModelBundleReader(path) as bundle:
             result = bundle.inspect()
             verified = []
@@ -65,10 +73,16 @@ def inspect_artifact(path, *, verify=False):
                     else:
                         bundle.read_f32(name)
                     verified.append(name)
+            container_read_bytes = None
+            if verify and bundle.container is not None:
+                # Section checksums cover the container's own copy of each
+                # file, including the bytes no tensor read would touch.
+                container_read_bytes = bundle.container.verify()
             result["validation"].update({"payloads_verified": verify, "verified_tensors": verified,
                                          "checksums_verified": verify, "q4_codec_validated": verify,
                                          "q4_payload_bytes_read": q4_read_bytes,
                                          "dense_payload_bytes_read": dense_read_bytes,
+                                         "container_bytes_read": container_read_bytes,
                                          "model_quality_measured": False})
             return result
     with NexaPackReader(path) as reader:
