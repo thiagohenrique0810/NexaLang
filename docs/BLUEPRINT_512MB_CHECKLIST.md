@@ -129,6 +129,52 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Trigésimo quinto incremento — primeiro modelo em escala real, e o bug que só
+ela revelou.** `tools/nexa_synth.py` gera um checkpoint **sintético** no formato
+que o importador Llama já lê, com determinismo por semente provado em 503 MB
+(duas gerações, SHA-256 idênticos). **1.020 testes**, zero falhas, zero skips.
+
+**A pergunta que o projeto existe para responder, finalmente medida.**
+`NexaLM512_R0`, **125.854.464 parâmetros**, pesos Q4, contexto **2048 tokens
+inteiros** — não 8:
+
+| | KV F32 | KV Q4 |
+| --- | ---: | ---: |
+| Pico dos buffers gerenciados | 83.370.495 B (79,5 MiB) | **27.140.355 B (25,9 MiB)** |
+| KV residente (64 páginas) | 67.112.896 B | 10.489.792 B |
+| KV por token | 32.768 B | 5.120 B |
+| Pesos Q4 (streaming) | 78.744.576 B | 78.744.576 B |
+
+**Cabe, com folga: nunca passou de 267,7 MiB — metade do orçamento.** Sob a
+contabilidade mais dura, com todos os pesos residentes, **F32 fica 47,6 MiB
+acima** de 512 MiB. E o teto que não foi alcançado é o de velocidade: prefill de
+2048 tokens leva **4min49s** num executor C escalar de uma thread, sem SIMD nem
+GPU. Não é interativo.
+
+Três achados que só a escala revela: os codecs densos viram **limitados por I/O**
+(F32 relê 503 MB por passo a ~135 MB/s; os empacotados leem a ~2 GB/s porque
+cabem no cache de página, e o ganho de Q4 sobre F32 em decode é **13×**, quase
+todo de I/O); **F16 é o pior dos dois mundos**, pagando leitura densa e kernel
+mais lento que o de F32; e **Q8 ganha de Q4 em compute** — desempacotar 4 bits
+custa mais que ler um byte. O overhead do `.nxb`, que era +134% na fixture tiny,
+é **+0,013% a +0,134%** aqui: é quase constante (~64 KiB) e some com a escala.
+
+**O bug que a escala revelou, e a correção.** Um bundle **Q2 com `group_size` 32
+convertia, empacotava e passava em `inspect --verify`, e então se recusava a
+abrir**: `packed storage_nbytes is smaller than its 12582912-byte payload`. A
+causa era uma verdade escrita em três lugares. `transformer.py` descrevia **todo**
+codec empacotado como `q4`; `model_ir` não tinha sequer um `DType` para Q8 e
+admitia só Q4 como storage empacotado; e `model_lowering` **repetia a lista** em
+vez de usar a constante. Isso só funcionava enquanto a escala de 4 bytes por
+grupo mantinha a largura real acima de 4 bits por valor — Q2 em grupo 32 guarda
+**3 bits** e era rejeitado.
+
+Por que a suíte não pegava: as fixtures têm matrizes de 8 colunas, então um
+"grupo de 32" vira um grupo de 8 e a escala infla Q2 para 6 bits por valor, e o
+piso errado passa por acidente. A regressão nova usa uma fixture de **64 colunas**
+— pelo menos tão larga quanto o grupo — e foi provada por reinjeção: desfazendo a
+correção, ela cai com 2 falhas e 2 erros.
+
 **Trigésimo quarto incremento — bloco paralelo, onda 5: ADRs verificados.**
 **999 testes** (965 + 34), zero falhas, zero skips. Doze ADRs, e a prova que os
 separa de doze arquivos Markdown: uma **bijeção com o código como oráculo**. Um
@@ -1061,7 +1107,16 @@ com qualidade, latência e temporários contabilizados.
 
 ## M5 — prova de modelo completo e ABI (PDF páginas 17/19)
 
-- [ ] M5.01 Modelo fixo 250–500M, batch 1, tokenizer, prefill e decode sem PyTorch.
+- [x] M5.01a Modelo **sintético** de 125,8M ponta a ponta sem PyTorch: gerado,
+  convertido nos seis codecs, empacotado em `.nxb`, verificado e executado em
+  contexto de 2048 tokens dentro de 512 MiB (pico 25,9 MiB de buffers com KV Q4).
+  Prova **física**: bytes, residência, pico e tempo. Não prova qualidade — os
+  tokens gerados são um ponto fixo, que é o que pesos aleatórios produzem.
+- [ ] M5.01b Modelo **treinado** de 250–500M: exige baixar um checkpoint real com
+  origem, revisão, licença e hashes registrados, ou o gate de treinamento
+  (LLM.03/LLM.04). Só ele mede qualidade, perplexidade e sensibilidade por tensor.
+- [ ] M5.01c Velocidade: prefill de 2048 tokens leva 4min49s no executor C escalar
+  de uma thread. SIMD (M7.05), paralelismo e GPU continuam pendentes.
   Tokenizer e caminho texto→IDs→execução→texto estão em LLM.02c1; falta o modelo
   real importado, sua fixação em M0.08 e a medição de qualidade.
 - [ ] M5.02 Modelo ~1B sob 512 MB, pesos streamados e KV comprimido.

@@ -7,7 +7,7 @@ workspace are separate requests supplied by the executor, never hidden here.
 from collections.abc import Mapping
 
 from .model_config import ModelConfig
-from .model_ir import DType, ModelGraph, ModelOp, TensorDesc, _integer
+from .model_ir import DType, ModelGraph, ModelOp, TensorDesc, _WEIGHT_STORAGE, _integer
 from .planner.memory import MemoryRequest
 
 
@@ -36,7 +36,9 @@ def lower_model(config: ModelConfig, sequence_length: int, *, weight_storage=Non
         if (not isinstance(tensor, TensorDesc) or tensor.name != name or tensor.shape != shape
                 or tensor.logical_dtype != DType.F32):
             raise ValueError(f"weight_storage descriptor does not match {name}")
-        allowed = (DType.F32, DType.F16, DType.Q4) if len(shape) == 2 else (DType.F32,)
+        # A única lista de storages admitidos vive em model_ir; repeti-la aqui
+        # foi o que deixou Q2/Q3/Q8 passarem na descrição e falharem no grafo.
+        allowed = _WEIGHT_STORAGE if len(shape) == 2 else frozenset({DType.F32})
         if tensor.storage_dtype not in allowed:
             raise ValueError(f"unsupported physical storage for {name}")
         tensors.append(tensor)

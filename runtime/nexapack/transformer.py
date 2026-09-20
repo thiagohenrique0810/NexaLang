@@ -35,6 +35,10 @@ _PACKED_KERNELS = {"Q4_GROUPED": ("nexa_q4_matmul", "nexa_q4_decode_row"),
                    "Q2_GROUPED": ("nexa_q2_matmul", "nexa_q2_decode_row")}
 # Dense matrices: the stored width decides the kernel and the row copy.
 _DENSE_WIDTH = {"RAW_F32_MATRIX": 4, "RAW_F16_MATRIX": 2}
+# A packed tensor is described by the codec it actually uses. Calling every one
+# of them "q4" only passed while the group scale held the real width above four
+# bits per value; Q2 at group 32 stores three and was rejected on open.
+_PACKED_STORAGE = {name: name.split("_")[0].lower() for name in _PACKED_KERNELS}
 
 
 @lru_cache(maxsize=1)
@@ -151,7 +155,8 @@ class TransformerSession:
                 dense = item["codec"] in _DENSE_WIDTH
                 if q4:
                     self._packed_kernels[name] = _PACKED_KERNELS[item["codec"]]
-                storage = "q4" if q4 else ("f16" if item["codec"] == "RAW_F16_MATRIX" else "f32")
+                storage = (_PACKED_STORAGE[item["codec"]] if q4 else
+                           ("f16" if item["codec"] == "RAW_F16_MATRIX" else "f32"))
                 self._storage[name] = TensorDesc(name, shape, storage_dtype=storage,
                                                  storage_nbytes=item["packed_payload_bytes"])
                 if q4:

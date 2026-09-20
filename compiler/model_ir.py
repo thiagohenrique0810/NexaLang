@@ -34,6 +34,7 @@ class DType(str, Enum):
     Q2 = "q2"
     Q3 = "q3"
     Q4 = "q4"
+    Q8 = "q8"
 
 
 class MemoryTier(str, Enum):
@@ -52,10 +53,16 @@ class OpKind(str, Enum):
     ADD = "Add"
 
 
-_PACKED_BITS = {DType.Q2: 2, DType.Q3: 3, DType.Q4: 4}
+_PACKED_BITS = {DType.Q2: 2, DType.Q3: 3, DType.Q4: 4, DType.Q8: 8}
 # Weight storage a kernel can consume directly: dense float widths, or the
 # packed codecs whose layout the runtime dispatches per tensor.
-_WEIGHT_STORAGE = frozenset({DType.F32, DType.F16, DType.Q4})
+#
+# Every codec the runtime dispatches must be nameable here. Describing them all
+# as Q4 worked only while the group scale kept the real width above four bits
+# per value: Q2 at group 32 stores three, and a tensor that converts and
+# verifies cleanly then refuses to open. Group 4 hides it, because the
+# four-byte scale inflates Q2 to ten bits.
+_WEIGHT_STORAGE = frozenset({DType.F32, DType.F16, DType.Q2, DType.Q3, DType.Q4, DType.Q8})
 _ITEM_BYTES = {
     DType.BOOL: 1, DType.F16: 2, DType.BF16: 2, DType.F32: 4,
     DType.F64: 8, DType.I8: 1, DType.U8: 1, DType.I16: 2,
