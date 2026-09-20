@@ -11,6 +11,7 @@ import ctypes
 from functools import lru_cache
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import threading
@@ -22,6 +23,7 @@ from compiler.model_lowering import lower_model, derive_activation_requests
 from compiler.planner.memory import (MemoryAllocation, MemoryPlan, MemoryPlanner,
                                      MemoryRequest, parse_memory_size)
 from runtime.build_runtime import build_runtime
+from runtime.learning.adapter import AdapterSet
 from .bundle import ModelBundleReader
 from .format import MAX_READ_BYTES, READ_CHUNK_BYTES
 
@@ -106,11 +108,13 @@ class TransformerSession:
     Instances are synchronous and must not be used concurrently.
     """
     def __init__(self, bundle_path, *, memory_budget="512MiB", max_sequence_length=None,
-                 tile_rows=32, reserve_bytes=0, memory_pool=None):
+                 tile_rows=32, reserve_bytes=0, memory_pool=None, adapters=None):
         self._closed = False
         self._tokens = ()
         self._last_report = None
         self._workspace_template = None
+        # Set before any planning: subclasses plan from their own __init__.
+        self._adapters = None
         self._pool = memory_pool
         self._reservation = None
         self._admission_bytes = 0
@@ -169,6 +173,13 @@ class TransformerSession:
                         raise ValueError("Dense weight block exceeds the reader limit; convert with fewer block_rows")
                     self._matrix_layouts[name] = (rows, row_bytes)
             self._weights_bytes = summary["packed_payload_bytes"]
+            if adapters is not None:
+                if not isinstance(adapters, AdapterSet):
+                    raise ValueError("adapters must be an AdapterSet")
+                # An empty set is exactly no adapters: it must not add a request
+                # to the plan, or the baseline plan would differ by declaration.
+                bound = adapters.bind(self._bundle)
+                self._adapters = bound if len(bound) else None
             manifest = json.dumps(self._bundle.manifest, sort_keys=True, separators=(",", ":"))
             self._manifest_sha256 = hashlib.sha256(manifest.encode()).hexdigest()
             # Validate the declared session capacity before any weights or native
@@ -218,6 +229,13 @@ class TransformerSession:
         for name, size in (("__packed_tile", max_packed), ("__output_tile", length * max_rows * 4),
                            ("__norm", self.config.hidden_size * 4), ("__attention", attention_length * 4)):
             requests.append(MemoryRequest(name, size, 0, end))
+        if self._adapters is not None:
+            # Requested only when a bound adapter exists, so a session without
+            # adapters keeps byte-identical offsets and peak to the baseline.
+            for name, size in (("__adapter_payload", self._adapters.max_payload_bytes),
+                               ("__adapter_low", length * self._adapters.max_rank * 4),
+                               ("__adapter_delta", length * self._adapters.max_target_rows * 4)):
+                requests.append(MemoryRequest(name, size, 0, end))
         reserves = {"host": self.reserve + READ_CHUNK_BYTES + ALIGNMENT - 1 + extra_reserve}
         if self._workspace_template is None:
             # Preflight uses the largest declared chunk and attention prefix.
@@ -243,7 +261,7 @@ class TransformerSession:
 
     def _report(self, graph, plan, *, executed, execution_context=None):
         extent = plan.peak_bytes["host"]
-        return {
+        report = {
             "schema_version": 1, "workload": "llama_causal_forward", "backend": "cpu_native",
             "bundle": str(self.path.resolve()), "manifest_sha256": self._manifest_sha256,
             "config": self.config.to_dict(), "executed": executed,
@@ -268,6 +286,9 @@ class TransformerSession:
             },
             "validation": {"model_quality_measured": False, "verified": False},
         }
+        if self._adapters is not None:
+            report["adapters"] = self._adapters.to_dict()
+        return report
 
     def _execution_steps(self, graph, execution_context):
         for op in graph.ops:
@@ -278,6 +299,40 @@ class TransformerSession:
 
     def _rope_offset(self, action, execution_context):
         return 0
+
+    def _apply_adapters(self, adapters, left, out, length, buffer, call, io):
+        """Add each low-rank delta to a base projection already written to out.
+
+        The base matrix is never expanded and B A is never materialized: the
+        cost is two thin matmuls, rank-sized between them. The scale multiplies
+        the rank intermediate rather than the output because that is where the
+        roundings are cheapest and the contract fixes the order.
+        """
+        payload = buffer("__adapter_payload", ctypes.c_uint8)
+        payload_view = memoryview(payload).cast("B")
+        low, delta = buffer("__adapter_low"), buffer("__adapter_delta")
+        for adapter in adapters:
+            rank, rows, cols = adapter.spec.rank, adapter.rows, adapter.cols
+            io["adapter_payload_bytes_read"] += adapter.read_payload_into(
+                payload_view[:adapter.payload_bytes])
+            a = (ctypes.c_float * (rank * cols)).from_address(ctypes.addressof(payload))
+            b = (ctypes.c_float * (rows * rank)).from_address(
+                ctypes.addressof(payload) + adapter.a_bytes)
+            call("nexa_f32_matmul", left, len(left), length, a, len(a), rank, cols,
+                 low, length * rank)
+            scale = adapter.spec.alpha / rank
+            for index in range(length * rank):
+                low[index] = low[index] * scale
+            call("nexa_f32_matmul", low, len(low), length, b, len(b), rows, rank,
+                 delta, length * rows)
+            # The native kernels refuse an output that aliases an input, so the
+            # final sum is taken here. Reading a c_float widens to double, and
+            # the store rounds once, which is exactly what nexa_add computes.
+            for index in range(length * rows):
+                value = out[index] + delta[index]
+                if not math.isfinite(value):
+                    raise ArithmeticError("Adapter delta produced a nonfinite activation")
+                out[index] = value
 
     def _run_attention(self, op, action, buffer, attention, out, call, length, execution_context):
         q, k, v = (buffer(name) for name in op.inputs)
@@ -320,6 +375,8 @@ class TransformerSession:
         io = {"q4_payload_bytes_read": 0, "raw_payload_bytes_read": 0,
               "packed_bytes_consumed": 0, "matmul_tiles": 0, "host_to_gpu_bytes": 0,
               "embedding_rows_read": 0}
+        if self._adapters is not None:
+            io["adapter_payload_bytes_read"] = 0
         read_seconds = compute_seconds = 0.0
         started = time.perf_counter()
 
@@ -437,6 +494,11 @@ class TransformerSession:
                      right, len(right), tensors[op.outputs[0]].numel, out, len(out))
             else:
                 raise ValueError(f"Unsupported executable model operator: {kind}")
+            if kind == "MatMul" and self._adapters is not None:
+                adapters = self._adapters.for_target(op.inputs[1])
+                if adapters:
+                    self._apply_adapters(adapters, buffer(op.inputs[0]), out, length,
+                                         buffer, call, io)
 
         logits = buffer(graph.outputs[0])
         digest = hashlib.sha256(memoryview(logits).cast("B")).hexdigest()
