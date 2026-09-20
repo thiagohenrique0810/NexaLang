@@ -1,4 +1,4 @@
-# Codecs de peso por tensor: despacho e matrizes RAW_F32
+# Codecs de peso por tensor: Q4, Q8 e matrizes RAW_F32
 
 O décimo sétimo incremento acrescenta o **segundo codec de peso** e o despacho
 por tensor no executor. Até aqui toda matriz era Q4 e o executor só sabia
@@ -9,6 +9,25 @@ Isso não é um formato de distribuição: uma matriz F32 custa oito vezes a for
 Q4. É a referência exata que faltava — sem erro de quantização — e o
 pré-requisito de qualquer decisão de precisão por tensor (M6.01/M6.02), além de
 ser o lugar onde Q2/Q3/Q8/F16 entram depois (M1.05b).
+
+## Q8_GROUPED
+
+O vigésimo incremento acrescenta o terceiro codec: um byte com sinal por valor,
+depois da mesma escala float32 por grupo, com `escala = max|v| / 127` e o código
+`-128` reservado. O contêiner é o mesmo NexaPack — blocos, índice e checksums
+idênticos —, então só mudam o `codec_id`, o tamanho do grupo em bytes e o kernel.
+
+Custo e erro ficam entre Q4 e denso. Numa linha de exemplo com grupo 4, o erro
+máximo do round-trip caiu de 0,179 (Q4) para 0,0098 (Q8), com o grupo passando
+de 6 para 8 bytes. Num modelo sintético de duas camadas com grupo 8, o erro nos
+logits contra a referência densa caiu de 0,319 para 0,011, e o payload ficou
+entre o Q4 e o denso — que é exatamente o ponto: o precision map agora tem um
+degrau intermediário real para escolher.
+
+Os três codecs convivem no mesmo bundle. Uma regressão constrói um modelo com
+embedding denso, um tensor Q8 e outro Q4, usando pesos que **todos** os codecs
+guardam sem erro (zero e ±máximo do grupo, já que Q4 escala por `max/7` e Q8 por
+`max/127`), e verifica que os três caminhos produzem os mesmos logits.
 
 ## Formato
 
@@ -45,6 +64,14 @@ que um bundle misto mostra os dois caminhos ativos.
 ## Uso
 
 ```bash
+# Um codec para todas as matrizes.
+python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/q8 --matrix-codec q8 --group-size 32
+
+# Codec por tensor, misturando livremente.
+python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/misto2 \
+  --tensor-codec model.embed_tokens.weight=q8 \
+  --tensor-codec model.layers.0.mlp.down_proj.weight=f32
+
 # Todo o modelo denso: referência exata para comparar quantizações.
 python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/ref --dense-all --block-rows 64
 
@@ -71,8 +98,9 @@ O embedding denso lê um bloco inteiro por token alcançado, então um bloco gra
 custa I/O mesmo para um único token. Para prompts longos com vocabulário grande,
 prefira Q4 no embedding ou blocos menores.
 
-Q2, Q3, Q8 e F16 de **pesos** continuam pendentes em M1.05b, assim como o
-despacho de atenção para esses layouts (M4.03d). A escolha automática de codec
-por tensor — calibração e precision map — é M6.01/M6.02, e agora tem um
-executor capaz de consumi-la. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
+Q2, Q3 e F16 de **pesos** continuam pendentes em M1.05c, assim como o despacho
+de atenção para esses layouts (M4.03d). A calibração e o PrecisionMap ainda
+comparam apenas Q4 contra denso: medir e planejar com Q8 no espaço de escolha
+é M6.01c/M6.02b, e o contrato do mapa não muda por isso — apenas ganha mais um
+valor possível por tensor. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
 registra a suíte, os comandos e a próxima tarefa.

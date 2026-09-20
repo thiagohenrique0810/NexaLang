@@ -23,7 +23,13 @@ import sys
 import tempfile
 
 from compiler.model_config import ModelConfig
-from .format import NexaPackError, NexaPackReader, READ_CHUNK_BYTES, write_q4_matrix
+from .format import (NexaPackError, NexaPackReader, READ_CHUNK_BYTES,
+                     write_grouped_matrix)
+
+# Matrix codecs a bundle may store, with the NexaPack id each one publishes.
+PACKED_CODECS = {"q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
+MATRIX_CODECS = (*PACKED_CODECS, "f32")
+CODEC_BITS = {"Q4_GROUPED": 4, "Q8_GROUPED": 8, "RAW_F32_MATRIX": 32, "RAW_F32": 32}
 
 FORMAT = "NexaModelBundle"
 FORMAT_VERSION = 1
@@ -213,11 +219,11 @@ def _metadata_sha(reader):
 
 def _check_q4(path, entry):
     if path.stat().st_size != entry["file_bytes"]:
-        raise ModelBundleError(f"Q4 file size mismatch: {path.name}")
+        raise ModelBundleError(f"Packed file size mismatch: {path.name}")
     reader = NexaPackReader(path)
     try:
-        if reader.codec_id != 'Q4_GROUPED' or reader.codec_version != 1:
-            raise ModelBundleError(f'Unsupported matrix codec; expected Q4_GROUPED: {path.name}')
+        if reader.codec_id != entry["codec"] or reader.codec_version != 1:
+            raise ModelBundleError(f'Matrix codec differs from its manifest entry: {path.name}')
         if [reader.rows, reader.cols] != entry["shape"]:
             raise ModelBundleError(f"Q4 shape mismatch: {path.name}")
         if _metadata_sha(reader) != entry["metadata_sha256"]:
@@ -377,8 +383,8 @@ def write_model_bundle(destination, config: ModelConfig, tensor_sources: Mapping
     if not 0 < len(shapes) <= MAX_TENSORS or any(not callable(value) for value in tensor_sources.values()):
         raise ModelBundleError("Invalid tensor source count or callable")
     codecs = {} if tensor_codecs is None else dict(tensor_codecs)
-    if not set(codecs) <= set(shapes) or any(value not in ("q4", "f32") for value in codecs.values()):
-        raise ModelBundleError("Tensor codecs must name declared tensors and be q4 or f32")
+    if not set(codecs) <= set(shapes) or any(value not in MATRIX_CODECS for value in codecs.values()):
+        raise ModelBundleError(f"Tensor codecs must name declared tensors and be one of {MATRIX_CODECS}")
     if any(len(shapes[name]) == 1 and codec != "f32" for name, codec in codecs.items()):
         raise ModelBundleError("Rank-one vectors are always RAW_F32")
     assets = {} if tokenizer_files is None else tokenizer_files
@@ -413,9 +419,11 @@ def write_model_bundle(destination, config: ModelConfig, tensor_sources: Mapping
             elif len(shape) == 2:
                 relative = f"tensors/{index:04d}.nxp"
                 path = staging / relative
-                write_q4_matrix(path, shape[0], shape[1], group_size, source, block_rows=block_rows)
+                codec = PACKED_CODECS[codecs.get(name, "q4")]
+                write_grouped_matrix(path, shape[0], shape[1], group_size, source,
+                                     block_rows=block_rows, codec=codec)
                 with NexaPackReader(path) as reader:
-                    tensors[name] = {"shape": list(shape), "codec": "Q4_GROUPED", "codec_version": 1,
+                    tensors[name] = {"shape": list(shape), "codec": codec, "codec_version": 1,
                                      "path": relative, "file_bytes": path.stat().st_size,
                                      "metadata_sha256": _metadata_sha(reader)}
             elif len(shape) == 1:
@@ -532,8 +540,8 @@ class ModelBundleReader:
             if (not isinstance(entry["shape"], list) or any(type(v) is not int for v in entry["shape"])
                     or entry["shape"] != list(shape)):
                 raise ModelBundleError(f"Tensor shape mismatch: {name}")
-            expected_codec = ("RAW_F32_MATRIX" if dense else "Q4_GROUPED") if len(shape) == 2 else "RAW_F32"
-            if entry["codec"] != expected_codec or type(entry["codec_version"]) is not int or entry["codec_version"] != 1:
+            allowed = ({"RAW_F32_MATRIX"} if dense else set(PACKED_CODECS.values())) if len(shape) == 2 else {"RAW_F32"}
+            if entry["codec"] not in allowed or type(entry["codec_version"]) is not int or entry["codec_version"] != 1:
                 raise ModelBundleError(f"Unsupported tensor codec: {name}")
             if not dense:
                 _sha(entry[checksum_key], name)
@@ -595,6 +603,14 @@ class ModelBundleReader:
             return self._manifest["tensors"][name]
         except KeyError as error:
             raise ModelBundleError(f"Unknown tensor: {name}") from error
+
+    def open_packed(self, name):
+        """Open any grouped-codec matrix; the reader knows its own codec."""
+        entry = self._entry(name)
+        if entry["codec"] not in PACKED_CODECS.values():
+            raise ModelBundleError(f"Tensor is not a packed matrix: {name}")
+        path = _confined_file(self._directory, entry["path"])
+        return _check_q4(path, entry)
 
     def open_q4(self, name):
         entry = self._entry(name)
@@ -731,10 +747,10 @@ class ModelBundleReader:
         summaries = []
         for name, entry in sorted(tensors.items()):
             logical_bytes = math.prod(entry["shape"]) * _F32.size
-            q4 = entry["codec"] == "Q4_GROUPED"
+            q4 = entry["codec"] in PACKED_CODECS.values()
             payload_bytes = self._q4_summaries[name]["packed_payload_bytes"] if q4 else entry["file_bytes"]
             summaries.append({"name": name, "shape": list(entry["shape"]), "codec": entry["codec"],
-                              "storage_bits": 4 if q4 else 32,
+                              "storage_bits": CODEC_BITS[entry["codec"]],
                               "group_size": self._q4_summaries[name]["group_size"] if q4 else None,
                               "packed_payload_bytes": payload_bytes, "physical_file_bytes": entry["file_bytes"],
                               "logical_f32_bytes": logical_bytes, "compression_vs_f32": logical_bytes / payload_bytes})

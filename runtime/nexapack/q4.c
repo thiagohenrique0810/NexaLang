@@ -142,6 +142,94 @@ int nexa_q4_quantize(const float *weights, size_t weight_count,
     return NEXA_Q4_OK;
 }
 
+static int q8_layout(size_t cols, size_t group_size, size_t *groups,
+                     size_t *group_bytes, size_t *row_bytes) {
+    if (!cols || !group_size) return NEXA_Q4_INVALID_ARGUMENT;
+    if (group_size > SIZE_MAX - 4) return NEXA_Q4_OVERFLOW;
+    *group_bytes = 4 + group_size;  /* scale plus one signed byte per value */
+    *groups = cols / group_size + (cols % group_size != 0);
+    if (!checked_mul(*groups, *group_bytes, row_bytes)) return NEXA_Q4_OVERFLOW;
+    return NEXA_Q4_OK;
+}
+
+size_t nexa_q8_row_size(size_t cols, size_t group_size) {
+    size_t groups, group_bytes, row_bytes;
+    return q8_layout(cols, group_size, &groups, &group_bytes, &row_bytes) == 0 ? row_bytes : 0;
+}
+
+static int validate_packed_q8(const uint8_t *packed, size_t rows, size_t cols,
+                              size_t group_size, size_t groups,
+                              size_t group_bytes, size_t row_bytes) {
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *record = packed + row * row_bytes;
+        size_t start = 0;
+        for (size_t group = 0; group < groups; group++) {
+            const uint8_t *data = record + group * group_bytes;
+            float scale = load_scale(data);
+            if (!isfinite(scale) || scale < 0.0f) return NEXA_Q4_INVALID_DATA;
+            size_t valid = cols - start < group_size ? cols - start : group_size;
+            for (size_t index = 0; index < group_size; index++) {
+                int value = (int8_t)data[4 + index];
+                /* -128 has no positive counterpart; the writer never emits it. */
+                if (value == -128) return NEXA_Q4_INVALID_DATA;
+                if ((index >= valid || scale == 0.0f) && value != 0)
+                    return NEXA_Q4_INVALID_DATA;
+            }
+            start += valid;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
+/* Same contract, reduction order and accumulator as nexa_q4_matmul, over
+ * one signed byte per coordinate. Nothing is dequantized into a buffer. */
+int nexa_q8_matmul(const float *inputs, size_t input_count, size_t batch,
+                   const uint8_t *packed, size_t packed_bytes,
+                   size_t rows, size_t cols, size_t group_size,
+                   float *output, size_t output_count) {
+    if (!inputs || !packed || !output || !rows || !batch)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, row_bytes, total_bytes;
+    size_t input_elements, output_elements, input_bytes, output_bytes;
+    int status = q8_layout(cols, group_size, &groups, &group_bytes, &row_bytes);
+    if (status) return status;
+    if (!checked_mul(rows, row_bytes, &total_bytes) ||
+        !checked_mul(batch, cols, &input_elements) ||
+        !checked_mul(batch, rows, &output_elements) ||
+        !checked_mul(input_elements, sizeof(float), &input_bytes) ||
+        !checked_mul(output_elements, sizeof(float), &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (input_count < input_elements || packed_bytes < total_bytes ||
+        output_count < output_elements) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(inputs, input_bytes, output, output_bytes) ||
+        !disjoint(packed, total_bytes, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    for (size_t i = 0; i < input_elements; i++) {
+        if (!isfinite(inputs[i])) return NEXA_Q4_INVALID_DATA;
+    }
+    status = validate_packed_q8(packed, rows, cols, group_size, groups, group_bytes, row_bytes);
+    if (status) return status;
+    for (size_t item = 0; item < batch; item++) {
+        const float *input = inputs + item * cols;
+        for (size_t row = 0; row < rows; row++) {
+            const uint8_t *record = packed + row * row_bytes;
+            double sum = 0.0;
+            size_t start = 0;
+            for (size_t group = 0; group < groups; group++) {
+                const uint8_t *data = record + group * group_bytes;
+                double scale = (double)load_scale(data);
+                size_t valid = cols - start < group_size ? cols - start : group_size;
+                for (size_t i = 0; i < valid; i++) {
+                    int value = (int8_t)data[4 + i];
+                    sum += (double)input[start + i] * ((double)value * scale);
+                }
+                start += valid;
+            }
+            if (!isfinite(sum) || fabs(sum) > FLT_MAX) return NEXA_Q4_NUMERIC_RANGE;
+            output[item * rows + row] = (float)sum;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
 int nexa_q4_matmul(const float *inputs, size_t input_count, size_t batch,
                   const uint8_t *packed, size_t packed_bytes,
                   size_t rows, size_t cols, size_t group_size,
@@ -185,6 +273,33 @@ int nexa_q4_matmul(const float *inputs, size_t input_count, size_t batch,
             if (!isfinite(sum) || fabs(sum) > FLT_MAX) return NEXA_Q4_NUMERIC_RANGE;
             output[item * rows + row] = (float)sum;
         }
+    }
+    return NEXA_Q4_OK;
+}
+
+int nexa_q8_decode_row(const uint8_t *packed, size_t packed_bytes,
+                       size_t cols, size_t group_size,
+                       float *output, size_t output_count) {
+    if (!packed || !output) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, row_bytes, output_bytes;
+    int status = q8_layout(cols, group_size, &groups, &group_bytes, &row_bytes);
+    if (status) return status;
+    if (!checked_mul(cols, sizeof(float), &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (packed_bytes < row_bytes || output_count < cols) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(packed, row_bytes, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    status = validate_packed_q8(packed, 1, cols, group_size, groups, group_bytes, row_bytes);
+    if (status) return status;
+    size_t start = 0;
+    for (size_t group = 0; group < groups; group++) {
+        const uint8_t *data = packed + group * group_bytes;
+        double scale = (double)load_scale(data);
+        size_t valid = cols - start < group_size ? cols - start : group_size;
+        for (size_t lane = 0; lane < valid; lane++) {
+            double value = (double)(int8_t)data[4 + lane] * scale;
+            if (!isfinite(value) || fabs(value) > FLT_MAX) return NEXA_Q4_NUMERIC_RANGE;
+            output[start + lane] = (float)value;
+        }
+        start += valid;
     }
     return NEXA_Q4_OK;
 }

@@ -227,6 +227,10 @@ def main(argv=None):
                         help="Store every matrix as RAW_F32; requires --checkpoint")
     parser.add_argument("--precision-map", type=Path,
                         help="Apply a planned per-tensor codec map; requires --checkpoint")
+    parser.add_argument("--tensor-codec", action="append", dest="tensor_codecs", metavar="NAME=CODEC",
+                        help="Store this matrix with q4, q8 or f32; repeat per tensor")
+    parser.add_argument("--matrix-codec", choices=("q4", "q8", "f32"),
+                        help="Store every matrix with this codec; requires --checkpoint")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--rows", type=int)
     parser.add_argument("--cols", type=int)
@@ -244,10 +248,12 @@ def main(argv=None):
         parser.error("Supply either a float32 input or --checkpoint")
     if args.input is not None and (args.rows is None or args.cols is None):
         parser.error("Float32 input requires --rows and --cols")
-    if (args.dense_tensors or args.dense_all or args.precision_map) and args.checkpoint is None:
-        parser.error("--dense-tensor/--dense-all/--precision-map require --checkpoint")
-    if sum(bool(value) for value in (args.dense_tensors, args.dense_all, args.precision_map)) > 1:
-        parser.error("pass only one of --dense-all, --dense-tensor or --precision-map")
+    selectors = (args.dense_tensors, args.dense_all, args.precision_map,
+                 args.tensor_codecs, args.matrix_codec)
+    if any(selectors) and args.checkpoint is None:
+        parser.error("codec selection options require --checkpoint")
+    if sum(bool(value) for value in selectors) > 1:
+        parser.error("pass only one codec selection option")
     if args.checkpoint is not None and (args.rows is not None or args.cols is not None):
         parser.error("--checkpoint gets shapes from the architecture; do not pass --rows/--cols")
     tq_options = any(value is not None for value in
@@ -272,6 +278,22 @@ def main(argv=None):
                 from compiler.precision_map import PrecisionMap
                 precision = PrecisionMap.from_json(args.precision_map.read_text(encoding="utf-8"))
                 codecs = dict(precision.codecs)
+            elif args.tensor_codecs or args.matrix_codec:
+                from compiler.model_config import ModelConfig
+                from compiler.importers.safetensors import read_json, safe_child
+                shapes = ModelConfig.from_hf_config(
+                    read_json(safe_child(Path(args.checkpoint).resolve(strict=True),
+                                         'config.json'))).required_tensor_shapes()
+                matrices = [name for name, shape in shapes.items() if len(shape) == 2]
+                if args.matrix_codec:
+                    codecs = {name: args.matrix_codec for name in matrices}
+                else:
+                    codecs = {}
+                    for item in args.tensor_codecs:
+                        name, separator, codec = item.partition("=")
+                        if not separator or codec not in ("q4", "q8", "f32") or name not in matrices:
+                            parser.error(f"--tensor-codec expects NAME=q4|q8|f32 for a matrix: {item}")
+                        codecs[name] = codec
             elif args.dense_all or args.dense_tensors:
                 from compiler.model_config import ModelConfig
                 from compiler.importers.safetensors import read_json, safe_child

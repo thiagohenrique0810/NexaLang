@@ -37,6 +37,8 @@ def _load_kernels():
         "nexa_q4_matmul": [fp, sz, sz, bp, sz, sz, sz, sz, fp, sz],
         "nexa_q4_decode_row": [bp, sz, sz, sz, fp, sz],
         "nexa_f32_matmul": [fp, sz, sz, fp, sz, sz, sz, fp, sz],
+        "nexa_q8_matmul": [fp, sz, sz, bp, sz, sz, sz, sz, fp, sz],
+        "nexa_q8_decode_row": [bp, sz, sz, sz, fp, sz],
         "nexa_q4_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_q3_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_rmsnorm": [fp, sz, fp, sz, sz, sz, dbl, fp, sz],
@@ -107,10 +109,14 @@ class TransformerSession:
             self._storage = {}
             self._matrix_layouts = {}
             self._dense_matrices = set()
+            self._packed_kernels = {}
             for item in summary["tensors"]:
                 name, shape = item["name"], tuple(item["shape"])
-                q4 = item["codec"] == "Q4_GROUPED"
+                q4 = item["codec"] in ("Q4_GROUPED", "Q8_GROUPED")
                 dense = item["codec"] == "RAW_F32_MATRIX"
+                if q4:
+                    self._packed_kernels[name] = ("nexa_q4_matmul" if item["codec"] == "Q4_GROUPED"
+                                                  else "nexa_q8_matmul")
                 self._storage[name] = TensorDesc(name, shape, storage_dtype="q4" if q4 else "f32",
                                                  storage_nbytes=item["packed_payload_bytes"])
                 if q4:
@@ -327,7 +333,7 @@ class TransformerSession:
                     io["matmul_tiles"] += 1
             elif kind in ("Embedding", "MatMul"):
                 weight_name = op.inputs[1]
-                with self._bundle.open_q4(weight_name) as reader:
+                with self._bundle.open_packed(weight_name) as reader:
                     if kind == "Embedding":
                         for index, token in enumerate(tokens):
                             tick = time.perf_counter()
@@ -335,8 +341,14 @@ class TransformerSession:
                             read_seconds += time.perf_counter() - tick
                             target = (ctypes.c_float * reader.cols).from_address(
                                 ctypes.addressof(out) + index * reader.cols * 4)
-                            call("nexa_q4_decode_row", packed, reader.row_bytes, reader.cols,
-                                 reader.group_size, target, len(target))
+                            # Embedding rows decode through the codec's own row
+                            # helper; Q8 reuses the packed matmul with one row.
+                            if self._packed_kernels[weight_name] == "nexa_q4_matmul":
+                                call("nexa_q4_decode_row", packed, reader.row_bytes, reader.cols,
+                                     reader.group_size, target, len(target))
+                            else:
+                                call("nexa_q8_decode_row", packed, reader.row_bytes, reader.cols,
+                                     reader.group_size, target, len(target))
                             io["packed_bytes_consumed"] += reader.row_bytes
                             io["embedding_rows_read"] += 1
                     else:
@@ -348,7 +360,7 @@ class TransformerSession:
                             tick = time.perf_counter()
                             reader.read_rows_into(start, count, packed_view[:size])
                             read_seconds += time.perf_counter() - tick
-                            call("nexa_q4_matmul", left, len(left), length, packed, size,
+                            call(self._packed_kernels[weight_name], left, len(left), length, packed, size,
                                  count, reader.cols, reader.group_size, tile_output, length * count)
                             for row in range(length):
                                 ctypes.memmove(ctypes.addressof(out) + (row * reader.rows + start) * 4,

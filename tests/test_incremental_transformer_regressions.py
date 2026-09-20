@@ -168,7 +168,7 @@ class IncrementalNativeRegressions(_IncrementalFixture):
         with self.session(tile_rows=3) as session:
             session.prefill([1, 3, 5])
             kernels = _load_kernels()
-            original_open = ModelBundleReader.open_q4
+            original_open = ModelBundleReader.open_packed
             embedding_reads = []
             def tracked_open(bundle, name):
                 reader = original_open(bundle, name)
@@ -179,7 +179,7 @@ class IncrementalNativeRegressions(_IncrementalFixture):
                         return original_read(start, count, destination)
                     reader.read_rows_into = read_rows_into
                 return reader
-            with patch.object(ModelBundleReader, 'open_q4', tracked_open):
+            with patch.object(ModelBundleReader, 'open_packed', tracked_open):
                 with patch.object(kernels, 'nexa_q4_matmul', wraps=kernels.nexa_q4_matmul) as matmul:
                     with patch.object(kernels, 'nexa_rope_offset', wraps=kernels.nexa_rope_offset) as rope:
                         with patch.object(kernels, 'nexa_causal_gqa_attention_cached',

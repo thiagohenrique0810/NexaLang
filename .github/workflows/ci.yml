@@ -120,6 +120,12 @@ jobs:
           python tools/nexa_inspect.py artifacts/models/ci-dense --verify
           python tools/nexa_run.py artifacts/models/ci-dense --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB --report artifacts/reports/ci-dense.json
 
+      - name: Convert and run a Q8 weight bundle
+        run: |
+          python tools/nexa_convert.py --checkpoint artifacts/checkpoints/ci-tiny --out artifacts/models/ci-q8 --matrix-codec q8 --group-size 4 --block-rows 3
+          python tools/nexa_inspect.py artifacts/models/ci-q8 --verify
+          python tools/nexa_run.py artifacts/models/ci-q8 --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB --report artifacts/reports/ci-q8.json
+
       - name: Calibrate one tensor against a dense reference
         run: python tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/ci-tiny --tokens 1,3 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --tensor model.embed_tokens.weight --report artifacts/reports/ci-calibration.json
 

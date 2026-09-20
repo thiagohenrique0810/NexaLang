@@ -28,6 +28,10 @@ MAGIC = b'NEXAPACK'
 FORMAT_VERSION = 1
 CODEC_ID = 'Q4_GROUPED'
 CODEC_VERSION = 1
+Q8_CODEC_ID = 'Q8_GROUPED'
+Q8_CODEC_VERSION = 1
+# Storage dtype per matrix codec; the container layout is otherwise identical.
+_GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8'}
 TQ_CODEC_ID = 'TQ_MSE_SRHT'
 TQ_CODEC_VERSION = 1
 TQ_TRANSFORM_ID = 'SRHT_XOSHIRO256SS_V1'
@@ -63,14 +67,19 @@ def _integer(value, name, *, minimum=1, maximum=MAX_INTEGER):
     return value
 
 
-def _group_bytes(group_size):
+def _group_bytes(group_size, codec=CODEC_ID):
     _integer(group_size, 'group_size', maximum=MAX_GROUP_SIZE)
+    if codec == Q8_CODEC_ID:
+        # One signed byte per value, after the shared float32 scale.
+        return 4 + group_size
+    if codec != CODEC_ID:
+        raise NexaPackError(f'Unsupported grouped codec: {codec}')
     return 4 + (group_size + 1) // 2
 
 
-def _row_bytes(cols, group_size):
+def _row_bytes(cols, group_size, codec=CODEC_ID):
     _integer(cols, 'cols')
-    group_bytes = _group_bytes(group_size)
+    group_bytes = _group_bytes(group_size, codec)
     result = ((cols + group_size - 1) // group_size) * group_bytes
     if result > MAX_ROW_BYTES:
         raise NexaPackError(f'Encoded row exceeds {MAX_ROW_BYTES} bytes')
@@ -106,10 +115,69 @@ def _encode_group(values, group_size):
     return bytes(output)
 
 
-def _iter_q4_groups(values, group_size, cols=None):
-    group_bytes = _group_bytes(group_size)
+def _encode_group_q8(values, group_size):
+    """Symmetric int8 group: scale = max|v| / 127, code -128 stays reserved."""
+    maximum = max(abs(value) for value in values)
+    scale = _FLOAT32.unpack(_FLOAT32.pack(maximum / 127.0))[0]
+    if maximum and not scale:
+        raise NexaPackError('Q8 scale underflows float32; rescale the input')
+    output = bytearray(_group_bytes(group_size, Q8_CODEC_ID))
+    _FLOAT32.pack_into(output, 0, scale)
+    if scale:
+        for index, value in enumerate(values):
+            quotient = value / scale
+            magnitude = math.floor(abs(quotient) + 0.5)
+            quantized = min(127, magnitude) * (-1 if quotient < 0 else 1)
+            output[4 + index] = quantized & 0xFF
+    return bytes(output)
+
+
+def _iter_decoded_q8_row(data, cols, group_size):
+    size = _row_bytes(cols, group_size, Q8_CODEC_ID)
+    try:
+        payload = memoryview(data).cast('B')
+    except (TypeError, ValueError) as error:
+        raise NexaPackError('Q8 row must be a contiguous byte buffer') from error
+    if len(payload) != size:
+        raise NexaPackError(f'Q8 row has {len(payload)} bytes; expected {size}')
+    group_bytes = _group_bytes(group_size, Q8_CODEC_ID)
+    decoded = 0
+    for offset in range(0, size, group_bytes):
+        scale = _FLOAT32.unpack_from(payload, offset)[0]
+        if not math.isfinite(scale) or scale < 0:
+            raise NexaPackError('Q8 scale must be finite and nonnegative')
+        count = min(group_size, cols - decoded)
+        for index in range(group_size):
+            code = payload[offset + 4 + index]
+            value = code if code < 128 else code - 256
+            if value == -128:
+                raise NexaPackError('Q8 code -128 is reserved and invalid')
+            if (index >= count or not scale) and value:
+                raise NexaPackError('Q8 padding and zero-scale groups must contain zero codes')
+            if index < count:
+                yield scale * value
+        decoded += count
+
+
+def validate_q8_row(data, cols: int, group_size: int) -> None:
+    for _ in _iter_decoded_q8_row(data, cols, group_size):
+        pass
+
+
+def decode_q8_row(data: bytes, cols: int, group_size: int) -> list[float]:
+    """Decode one Q8 row for reference and calibration, never for execution."""
+    return list(_iter_decoded_q8_row(data, cols, group_size))
+
+
+def quantize_q8_row(values: Iterable[float], group_size: int) -> bytes:
+    return b''.join(_iter_grouped(values, group_size, None, Q8_CODEC_ID))
+
+
+def _iter_grouped(values, group_size, cols=None, codec=CODEC_ID):
+    group_bytes = _group_bytes(group_size, codec)
+    encode = _encode_group_q8 if codec == Q8_CODEC_ID else _encode_group
     if cols is not None:
-        _row_bytes(cols, group_size)
+        _row_bytes(cols, group_size, codec)
     try:
         iterator = iter(values)
     except TypeError as error:
@@ -129,7 +197,7 @@ def _iter_q4_groups(values, group_size, cols=None):
         encoded_size += group_bytes
         if encoded_size > MAX_ROW_BYTES:
             raise NexaPackError(f'Encoded row exceeds {MAX_ROW_BYTES} bytes')
-        yield _encode_group(group, group_size)
+        yield encode(group, group_size)
         if len(group) != count:
             break
     if not seen:
@@ -147,7 +215,7 @@ def quantize_q4_row(values: Iterable[float], group_size: int) -> bytes:
     rounding is half away from zero, and zero groups have zero scale/payload.
     A nonzero group whose scale rounds to zero is rejected.
     """
-    return b''.join(_iter_q4_groups(values, group_size))
+    return b''.join(_iter_grouped(values, group_size))
 
 
 def _iter_decoded_q4_row(data, cols, group_size):
@@ -209,10 +277,12 @@ def _align(value):
     return ((value + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
 
 
-def _new_metadata(rows, cols, group_size, block_rows):
+def _new_metadata(rows, cols, group_size, block_rows, codec=CODEC_ID):
     _integer(rows, 'rows')
     _integer(block_rows, 'block_rows')
-    row_bytes = _row_bytes(cols, group_size)
+    if codec not in _GROUPED_CODECS:
+        raise NexaPackError(f'Unsupported grouped codec: {codec}')
+    row_bytes = _row_bytes(cols, group_size, codec)
     block_count = (rows + block_rows - 1) // block_rows
     if block_count > MAX_BLOCKS:
         raise NexaPackError(f'More than {MAX_BLOCKS} blocks; increase block_rows')
@@ -223,7 +293,7 @@ def _new_metadata(rows, cols, group_size, block_rows):
     ]
     metadata = {
         'format': 'NexaPack', 'format_version': FORMAT_VERSION, 'shape': [rows, cols],
-        'logical_dtype': 'f32', 'storage_dtype': 'q4', 'codec_id': CODEC_ID,
+        'logical_dtype': 'f32', 'storage_dtype': _GROUPED_CODECS[codec], 'codec_id': codec,
         'codec_version': CODEC_VERSION, 'group_size': group_size,
         'endianness': 'little', 'checksum': 'sha256', 'row_bytes': row_bytes,
         'block_rows': block_rows, 'blocks': blocks,
@@ -244,6 +314,13 @@ def _new_metadata(rows, cols, group_size, block_rows):
         payload_offset = wanted_offset
 
 
+def write_q8_matrix(path, rows: int, cols: int, group_size: int,
+                    row_source: Iterable[Iterable[float]], *, block_rows: int = 64) -> None:
+    """Atomically write a row-major Q8 matrix; same container, wider codes."""
+    write_grouped_matrix(path, rows, cols, group_size, row_source,
+                         block_rows=block_rows, codec=Q8_CODEC_ID)
+
+
 def write_q4_matrix(path, rows: int, cols: int, group_size: int,
                     row_source: Iterable[Iterable[float]], *, block_rows: int = 64) -> None:
     """Atomically write a row-major Q4 matrix without materializing the matrix.
@@ -252,7 +329,14 @@ def write_q4_matrix(path, rows: int, cols: int, group_size: int,
     float32-convertible values. Only one group and the bounded index are held
     internally. Existing output survives validation, source, and write errors.
     """
-    metadata, payload_offset, total_size = _new_metadata(rows, cols, group_size, block_rows)
+    write_grouped_matrix(path, rows, cols, group_size, row_source, block_rows=block_rows)
+
+
+def write_grouped_matrix(path, rows: int, cols: int, group_size: int,
+                         row_source: Iterable[Iterable[float]], *,
+                         block_rows: int = 64, codec: str = CODEC_ID) -> None:
+    """Shared streaming writer for the grouped codecs; one group at a time."""
+    metadata, payload_offset, total_size = _new_metadata(rows, cols, group_size, block_rows, codec)
     try:
         source = iter(row_source)
     except TypeError as error:
@@ -270,7 +354,7 @@ def write_q4_matrix(path, rows: int, cols: int, group_size: int,
                         values = next(source)
                     except StopIteration as error:
                         raise NexaPackError(f'Matrix ended at row {row_index}; expected {rows}') from error
-                    for group in _iter_q4_groups(values, group_size, cols):
+                    for group in _iter_grouped(values, group_size, cols, codec):
                         stream.write(group)
                         digest.update(group)
                 block['sha256'] = digest.hexdigest()
@@ -518,8 +602,8 @@ class NexaPackReader:
         if not isinstance(metadata, dict):
             raise NexaPackError('Unexpected NexaPack metadata fields')
         codec = metadata.get('codec_id')
-        if codec == CODEC_ID:
-            keys, storage_dtype = _METADATA_KEYS, 'q4'
+        if codec in _GROUPED_CODECS:
+            keys, storage_dtype = _METADATA_KEYS, _GROUPED_CODECS[codec]
         elif codec == TQ_CODEC_ID:
             keys, storage_dtype = _TQ_METADATA_KEYS, 'tq_mse'
         else:
@@ -528,7 +612,7 @@ class NexaPackReader:
             raise NexaPackError('Unexpected NexaPack metadata fields')
         expected = {'format': 'NexaPack', 'format_version': FORMAT_VERSION,
                     'logical_dtype': 'f32', 'storage_dtype': storage_dtype, 'codec_id': codec,
-                    'codec_version': CODEC_VERSION if codec == CODEC_ID else TQ_CODEC_VERSION,
+                    'codec_version': CODEC_VERSION if codec in _GROUPED_CODECS else TQ_CODEC_VERSION,
                     'endianness': 'little', 'checksum': 'sha256'}
         if codec == TQ_CODEC_ID:
             expected['transform_id'] = TQ_TRANSFORM_ID
@@ -543,9 +627,9 @@ class NexaPackReader:
         self._codec_id = codec
         self._codec_version = metadata['codec_version']
         self._group_size = self._bits = self._seed = self._codebook_f32le = None
-        if codec == CODEC_ID:
+        if codec in _GROUPED_CODECS:
             self._group_size = _integer(metadata['group_size'], 'group_size', maximum=MAX_GROUP_SIZE)
-            self._row_bytes = _row_bytes(self._cols, self._group_size)
+            self._row_bytes = _row_bytes(self._cols, self._group_size, codec)
         else:
             from .tq import tq_row_bytes, validate_tq_codebook, validate_tq_parameters
             try:
@@ -636,6 +720,8 @@ class NexaPackReader:
         """
         if self.codec_id == CODEC_ID:
             validate_q4_row(data, self.cols, self.group_size)
+        elif self.codec_id == Q8_CODEC_ID:
+            validate_q8_row(data, self.cols, self.group_size)
         else:
             from .tq import validate_tq_row
             try:

@@ -60,7 +60,7 @@ def inspect_artifact(path, *, verify=False):
                             dense_read_bytes += bundle.read_matrix_block_into(
                                 name, index, bytearray(block["bytes"]))
                     elif len(shape) == 2:
-                        with bundle.open_q4(name) as reader:
+                        with bundle.open_packed(name) as reader:
                             q4_read_bytes += verify_matrix(reader)
                     else:
                         bundle.read_f32(name)

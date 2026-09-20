@@ -205,6 +205,18 @@ não se somam, e a seleção é gulosa sobre uma razão, não ótima; `quality_m
 continua falso. Passaram **618 regressões + 110 testes bootstrap = 728 testes**,
 sem falhas ou skips. Checklist: **38 concluídos e 107 pendentes**.
 
+**Vigésimo incremento implementado e validado:** codec de peso Q8_GROUPED, um
+byte com sinal por valor sobre a mesma escala por grupo, no mesmo contêiner
+NexaPack e com kernel próprio de matmul e de decode de linha. Custo e erro ficam
+entre Q4 e denso: numa linha de exemplo o erro do round-trip caiu de 0,179 para
+0,0098, e num modelo de duas camadas o erro nos logits contra a referência densa
+caiu de 0,319 para 0,011, com payload intermediário. Um bundle pode misturar os
+três codecs, e uma regressão prova que os três caminhos concordam usando pesos
+que todos guardam sem erro — zero e ±máximo do grupo, já que Q4 escala por max/7
+e Q8 por max/127. `--matrix-codec` e `--tensor-codec NAME=CODEC` na conversão.
+Passaram **630 regressões + 110 testes bootstrap = 740 testes**, sem falhas ou
+skips. Checklist: **39 concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -221,11 +233,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M1.05b — codecs de peso Q2/Q3/Q8 e RAW-F16.** O despacho por
-codec, a calibração e o PrecisionMap já existem, mas o espaço de escolha tem
-apenas dois pontos: Q4 e denso. Cada codec novo precisa de writer, kernel de
-matmul sem expansão integral, caudas, comparação numérica e entrada no mapa —
-sem mudar o contrato do PrecisionMap. Isso também destrava M4.03d.
+**Próxima tarefa: M6.01c/M6.02b — calibrar e planejar com Q8 no espaço de
+escolha.** O executor já guarda três codecs de peso, mas a calibração mede
+apenas Q4 contra denso e o PrecisionMap escolhe entre dois valores. Medir a
+sensibilidade por codec custa uma execução a mais por tensor e transforma a
+seleção binária numa escala de degraus; o contrato do mapa não muda, apenas
+ganha mais um valor por tensor. Depois disso, M1.05c acrescenta Q2/Q3/F16.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -547,7 +560,9 @@ medições. Telemetria e baseline de modelos continuam pendentes.
 - [x] M1.05a Despacho de peso por codec no executor e matrizes `RAW_F32_MATRIX`
   com blocos verificados; bundles mistos, conversão por tensor, verificação
   bloco a bloco e equivalência exata com Q4 quando a quantização é exata.
-- [ ] M1.05b Kernels Q2/Q3/Q8 e RAW-F16 de pesos, caudas e comparação numérica,
+- [x] M1.05b Codec de peso Q8_GROUPED com kernel de matmul e de decode, caudas,
+  códigos reservados, comparação numérica contra Q4/denso e bundles mistos.
+- [ ] M1.05c Kernels Q2/Q3 e RAW-F16 de pesos, caudas e comparação numérica,
   usando o despacho por codec já existente.
 - [x] M1.06 Integrar armazenamento TurboQuant MSE no NexaPack: TQ02 portátil,
   dimensão/bits/seed/SRHT/codebook explícitos, norma F32LE e migração TQ01 com
@@ -1368,6 +1383,34 @@ Décimo primeiro incremento:
   **38 concluídos e 107 pendentes**; M6.02 foi dividido preservando os codecs
   restantes e a seleção por bloco em M6.02b.
 
+## Registro do vigésimo incremento — codec de peso Q8
+
+- Concluído M1.05b: `Q8_GROUPED` no NexaPack (escrita, leitura, validação de
+  linha), `nexa_q8_matmul` e `nexa_q8_decode_row` no runtime nativo, despacho no
+  executor e codec por tensor no bundle.
+- Layout: escala float32 por grupo e um byte com sinal por valor; `-128` é
+  reservado e recusado, e o padding de um grupo parcial precisa ser zero, como
+  no Q4. O contêiner, os blocos e os checksums não mudaram.
+- O writer foi generalizado em `write_grouped_matrix`; `write_q4_matrix` e
+  `write_q8_matrix` são as duas entradas nomeadas do mesmo caminho.
+- Medições: round-trip de uma linha com grupo 4, erro máximo 0,179 (Q4) contra
+  0,0098 (Q8), com o grupo passando de 6 para 8 bytes. Modelo sintético de duas
+  camadas com grupo 8: erro nos logits contra denso 0,319 (Q4) contra 0,011
+  (Q8), payload entre os dois extremos.
+- Equivalência dos três caminhos provada com pesos neutros ao codec — zero e
+  ±máximo do grupo — porque nenhum conjunto de frações é exato para max/7 e
+  max/127 ao mesmo tempo.
+- CLI: `--matrix-codec q4|q8|f32` e `--tensor-codec NAME=CODEC`, exclusivos
+  entre si e com `--dense-all`/`--dense-tensor`/`--precision-map`.
+- Validação macOS ARM64/Python 3.14.5: **630 regressões + 110 bootstrap = 740
+  testes, zero falhas e zero skips**. Os 12 novos cobrem round-trip contra Q4,
+  layout e caudas, valores exatos, códigos reservados/padding/escala inválida,
+  contêiner, kernel contra referência Python, rejeições do kernel, erro e bytes
+  entre Q4 e denso, bundle com três codecs, manifesto que contradiz o arquivo e
+  as duas formas da CLI.
+- Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **39 concluídos e
+  107 pendentes**; M1.05b foi dividido preservando Q2/Q3/F16 em M1.05c.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1415,6 +1458,11 @@ python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -
 python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --static-only
 python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibracao.json
 python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
+
+# Codec de peso Q8 e bundle com três codecs.
+python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q8 --matrix-codec q8 --group-size 4 --block-rows 3
+python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
+python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
 
 # PrecisionMap: planejar sob teto de bytes e converter pelo plano.
 python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json --budget 2KiB --out artifacts/precision/map.json
@@ -1639,6 +1687,15 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo incremento acrescenta:
+
+- `runtime/nexapack/format.py`: `Q8_GROUPED`, writer compartilhado
+  `write_grouped_matrix`, decode/validação de linha e leitura por codec.
+- `runtime/nexapack/q4.c/.h`: `nexa_q8_matmul` e `nexa_q8_decode_row`.
+- `runtime/nexapack/bundle.py` e `transformer.py`: codec por tensor, despacho e
+  `open_packed`; `tools/nexa_convert.py --matrix-codec/--tensor-codec`.
+- `tests/test_q8_weights_regressions.py` e a seção Q8 do guia de codecs.
 
 Décimo nono incremento acrescenta:
 
