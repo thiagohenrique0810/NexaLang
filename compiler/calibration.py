@@ -21,16 +21,28 @@ import math
 import os
 from pathlib import Path
 import shutil
+import struct
 
-from runtime.nexapack.bundle import PACKED_CODECS
+from runtime.nexapack.bundle import DENSE_CODECS, PACKED_CODECS
 from runtime.nexapack.format import (
-    decode_q3_row, decode_q4_row, decode_q8_row,
-    quantize_q3_row, quantize_q4_row, quantize_q8_row,
+    decode_q2_row, decode_q3_row, decode_q4_row, decode_q8_row,
+    quantize_q2_row, quantize_q3_row, quantize_q4_row, quantize_q8_row,
 )
+
+_F16 = struct.Struct("<e")
+
+
+def _f16_round_trip(values, _group_size):
+    """Half precision keeps no scale: the stored width is the whole codec."""
+    try:
+        return [_F16.unpack(_F16.pack(value))[0] for value in values]
+    except (OverflowError, struct.error) as error:
+        raise ValueError("Tensor value does not fit float16") from error
 
 MAX_CALIBRATION_TENSORS = 4096
 # Round-trip helpers per packed weight codec; dense needs none by definition.
 _CODEC_ROUND_TRIP = {
+    "q2": (quantize_q2_row, decode_q2_row),
     "q3": (quantize_q3_row, decode_q3_row),
     "q4": (quantize_q4_row, decode_q4_row),
     "q8": (quantize_q8_row, decode_q8_row),
@@ -83,15 +95,19 @@ def quantization_error(rows, group_size, codec="q4"):
     """Round-trip error of one packed codec, row by row, without the matrix."""
     if type(group_size) is not int or group_size < 1:
         raise ValueError("group_size must be a positive integer")
-    if codec not in _CODEC_ROUND_TRIP:
-        raise ValueError(f"Unsupported packed codec for calibration: {codec!r}")
-    quantize, decode = _CODEC_ROUND_TRIP[codec]
+    if codec == "f16":
+        quantize, decode = None, None
+    elif codec not in _CODEC_ROUND_TRIP:
+        raise ValueError(f"Unsupported codec for calibration: {codec!r}")
+    else:
+        quantize, decode = _CODEC_ROUND_TRIP[codec]
     count = 0
     squared = reference_squared = 0.0
     worst = 0.0
     for row in rows:
         values = _finite(row, "Tensor row")
-        decoded = decode(quantize(values, group_size), len(values), group_size)
+        decoded = (_f16_round_trip(values, group_size) if quantize is None
+                   else decode(quantize(values, group_size), len(values), group_size))
         for original, restored in zip(values, decoded):
             delta = original - restored
             squared += delta * delta
@@ -102,7 +118,8 @@ def quantization_error(rows, group_size, codec="q4"):
         raise ValueError("Tensor must have at least one value")
     rmse = math.sqrt(squared / count)
     reference_rms = math.sqrt(reference_squared / count)
-    return {"codec": PACKED_CODECS[codec], "group_size": group_size, "values": count,
+    stored = PACKED_CODECS.get(codec) or DENSE_CODECS[codec]
+    return {"codec": stored, "group_size": group_size if codec != "f16" else None, "values": count,
             "max_abs_error": worst, "rmse": rmse, "reference_rms": reference_rms,
             "relative_rmse": rmse / reference_rms if reference_rms else math.inf,
             # Signal-to-noise in dB; higher is a tensor the codec handles well.
@@ -148,9 +165,12 @@ def build_variant(dense_dir, packed_dir, tensor, destination):
     if tensor not in dense["tensors"] or tensor not in packed["tensors"]:
         raise ValueError(f"Unknown tensor for calibration: {tensor}")
     if dense["tensors"][tensor]["codec"] != "RAW_F32_MATRIX":
-        raise ValueError(f"The reference tensor must be dense: {tensor}")
-    if packed["tensors"][tensor]["codec"] not in PACKED_CODECS.values():
-        raise ValueError(f"The measured tensor must be packed: {tensor}")
+        raise ValueError(f"The reference tensor must be dense F32: {tensor}")
+    measured = packed["tensors"][tensor]["codec"]
+    if measured == dense["tensors"][tensor]["codec"]:
+        raise ValueError(f"The measured tensor must differ from the reference: {tensor}")
+    if measured not in set(PACKED_CODECS.values()) | set(DENSE_CODECS.values()):
+        raise ValueError(f"The measured tensor must use a supported codec: {tensor}")
     if destination.exists():
         raise FileExistsError(f"Variant destination already exists: {destination}")
     manifest = dict(dense)

@@ -47,6 +47,19 @@ A montagem é atômica: a variante é construída num diretório `.partial` e
 renomeada ao final, então uma falha de link, cópia ou espaço não deixa um bundle
 incompleto para trás.
 
+## Conjunto de calibração
+
+`--tokens` é repetível: cada ocorrência é um prompt do conjunto, e
+`--prompt-label` dá nome a cada um, em ordem. O relatório registra o conjunto
+inteiro — rótulo, IDs e comprimento — porque **o que foi medido depende do que
+foi executado**.
+
+A agregação é o RMSE combinado de todos os prompts, e o relatório traz também o
+delta de cada prompt e qual foi o **pior**. Um codec aceitável na média pode
+quebrar um domínio, e um prompt só não distingue os dois casos. Na fixture com
+três prompts, a sensibilidade de um mesmo tensor em Q4 variou de 0,34 a 0,81
+conforme o prompt — a média sozinha esconderia isso.
+
 ## Métricas do relatório
 
 Por tensor: `statistics` (min, max, média, RMS, desvio, `max_abs`,
@@ -126,16 +139,35 @@ Um codec grosseiro nem sempre é o mais barato: com grupos pequenos, a escala de
 quatro bytes domina e Q3 ocupa o mesmo que Q4 errando mais. A fronteira remove
 essa opção antes da escolha, sem precisar de regra especial.
 
+## Teto de qualidade em vez de teto de bytes
+
+`--max-rmse` inverte a pergunta: em vez de "o melhor plano que cabe em N bytes",
+"o plano mais barato que fica abaixo deste erro". Os degraus são aplicados na
+mesma ordem, e a busca para assim que a estimativa atinge o teto.
+
+```bash
+python3 tools/nexa_precision.py plan --calibration REPORT --max-rmse 0.05 --out map.json
+```
+
+A estimativa combina as sensibilidades medidas **uma de cada vez** como se
+fossem independentes (raiz da soma dos quadrados). Isso é uma suposição, não uma
+medição: serve para comparar planos, não como número de qualidade do modelo.
+`--budget` e `--max-rmse` são mutuamente exclusivos, e a proveniência registra
+qual dos dois limitou o plano, a estimativa resultante e se o teto foi atingido.
+
 ## Limites
 
 O custo é **uma execução do modelo por tensor e por codec medido**, mais uma
 referência densa e uma por codec. Para um modelo grande isso é caro em tempo e em disco (o bundle
 denso ocupa oito vezes o empacotado), então use `--tensor` ou rode por camada.
 
-O prompt de calibração define o que está sendo medido: tokens diferentes
-exercitam caminhos diferentes. Um único prompt curto não representa uma mistura
-de domínios — escolher o conjunto de calibração faz parte de M6.01b, junto com
-o orçamento de qualidade e a calibração por grupo dentro do tensor.
+O conjunto de calibração define o que está sendo medido. Ele agora aceita vários
+prompts e reporta o pior, mas continua sendo escolhido por quem chama: uma
+mistura representativa por idioma e domínio depende do corpus de LLM.02, e
+nenhuma agregação corrige um conjunto que não representa o uso real.
+
+Calibração por grupo dentro do tensor — em vez de um codec por tensor inteiro —
+continua em M6.02c, junto da seleção por bloco.
 
 Validar um plano de verdade exige comparar qualidade entre mapas num modelo
 treinado, o que depende de LLM.04b. O

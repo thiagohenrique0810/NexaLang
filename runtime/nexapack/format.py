@@ -32,8 +32,12 @@ Q8_CODEC_ID = 'Q8_GROUPED'
 Q8_CODEC_VERSION = 1
 Q3_CODEC_ID = 'Q3_GROUPED'
 Q3_CODEC_VERSION = 1
+Q2_CODEC_ID = 'Q2_GROUPED'
+Q2_CODEC_VERSION = 1
 # Storage dtype per matrix codec; the container layout is otherwise identical.
-_GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8', Q3_CODEC_ID: 'q3'}
+_GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8', Q3_CODEC_ID: 'q3', Q2_CODEC_ID: 'q2'}
+# Codes per group: the scale is max|v| / levels, and -(levels + 1) is reserved.
+_CODEC_LEVELS = {CODEC_ID: 7, Q8_CODEC_ID: 127, Q3_CODEC_ID: 3, Q2_CODEC_ID: 1}
 TQ_CODEC_ID = 'TQ_MSE_SRHT'
 TQ_CODEC_VERSION = 1
 TQ_TRANSFORM_ID = 'SRHT_XOSHIRO256SS_V1'
@@ -78,6 +82,9 @@ def _group_bytes(group_size, codec=CODEC_ID):
         # Three bits per value, packed from the least significant bit, with
         # the same layout the paged KV cache already stores.
         return 4 + (3 * group_size + 7) // 8
+    if codec == Q2_CODEC_ID:
+        # Two bits per value: ternary codes -1, 0 and 1, with -2 reserved.
+        return 4 + (2 * group_size + 7) // 8
     if codec != CODEC_ID:
         raise NexaPackError(f'Unsupported grouped codec: {codec}')
     return 4 + (group_size + 1) // 2
@@ -136,6 +143,82 @@ def _encode_group_q8(values, group_size):
             quantized = min(127, magnitude) * (-1 if quotient < 0 else 1)
             output[4 + index] = quantized & 0xFF
     return bytes(output)
+
+
+def _encode_packed_bits(values, group_size, codec, bits):
+    """Shared encoder for the bit-packed grouped codecs (Q3 and Q2)."""
+    levels = _CODEC_LEVELS[codec]
+    maximum = max(abs(value) for value in values)
+    scale = _FLOAT32.unpack(_FLOAT32.pack(maximum / levels))[0]
+    if maximum and not scale:
+        raise NexaPackError(f'{codec} scale underflows float32; rescale the input')
+    payload_bytes = _group_bytes(group_size, codec) - 4
+    mask = (1 << bits) - 1
+    codes = 0
+    if scale:
+        for index, value in enumerate(values):
+            quotient = value / scale
+            magnitude = math.floor(abs(quotient) + 0.5)
+            quantized = max(-levels, min(levels, -magnitude if quotient < 0 else magnitude))
+            codes |= (quantized & mask) << (bits * index)
+    return _FLOAT32.pack(scale) + codes.to_bytes(payload_bytes, 'little')
+
+
+def _iter_decoded_packed_bits(data, cols, group_size, codec, bits):
+    size = _row_bytes(cols, group_size, codec)
+    try:
+        payload = memoryview(data).cast('B')
+    except (TypeError, ValueError) as error:
+        raise NexaPackError(f'{codec} row must be a contiguous byte buffer') from error
+    if len(payload) != size:
+        raise NexaPackError(f'{codec} row has {len(payload)} bytes; expected {size}')
+    group_bytes = _group_bytes(group_size, codec)
+    payload_bytes, reserved = group_bytes - 4, -(1 << (bits - 1))
+    mask, decoded = (1 << bits) - 1, 0
+    for offset in range(0, size, group_bytes):
+        scale = _FLOAT32.unpack_from(payload, offset)[0]
+        if not math.isfinite(scale) or scale < 0:
+            raise NexaPackError(f'{codec} scale must be finite and nonnegative')
+        packed = int.from_bytes(bytes(payload[offset + 4:offset + 4 + payload_bytes]), 'little')
+        if packed >> (bits * group_size):
+            raise NexaPackError(f'{codec} padding bits must be zero')
+        count = min(group_size, cols - decoded)
+        for index in range(group_size):
+            code = (packed >> (bits * index)) & mask
+            value = code if code < (1 << (bits - 1)) else code - (1 << bits)
+            if value == reserved:
+                raise NexaPackError(f'{codec} code {reserved} is reserved and invalid')
+            if (index >= count or not scale) and value:
+                raise NexaPackError(f'{codec} padding and zero-scale groups must contain zero codes')
+            if index < count:
+                yield scale * value
+        decoded += count
+
+
+def _encode_group_q2(values, group_size):
+    """Q2_GROUPED v1: ternary codes -1, 0 and 1, scale = max|v|, -2 reserved."""
+    return _encode_packed_bits(values, group_size, Q2_CODEC_ID, 2)
+
+
+def validate_q2_row(data, cols: int, group_size: int) -> None:
+    for _ in _iter_decoded_packed_bits(data, cols, group_size, Q2_CODEC_ID, 2):
+        pass
+
+
+def decode_q2_row(data: bytes, cols: int, group_size: int) -> list[float]:
+    """Decode one Q2 row for reference and calibration, never for execution."""
+    return list(_iter_decoded_packed_bits(data, cols, group_size, Q2_CODEC_ID, 2))
+
+
+def quantize_q2_row(values: Iterable[float], group_size: int) -> bytes:
+    return b''.join(_iter_grouped(values, group_size, None, Q2_CODEC_ID))
+
+
+def write_q2_matrix(path, rows: int, cols: int, group_size: int,
+                    row_source: Iterable[Iterable[float]], *, block_rows: int = 64) -> None:
+    """Atomically write a row-major ternary Q2 matrix."""
+    write_grouped_matrix(path, rows, cols, group_size, row_source,
+                         block_rows=block_rows, codec=Q2_CODEC_ID)
 
 
 def _encode_group_q3(values, group_size):
@@ -250,7 +333,8 @@ def quantize_q8_row(values: Iterable[float], group_size: int) -> bytes:
 
 def _iter_grouped(values, group_size, cols=None, codec=CODEC_ID):
     group_bytes = _group_bytes(group_size, codec)
-    encode = {Q8_CODEC_ID: _encode_group_q8, Q3_CODEC_ID: _encode_group_q3}.get(codec, _encode_group)
+    encode = {Q8_CODEC_ID: _encode_group_q8, Q3_CODEC_ID: _encode_group_q3,
+              Q2_CODEC_ID: _encode_group_q2}.get(codec, _encode_group)
     if cols is not None:
         _row_bytes(cols, group_size, codec)
     try:
@@ -799,6 +883,8 @@ class NexaPackReader:
             validate_q8_row(data, self.cols, self.group_size)
         elif self.codec_id == Q3_CODEC_ID:
             validate_q3_row(data, self.cols, self.group_size)
+        elif self.codec_id == Q2_CODEC_ID:
+            validate_q2_row(data, self.cols, self.group_size)
         else:
             from .tq import validate_tq_row
             try:

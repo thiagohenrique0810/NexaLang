@@ -244,6 +244,20 @@ grupo 8, o modelo inteiro num codec só move os logits 0,686 (Q3), 0,447 (Q4) e
 0,017 (Q8) de RMSE. Passaram **647 regressões + 110 testes bootstrap = 757
 testes**, sem falhas ou skips. Checklist: **42 concluídos e 107 pendentes**.
 
+**Vigésimo terceiro incremento implementado e validado:** a escala de codecs de
+peso fechou nas duas pontas e o plano ganhou um segundo tipo de limite.
+Q2_GROUPED guarda códigos ternários em dois bits; RAW_F16_MATRIX guarda meia
+precisão densa, com conversão half→float própria em vez de depender de
+`_Float16`. Medidos num modelo de duas camadas com grupo 8, payload e erro são
+monotônicos ao longo de Q2 → Q3 → Q4 → Q8 → F16 → F32 (3.512 B/1,397 até
+17.344 B/0), e um bundle pode misturar os seis. A calibração passou a aceitar um
+**conjunto** de prompts com rótulos, agregando por RMSE combinado e reportando o
+pior prompt — na fixture, o mesmo tensor em Q4 variou de 0,34 a 0,81 conforme o
+prompt, o que um prompt só esconderia. E `nexa_precision plan --max-rmse` inverte
+a pergunta: o plano mais barato que fica sob um teto de erro, em vez do melhor
+plano sob um teto de bytes. Passaram **665 regressões + 110 testes bootstrap =
+775 testes**, sem falhas ou skips. Checklist: **44 concluídos e 106 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -260,13 +274,13 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M6.01b — conjunto de calibração e orçamento de qualidade.**
-A escala de codecs está pronta, mas o plano depende de um prompt só: tokens
-diferentes exercitam caminhos diferentes, e não há critério de qualidade além
-do RMSE de logits. Definir um conjunto representativo por domínio, agregação
-entre prompts e um teto de erro aceitável — em vez de apenas um teto de bytes —
-é o que falta para o plano significar algo fora da fixture. Alternativas em
-aberto: M1.05d (Q2/RAW-F16), M4.03d (atenção para os demais layouts) e M4.06c.
+**Próxima tarefa: M4.03d — atenção packed para os demais codecs de KV.** A
+escala de pesos está completa e planejável; o cache KV ainda executa F32, Q4, Q3
+e TQ, sem Q8 nem meia precisão, e o despacho por layout na atenção é o que
+M4.03d pede. Os codecs já existem no formato; o trabalho é o quantizador de
+página e o kernel de atenção correspondente, sem expansão integral e com
+temporários contabilizados. Alternativas em aberto: M6.01d (conjunto
+representativo e calibração por grupo), M4.06c e M5.01 com modelo real.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -593,8 +607,9 @@ medições. Telemetria e baseline de modelos continuam pendentes.
 - [x] M1.05c Codec de peso Q3_GROUPED no layout do KV, com matmul e decode
   nativos, caudas, códigos reservados e bits de padding verificados, e
   comparação numérica contra a referência independente e os demais codecs.
-- [ ] M1.05d Kernels Q2 e RAW-F16 de pesos, caudas e comparação numérica,
-  usando o despacho por codec já existente.
+- [x] M1.05d Codecs de peso Q2_GROUPED e RAW_F16_MATRIX com kernels de matmul
+  e decode, caudas, códigos reservados e valores não finitos verificados, e
+  escala monotônica de payload e erro medida ponta a ponta.
 - [x] M1.06 Integrar armazenamento TurboQuant MSE no NexaPack: TQ02 portátil,
   dimensão/bits/seed/SRHT/codebook explícitos, norma F32LE e migração TQ01 com
   endian de origem. Atenção TQ e kernels de matriz permanecem em gates próprios.
@@ -721,9 +736,12 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
   variantes atômicas que reusam payloads e custo por byte economizado.
 - [x] M6.01c Calibração por codec: erro estático e sensibilidade medidos para
   cada codec empacotado disponível, com seleção de codecs por execução.
-- [ ] M6.01b Calibração por grupo dentro do tensor, conjunto de calibração
-  representativo por domínio e orçamento de qualidade; sensibilidade em
-  checkpoint treinado com perplexidade, dependente de LLM.04b.
+- [x] M6.01b Conjunto de calibração com vários prompts rotulados, agregação por
+  RMSE combinado com o pior prompt reportado, e orçamento de qualidade no plano
+  (`--max-rmse`) como alternativa ao teto de bytes.
+- [ ] M6.01d Calibração por grupo dentro do tensor, conjunto representativo por
+  idioma/domínio vindo do corpus de LLM.02, e sensibilidade em checkpoint
+  treinado com perplexidade, dependente de LLM.04b.
 - [x] M6.02a PrecisionMap versionado por tensor e seleção sob teto de bytes a
   partir de sensibilidade medida, com proveniência da decisão, aplicação na
   conversão e limites da estimativa declarados.
@@ -1501,6 +1519,38 @@ Décimo primeiro incremento:
 - Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **42 concluídos e
   107 pendentes**; M1.05c foi dividido preservando Q2/RAW-F16 em M1.05d.
 
+## Registro do vigésimo terceiro incremento — escala completa e teto de qualidade
+
+- Concluído M1.05d: `Q2_GROUPED` (ternário em dois bits, `-2` reservado) e
+  `RAW_F16_MATRIX` (denso, dois bytes por valor, blocos verificados). Kernels
+  `nexa_q2_matmul`/`nexa_q2_decode_row` e `nexa_f16_matmul`/`nexa_f16_decode_row`,
+  este último com conversão half→float explícita, sem depender de `_Float16`.
+- O extrator de bits foi generalizado: Q3 e Q2 compartilham `packed_code`, e o
+  writer compartilha `_encode_packed_bits` com os níveis por codec numa tabela.
+- Escala medida com grupo 8, modelo inteiro num codec: 3.512 B/1,397 (Q2),
+  4.044 B/0,556 (Q3), 4.576 B/0,184 (Q4), 6.704 B/0,012 (Q8), 8.832 B/0,002
+  (F16) e 17.344 B/0 (F32). Payload e erro monotônicos; bundle misto com os seis.
+- Caso honesto registrado: quando os pesos já são exatos em half — a fixture usa
+  múltiplos de 1/16 — o F16 reproduz os logits bit a bit e sua sensibilidade é
+  zero. A regressão aceita esse caso em vez de exigir diferença.
+- Concluído M6.01b: `--tokens` repetível com `--prompt-label`, agregação por
+  RMSE combinado, delta por prompt e pior prompt no relatório. Na fixture, o
+  mesmo tensor em Q4 variou de 0,34 a 0,81 entre prompts.
+- `nexa_precision plan --max-rmse` planeja o mapa mais barato sob um teto de
+  erro; `--budget` e `--max-rmse` são exclusivos, e a proveniência registra qual
+  limitou, a estimativa e se o teto foi atingido. A estimativa combina medições
+  feitas uma de cada vez como erros independentes — suposição declarada.
+- Ajustes de contrato que a suíte apanhou: o IR passou a aceitar F16 como
+  storage de matriz (vetores seguem F32), e `nexa_inspect` verifica qualquer
+  matriz densa, não só F32.
+- Validação macOS ARM64/Python 3.14.5: **665 regressões + 110 bootstrap = 775
+  testes, zero falhas e zero skips**. Os novos cobrem Q2 e F16 no codec, kernel
+  e execução, a escala monotônica, bundle com os seis codecs, conjunto de
+  prompts, agregação, teto de qualidade e as rejeições das duas CLIs.
+- Guias: [codecs de peso](NEXALM_CODECS_PESOS.md) e
+  [calibração](NEXALM_CALIBRACAO.md). Checklist: **44 concluídos e 106
+  pendentes**; M6.01b foi dividido preservando grupo e corpus em M6.01d.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1554,7 +1604,13 @@ python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --o
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
 
-# Codec de peso Q3 e escala completa de quatro codecs.
+# Escala completa de codecs de peso e plano por teto de qualidade.
+python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-f16 --matrix-codec f16 --group-size 8 --block-rows 3
+python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3 --tokens 5,7,2 --prompt-label curto --prompt-label longo --group-size 8 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibset.json
+python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibset.json --max-rmse 0.05 --out artifacts/precision/qualidade.json
+python3 -m unittest discover -s tests -p 'test_weight_ladder_regressions.py' -v
+
+# Codec de peso Q3 e escala de quatro codecs.
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q3 --matrix-codec q3 --group-size 8 --block-rows 3
 python3 -m unittest discover -s tests -p 'test_q3_weights_regressions.py' -v
 
@@ -1785,6 +1841,18 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo terceiro incremento acrescenta:
+
+- `runtime/nexapack/format.py`: `Q2_GROUPED` e o encoder/decoder de bits
+  compartilhado com Q3; `runtime/nexapack/bundle.py`: `RAW_F16_MATRIX` e
+  largura densa por codec.
+- `runtime/nexapack/q4.c` e `transformer.c/.h`: kernels Q2 e F16, com
+  `packed_code` genérico e conversão half→float própria.
+- `compiler/model_ir.py`/`model_lowering.py`: F16 como storage de matriz.
+- `tools/nexa_calibrate.py`: conjunto de prompts rotulados e agregação;
+  `compiler/precision_map.py` e `tools/nexa_precision.py`: teto de qualidade.
+- `tests/test_weight_ladder_regressions.py` e ajustes nas suítes existentes.
 
 Vigésimo segundo incremento acrescenta:
 

@@ -92,6 +92,18 @@ NEXA_Q4_API int nexa_causal_gqa_attention_cached(
  * scratch must be disjoint from each other, query, used pointer-table spans,
  * and every active page span. Cache data and tables are never modified.
  */
+/* Dense F16 weight tile, row-major, two bytes per coordinate; same contract
+ * as nexa_f32_matmul. Nonfinite stored values are rejected. */
+NEXA_Q4_API int nexa_f16_matmul(
+    const float *inputs, size_t input_count, size_t batch,
+    const uint8_t *weights, size_t weight_bytes,
+    size_t rows, size_t cols,
+    float *output, size_t output_count);
+
+NEXA_Q4_API int nexa_f16_decode_row(
+    const uint8_t *weights, size_t weight_bytes, size_t cols,
+    float *output, size_t output_count);
+
 /* Dense F32 weight tile of `rows` x `cols`, row-major, matching the packed
  * matmul contract: inputs are batch x cols and outputs batch x rows.
  * Returns NEXA_Q4_INVALID_DATA for nonfinite inputs or weights. */

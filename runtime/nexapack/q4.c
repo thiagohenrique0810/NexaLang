@@ -154,14 +154,21 @@ static int q3_layout(size_t cols, size_t group_size, size_t *groups,
     return NEXA_Q4_OK;
 }
 
-/* Three bits never span more than two bytes, since the shift is at most 7. */
-static int q3_code(const uint8_t *payload, size_t payload_bytes, size_t index) {
-    size_t bit = index * 3, byte = bit >> 3;
+/* Two or three bits never span more than two bytes: the shift is at most 7. */
+static int packed_code(const uint8_t *payload, size_t payload_bytes, size_t index,
+                       unsigned int bits) {
+    size_t bit = index * bits, byte = bit >> 3;
     unsigned int shift = (unsigned int)(bit & 7u);
+    unsigned int mask = (1u << bits) - 1u;
     unsigned int value = payload[byte];
     if (byte + 1 < payload_bytes) value |= (unsigned int)payload[byte + 1] << 8;
-    value = (value >> shift) & 7u;
-    return value < 4u ? (int)value : (int)value - 8;
+    value = (value >> shift) & mask;
+    unsigned int sign = 1u << (bits - 1u);
+    return value < sign ? (int)value : (int)value - (int)(sign << 1u);
+}
+
+static int q3_code(const uint8_t *payload, size_t payload_bytes, size_t index) {
+    return packed_code(payload, payload_bytes, index, 3u);
 }
 
 static int validate_packed_q3(const uint8_t *packed, size_t rows, size_t cols,
@@ -257,6 +264,119 @@ int nexa_q3_matmul(const float *inputs, size_t input_count, size_t batch,
                 size_t valid = cols - start < group_size ? cols - start : group_size;
                 for (size_t i = 0; i < valid; i++) {
                     int value = q3_code(data + 4, group_bytes - 4, i);
+                    sum += (double)input[start + i] * ((double)value * scale);
+                }
+                start += valid;
+            }
+            if (!isfinite(sum) || fabs(sum) > FLT_MAX) return NEXA_Q4_NUMERIC_RANGE;
+            output[item * rows + row] = (float)sum;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
+static int q2_layout(size_t cols, size_t group_size, size_t *groups,
+                     size_t *group_bytes, size_t *row_bytes) {
+    if (!cols || !group_size) return NEXA_Q4_INVALID_ARGUMENT;
+    if (group_size > (SIZE_MAX - 7) / 2) return NEXA_Q4_OVERFLOW;
+    size_t payload = (2 * group_size + 7) / 8;
+    if (payload > SIZE_MAX - 4) return NEXA_Q4_OVERFLOW;
+    *group_bytes = 4 + payload;  /* scale plus two bits per value */
+    *groups = cols / group_size + (cols % group_size != 0);
+    if (!checked_mul(*groups, *group_bytes, row_bytes)) return NEXA_Q4_OVERFLOW;
+    return NEXA_Q4_OK;
+}
+
+static int validate_packed_q2(const uint8_t *packed, size_t rows, size_t cols,
+                              size_t group_size, size_t groups,
+                              size_t group_bytes, size_t row_bytes) {
+    size_t payload_bytes = group_bytes - 4, used_bits = 2 * group_size;
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *record = packed + row * row_bytes;
+        size_t start = 0;
+        for (size_t group = 0; group < groups; group++) {
+            const uint8_t *data = record + group * group_bytes;
+            float scale = load_scale(data);
+            if (!isfinite(scale) || scale < 0.0f) return NEXA_Q4_INVALID_DATA;
+            size_t valid = cols - start < group_size ? cols - start : group_size;
+            for (size_t index = 0; index < group_size; index++) {
+                int value = packed_code(data + 4, payload_bytes, index, 2u);
+                if (value == -2) return NEXA_Q4_INVALID_DATA;  /* reserved */
+                if ((index >= valid || scale == 0.0f) && value != 0)
+                    return NEXA_Q4_INVALID_DATA;
+            }
+            for (size_t bit = used_bits; bit < payload_bytes * 8; bit++) {
+                if ((data[4 + (bit >> 3)] >> (bit & 7u)) & 1u) return NEXA_Q4_INVALID_DATA;
+            }
+            start += valid;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
+int nexa_q2_decode_row(const uint8_t *packed, size_t packed_bytes,
+                       size_t cols, size_t group_size,
+                       float *output, size_t output_count) {
+    if (!packed || !output) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, row_bytes, output_bytes;
+    int status = q2_layout(cols, group_size, &groups, &group_bytes, &row_bytes);
+    if (status) return status;
+    if (!checked_mul(cols, sizeof(float), &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (packed_bytes < row_bytes || output_count < cols) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(packed, row_bytes, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    status = validate_packed_q2(packed, 1, cols, group_size, groups, group_bytes, row_bytes);
+    if (status) return status;
+    size_t start = 0;
+    for (size_t group = 0; group < groups; group++) {
+        const uint8_t *data = packed + group * group_bytes;
+        double scale = (double)load_scale(data);
+        size_t valid = cols - start < group_size ? cols - start : group_size;
+        for (size_t lane = 0; lane < valid; lane++) {
+            double value = (double)packed_code(data + 4, group_bytes - 4, lane, 2u) * scale;
+            if (!isfinite(value) || fabs(value) > FLT_MAX) return NEXA_Q4_NUMERIC_RANGE;
+            output[start + lane] = (float)value;
+        }
+        start += valid;
+    }
+    return NEXA_Q4_OK;
+}
+
+int nexa_q2_matmul(const float *inputs, size_t input_count, size_t batch,
+                   const uint8_t *packed, size_t packed_bytes,
+                   size_t rows, size_t cols, size_t group_size,
+                   float *output, size_t output_count) {
+    if (!inputs || !packed || !output || !rows || !batch)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, row_bytes, total_bytes;
+    size_t input_elements, output_elements, input_bytes, output_bytes;
+    int status = q2_layout(cols, group_size, &groups, &group_bytes, &row_bytes);
+    if (status) return status;
+    if (!checked_mul(rows, row_bytes, &total_bytes) ||
+        !checked_mul(batch, cols, &input_elements) ||
+        !checked_mul(batch, rows, &output_elements) ||
+        !checked_mul(input_elements, sizeof(float), &input_bytes) ||
+        !checked_mul(output_elements, sizeof(float), &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (input_count < input_elements || packed_bytes < total_bytes ||
+        output_count < output_elements) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(inputs, input_bytes, output, output_bytes) ||
+        !disjoint(packed, total_bytes, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    for (size_t i = 0; i < input_elements; i++) {
+        if (!isfinite(inputs[i])) return NEXA_Q4_INVALID_DATA;
+    }
+    status = validate_packed_q2(packed, rows, cols, group_size, groups, group_bytes, row_bytes);
+    if (status) return status;
+    for (size_t item = 0; item < batch; item++) {
+        const float *input = inputs + item * cols;
+        for (size_t row = 0; row < rows; row++) {
+            const uint8_t *record = packed + row * row_bytes;
+            double sum = 0.0;
+            size_t start = 0;
+            for (size_t group = 0; group < groups; group++) {
+                const uint8_t *data = record + group * group_bytes;
+                double scale = (double)load_scale(data);
+                size_t valid = cols - start < group_size ? cols - start : group_size;
+                for (size_t i = 0; i < valid; i++) {
+                    int value = packed_code(data + 4, group_bytes - 4, i, 2u);
                     sum += (double)input[start + i] * ((double)value * scale);
                 }
                 start += valid;

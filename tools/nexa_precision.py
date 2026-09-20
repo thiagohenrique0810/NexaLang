@@ -38,7 +38,9 @@ def main(argv=None):
 
     planner = commands.add_parser("plan", help="Select codecs under a byte budget")
     planner.add_argument("--calibration", required=True, type=Path)
-    planner.add_argument("--budget", required=True, help="Weight byte budget, e.g. 64MiB")
+    planner.add_argument("--budget", help="Weight byte budget, e.g. 64MiB")
+    planner.add_argument("--max-rmse", type=float,
+                         help="Estimated logit RMSE ceiling; plans the cheapest map that reaches it")
     planner.add_argument("--out", type=Path, help="Write the precision map here")
 
     shower = commands.add_parser("show", help="Validate a precision map and summarize it")
@@ -46,8 +48,11 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     if args.command == "plan":
+        if (args.budget is None) == (args.max_rmse is None):
+            parser.error("pass exactly one of --budget or --max-rmse")
         report = read_report(args.calibration)
-        precision = select_precision(report, parse_memory_size(args.budget))
+        precision = (select_precision(report, parse_memory_size(args.budget)) if args.budget
+                     else select_precision(report, max_rmse=args.max_rmse))
         encoded = precision.to_json()
         if args.out is not None:
             args.out.parent.mkdir(parents=True, exist_ok=True)

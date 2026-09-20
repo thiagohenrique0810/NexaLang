@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import math
+
 from compiler.calibration import (
     MAX_CALIBRATION_TENSORS, build_variant, logit_delta, quantization_error, row_statistics,
 )
@@ -39,28 +41,54 @@ def token_list(value):
     return tokens
 
 
-def run_model(path, tokens, *, memory_budget, tile_rows):
-    with TransformerSession(path, memory_budget=memory_budget, max_sequence_length=len(tokens),
+def run_model(path, prompts, *, memory_budget, tile_rows):
+    """Run every calibration prompt, returning its logits and digests."""
+    longest = max(len(prompt) for prompt in prompts)
+    outputs, digests = [], []
+    with TransformerSession(path, memory_budget=memory_budget, max_sequence_length=longest,
                             tile_rows=tile_rows) as session:
-        logits = session.prefill(list(tokens))
-        report = session.report()
-    return logits, report
+        for prompt in prompts:
+            outputs.append(session.prefill(list(prompt)))
+            digests.append(session.report()["logits_sha256"])
+            session.reset()
+    return outputs, digests
+
+
+def aggregate(reference, measured, labels):
+    """Per-prompt deltas plus the aggregate the plan actually ranks on.
+
+    The worst prompt is reported next to the mean, because a codec that is
+    fine on average can still break one domain, and a single prompt cannot
+    tell the difference.
+    """
+    per_prompt = [dict(logit_delta(expected, actual), prompt=label)
+                  for expected, actual, label in zip(reference, measured, labels)]
+    count = sum(item["values"] for item in per_prompt)
+    squared = sum(item["rmse"] ** 2 * item["values"] for item in per_prompt)
+    worst = max(per_prompt, key=lambda item: item["rmse"])
+    return {"rmse": math.sqrt(squared / count) if count else 0.0,
+            "max_abs_delta": max(item["max_abs_delta"] for item in per_prompt),
+            "worst_prompt": worst["prompt"], "worst_prompt_rmse": worst["rmse"],
+            "prompts": per_prompt, "positions": sum(item["positions"] for item in per_prompt),
+            "values": count}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path,
                         help="Local Llama Safetensors checkpoint to calibrate")
-    parser.add_argument("--tokens", required=True, type=token_list,
-                        help="Prompt ids used to measure the logit delta")
+    parser.add_argument("--tokens", action="append", dest="prompts", required=True, type=token_list,
+                        help="Prompt ids used to measure the logit delta; repeat for a calibration set")
+    parser.add_argument("--prompt-label", action="append", dest="labels",
+                        help="Name each prompt, in order, to record what the set represents")
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--block-rows", type=int, default=64)
     parser.add_argument("--tile-rows", type=int, default=32)
     parser.add_argument("--memory-budget", default="512MiB")
     parser.add_argument("--tensor", action="append", dest="tensors",
                         help="Measure only these tensors; repeat per tensor")
-    parser.add_argument("--codec", action="append", dest="codecs", choices=("q3", "q4", "q8"),
-                        help="Packed codecs to measure (default: q3, q4 and q8)")
+    parser.add_argument("--codec", action="append", dest="codecs", choices=("q2", "q3", "q4", "q8", "f16"),
+                        help="Codecs to measure against dense (default: q2, q3, q4, q8 and f16)")
     parser.add_argument("--static-only", action="store_true",
                         help="Report distribution and codec error without executing the model")
     parser.add_argument("--work-dir", type=Path, help="Keep intermediate bundles here instead of a temp dir")
@@ -82,7 +110,7 @@ def main(argv=None):
         if len(selected) > MAX_CALIBRATION_TENSORS:
             raise ValueError("Too many tensors requested for one calibration run")
 
-        codecs = tuple(dict.fromkeys(args.codecs or ("q3", "q4", "q8")))
+        codecs = tuple(dict.fromkeys(args.codecs or ("q2", "q3", "q4", "q8", "f16")))
         tensors = []
         for name in selected:
             statistics = row_statistics(source.iter_rows(name))
@@ -94,14 +122,24 @@ def main(argv=None):
                             "dense_bytes": dense_bytes, "statistics": statistics,
                             "codecs": measured})
 
-        report = {"checkpoint": str(checkpoint), "tokens": args.tokens,
+        labels = args.labels or []
+        if len(labels) > len(args.prompts):
+            raise ValueError("More prompt labels than prompts")
+        labels = [*labels, *(f"prompt-{index}" for index in range(len(labels), len(args.prompts)))]
+        if len(set(labels)) != len(labels):
+            raise ValueError("Prompt labels must be unique")
+        report = {"checkpoint": str(checkpoint), "tokens": args.prompts[0],
+                  "calibration_set": [{"label": label, "token_ids": prompt, "tokens": len(prompt)}
+                                      for label, prompt in zip(labels, args.prompts)],
                   "group_size": args.group_size, "tensors": tensors,
                   "measured_codecs": list(codecs), "sensitivity_measured": not args.static_only,
                   "scope": ("static distribution and per-codec round-trip error"
                             if args.static_only else
                             "per-codec error plus the logit delta of packing one tensor at a time"),
                   "quality_measured": False,
-                  "quality_note": "logit deltas on these weights; perplexity needs a trained checkpoint"}
+                  "quality_note": ("logit deltas over this calibration set on these weights; "
+                                   "perplexity needs a trained checkpoint"),
+                  "aggregation": "RMSE pooled over every prompt, with the worst prompt reported"}
 
         def rank(entry):
             """Worst case across measured codecs; the cheapest one bounds it."""
@@ -113,10 +151,9 @@ def main(argv=None):
                 import_llama_checkpoint(checkpoint, dense, group_size=args.group_size,
                                         block_rows=args.block_rows,
                                         tensor_codecs={name: "f32" for name in matrices})
-            reference, dense_report = run_model(dense, args.tokens, memory_budget=args.memory_budget,
-                                                tile_rows=args.tile_rows)
-            report["reference"] = {"codec": "RAW_F32_MATRIX",
-                                   "logits_sha256": dense_report["logits_sha256"]}
+            reference, dense_digests = run_model(dense, args.prompts, memory_budget=args.memory_budget,
+                                                 tile_rows=args.tile_rows)
+            report["reference"] = {"codec": "RAW_F32_MATRIX", "logits_sha256": dense_digests}
             report["all_packed"] = {}
             for codec in codecs:
                 packed = work / f"reference-{codec}"
@@ -124,12 +161,12 @@ def main(argv=None):
                     import_llama_checkpoint(checkpoint, packed, group_size=args.group_size,
                                             block_rows=args.block_rows,
                                             tensor_codecs={name: codec for name in matrices})
-                packed_logits, packed_report = run_model(packed, args.tokens,
-                                                         memory_budget=args.memory_budget,
-                                                         tile_rows=args.tile_rows)
+                packed_logits, packed_digests = run_model(packed, args.prompts,
+                                                          memory_budget=args.memory_budget,
+                                                          tile_rows=args.tile_rows)
                 report["all_packed"][codec] = {
-                    "logits_sha256": packed_report["logits_sha256"],
-                    "sensitivity": logit_delta(reference, packed_logits)}
+                    "logits_sha256": packed_digests,
+                    "sensitivity": aggregate(reference, packed_logits, labels)}
                 with ModelBundleReader(packed) as bundle:
                     sizes = {item["name"]: item["packed_payload_bytes"]
                              for item in bundle.inspect()["tensors"]}
@@ -140,7 +177,7 @@ def main(argv=None):
                         shutil.rmtree(variant)
                     build_variant(dense, packed, name, variant)
                     try:
-                        logits, _ = run_model(variant, args.tokens, memory_budget=args.memory_budget,
+                        logits, _ = run_model(variant, args.prompts, memory_budget=args.memory_budget,
                                               tile_rows=args.tile_rows)
                     finally:
                         if not args.work_dir:
@@ -148,7 +185,7 @@ def main(argv=None):
                     measurement = entry["codecs"][codec]
                     measurement["packed_bytes"] = sizes[name]
                     measurement["saved_bytes"] = entry["dense_bytes"] - sizes[name]
-                    measurement["sensitivity"] = logit_delta(reference, logits)
+                    measurement["sensitivity"] = aggregate(reference, logits, labels)
                     saved = max(measurement["saved_bytes"], 1)
                     # Logit error per byte this codec saves on this tensor: the
                     # ranking a precision map needs, not a quality claim.

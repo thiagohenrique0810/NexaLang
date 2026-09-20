@@ -245,7 +245,7 @@ class Q8CLIRegressions(_DenseFixture):
         self.assertEqual(codecs["model.embed_tokens.weight"], "Q8_GROUPED")
         self.assertEqual(codecs["model.layers.0.mlp.down_proj.weight"], "RAW_F32_MATRIX")
         self.assertEqual(codecs["model.layers.0.mlp.up_proj.weight"], "Q4_GROUPED")
-        for arguments in (("--tensor-codec", "model.embed_tokens.weight=q2"),
+        for arguments in (("--tensor-codec", "model.embed_tokens.weight=q16"),
                           ("--tensor-codec", "model.norm.weight=q8"),
                           ("--tensor-codec", "no-equals-sign"),
                           ("--tensor-codec", "model.embed_tokens.weight=q8", "--matrix-codec", "q4")):

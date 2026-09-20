@@ -154,11 +154,14 @@ class TransformerLoweringRegressions(unittest.TestCase):
         invalid = [{"lm_head.weight": TensorDesc("lm_head.weight", (16, 8))},
                    {name: TensorDesc("wrong", (16, 8))}, {name: TensorDesc(name, (8, 16))},
                    {name: TensorDesc(name, (16, 8), logical_dtype="f16")},
-                   {name: TensorDesc(name, (16, 8), storage_dtype="f16")},
+                   {name: TensorDesc(name, (16, 8), storage_dtype="bf16")},
+                   {"model.norm.weight": TensorDesc("model.norm.weight", (8,), storage_dtype="f16")},
                    {"model.norm.weight": TensorDesc("model.norm.weight", (8,), storage_dtype="q4", storage_nbytes=8)}]
         for storage in invalid:
             with self.subTest(storage=storage), self.assertRaises(ValueError):
                 lower_model(config, 2, weight_storage=storage)
+        # Matrices may be stored half precision; vectors stay dense F32.
+        lower_model(config, 2, weight_storage={name: TensorDesc(name, (16, 8), storage_dtype="f16")})
         with self.assertRaises(ValueError):
             lower_model(tiny(num_hidden_layers=10 ** 12), 1)
 

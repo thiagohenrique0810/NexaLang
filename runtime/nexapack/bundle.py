@@ -27,10 +27,15 @@ from .format import (NexaPackError, NexaPackReader, READ_CHUNK_BYTES,
                      write_grouped_matrix)
 
 # Matrix codecs a bundle may store, with the NexaPack id each one publishes.
-PACKED_CODECS = {"q3": "Q3_GROUPED", "q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
-MATRIX_CODECS = (*PACKED_CODECS, "f32")
-CODEC_BITS = {"Q3_GROUPED": 3, "Q4_GROUPED": 4, "Q8_GROUPED": 8,
-              "RAW_F32_MATRIX": 32, "RAW_F32": 32}
+PACKED_CODECS = {"q2": "Q2_GROUPED", "q3": "Q3_GROUPED",
+                 "q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
+# Dense matrices carry no scale: the stored width is the whole contract.
+DENSE_CODECS = {"f16": "RAW_F16_MATRIX", "f32": "RAW_F32_MATRIX"}
+DENSE_WIDTH = {"RAW_F16_MATRIX": 2, "RAW_F32_MATRIX": 4}
+MATRIX_CODECS = (*PACKED_CODECS, *DENSE_CODECS)
+CODEC_BITS = {"Q2_GROUPED": 2, "Q3_GROUPED": 3, "Q4_GROUPED": 4, "Q8_GROUPED": 8,
+              "RAW_F16_MATRIX": 16, "RAW_F32_MATRIX": 32, "RAW_F32": 32}
+_F16 = struct.Struct("<e")
 
 FORMAT = "NexaModelBundle"
 FORMAT_VERSION = 1
@@ -193,8 +198,9 @@ def _check_dense_blocks(name, entry, shape):
     """Validate that the blocks tile every row exactly once, in order."""
     blocks = entry["blocks"]
     rows, cols = shape
+    width = DENSE_WIDTH[entry["codec"]]
     if (not isinstance(blocks, list) or not 0 < len(blocks) <= MAX_MATRIX_BLOCKS
-            or entry["file_bytes"] != rows * cols * _F32.size):
+            or entry["file_bytes"] != rows * cols * width):
         raise ModelBundleError(f"Invalid RAW_F32 matrix blocks or size: {name}")
     _integer(entry["file_bytes"], "RAW_F32 matrix size", minimum=0, maximum=MAX_RAW_MATRIX_BYTES)
     covered = 0
@@ -209,7 +215,7 @@ def _check_dense_blocks(name, entry, shape):
     if covered != rows:
         raise ModelBundleError(f"RAW_F32 matrix blocks do not cover every row: {name}")
     return tuple({"start_row": block["start_row"], "row_count": block["row_count"],
-                  "sha256": block["sha256"], "bytes": block["row_count"] * cols * _F32.size}
+                  "sha256": block["sha256"], "bytes": block["row_count"] * cols * width}
                  for block in blocks)
 
 
@@ -235,14 +241,15 @@ def _check_q4(path, entry):
         raise
 
 
-def _write_raw_matrix(path, rows, cols, source, block_rows):
+def _write_raw_matrix(path, rows, cols, source, block_rows, width=4):
     """Write a row-major F32 matrix in verified blocks, one row at a time.
 
     Each block carries its own checksum, so a tile read verifies exactly the
     bytes it consumes instead of trusting a whole-file digest.
     """
     _integer(block_rows, "block_rows", minimum=1)
-    total = rows * cols * _F32.size
+    encoder = _F32 if width == 4 else _F16
+    total = rows * cols * width
     _integer(total, "RAW_F32 matrix size", maximum=MAX_RAW_MATRIX_BYTES)
     if (rows + block_rows - 1) // block_rows > MAX_MATRIX_BLOCKS:
         raise ModelBundleError("RAW_F32 matrix exceeds the supported block count")
@@ -262,15 +269,16 @@ def _write_raw_matrix(path, rows, cols, source, block_rows):
                     if consumed == cols:
                         raise ModelBundleError(f"Matrix row {start + offset} exceeds {cols} values")
                     try:
-                        encoded += _F32.pack(float(value))
+                        encoded += encoder.pack(float(value))
                     except (ValueError, TypeError, OverflowError, struct.error) as error:
-                        raise ModelBundleError("Matrix values must fit finite float32") from error
+                        raise ModelBundleError("Matrix values must fit the stored float width") from error
                     consumed += 1
                 if consumed != cols:
                     raise ModelBundleError(f"Matrix row {start + offset} has {consumed} of {cols} values")
-                for value, in struct.iter_unpack("<f", encoded):
+                for value, in encoder.iter_unpack(bytes(encoded)):
+                    # float16 overflows to inf well inside the float32 range.
                     if not math.isfinite(value):
-                        raise ModelBundleError("Matrix values must be finite")
+                        raise ModelBundleError("Matrix values must be finite in the stored width")
                 stream.write(encoded)
                 digest.update(encoded)
             blocks.append({"start_row": start, "row_count": count, "sha256": digest.hexdigest()})
@@ -412,10 +420,13 @@ def write_model_bundle(destination, config: ModelConfig, tensor_sources: Mapping
         tensors = {}
         for index, (name, shape) in enumerate(sorted(shapes.items())):
             source = tensor_sources[name]()
-            if len(shape) == 2 and codecs.get(name, "q4") == "f32":
-                relative = f"tensors/{index:04d}.f32"
-                blocks, total = _write_raw_matrix(staging / relative, shape[0], shape[1], source, block_rows)
-                tensors[name] = {"shape": list(shape), "codec": "RAW_F32_MATRIX", "codec_version": 1,
+            if len(shape) == 2 and codecs.get(name, "q4") in DENSE_CODECS:
+                choice = codecs[name]
+                relative = f"tensors/{index:04d}.{choice}"
+                width = 4 if choice == "f32" else 2
+                blocks, total = _write_raw_matrix(staging / relative, shape[0], shape[1],
+                                                  source, block_rows, width)
+                tensors[name] = {"shape": list(shape), "codec": DENSE_CODECS[choice], "codec_version": 1,
                                  "path": relative, "file_bytes": total, "blocks": blocks}
             elif len(shape) == 2:
                 relative = f"tensors/{index:04d}.nxp"
@@ -535,13 +546,14 @@ class ModelBundleReader:
 
         for name, shape in shapes.items():
             entry = tensors[name]
-            dense = len(shape) == 2 and isinstance(entry, dict) and entry.get("codec") == "RAW_F32_MATRIX"
+            dense = (len(shape) == 2 and isinstance(entry, dict)
+                     and entry.get("codec") in DENSE_CODECS.values())
             checksum_key = "blocks" if dense else ("metadata_sha256" if len(shape) == 2 else "sha256")
             _keys(entry, {"shape", "codec", "codec_version", "path", "file_bytes", checksum_key}, "tensor entry")
             if (not isinstance(entry["shape"], list) or any(type(v) is not int for v in entry["shape"])
                     or entry["shape"] != list(shape)):
                 raise ModelBundleError(f"Tensor shape mismatch: {name}")
-            allowed = ({"RAW_F32_MATRIX"} if dense else set(PACKED_CODECS.values())) if len(shape) == 2 else {"RAW_F32"}
+            allowed = (set(DENSE_CODECS.values()) if dense else set(PACKED_CODECS.values())) if len(shape) == 2 else {"RAW_F32"}
             if entry["codec"] not in allowed or type(entry["codec_version"]) is not int or entry["codec_version"] != 1:
                 raise ModelBundleError(f"Unsupported tensor codec: {name}")
             if not dense:
@@ -652,8 +664,8 @@ class ModelBundleReader:
     def matrix_blocks(self, name):
         """Read-verified tiles of a dense F32 matrix, in row order."""
         entry = self._entry(name)
-        if entry["codec"] != "RAW_F32_MATRIX":
-            raise ModelBundleError(f"Tensor is not a dense F32 matrix: {name}")
+        if entry["codec"] not in DENSE_CODECS.values():
+            raise ModelBundleError(f"Tensor is not a dense matrix: {name}")
         return self._matrix_blocks[name]
 
     def read_matrix_block_into(self, name, block_index, destination):
@@ -675,7 +687,7 @@ class ModelBundleReader:
         entry = self._entry(name)
         path = _confined_file(self._directory, entry["path"])
         cols = entry["shape"][1]
-        offset = block["start_row"] * cols * _F32.size
+        offset = block["start_row"] * cols * DENSE_WIDTH[entry["codec"]]
         digest = hashlib.sha256()
         with path.open("rb", buffering=0) as stream:
             if os.fstat(stream.fileno()).st_size != entry["file_bytes"]:
@@ -692,9 +704,9 @@ class ModelBundleReader:
                     filled += count
                 chunk = view[consumed:end]
                 digest.update(chunk)
-                for value, in struct.iter_unpack("<f", chunk):
+                for value, in (_F32 if DENSE_WIDTH[entry["codec"]] == 4 else _F16).iter_unpack(bytes(chunk)):
                     if not math.isfinite(value):
-                        raise ModelBundleError(f"Nonfinite float32 matrix: {name}")
+                        raise ModelBundleError(f"Nonfinite float matrix: {name}")
                 consumed = end
         if digest.hexdigest() != block["sha256"]:
             raise ModelBundleError(f"Matrix block checksum mismatch: {name}")

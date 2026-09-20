@@ -1,4 +1,4 @@
-# Codecs de peso por tensor: Q3, Q4, Q8 e matrizes RAW_F32
+# Codecs de peso por tensor: Q2, Q3, Q4, Q8, F16 e F32
 
 O décimo sétimo incremento acrescenta o **segundo codec de peso** e o despacho
 por tensor no executor. Até aqui toda matriz era Q4 e o executor só sabia
@@ -48,6 +48,40 @@ escolha, e uma regressão fixa esse comportamento com os dois tamanhos de grupo.
 Medição na fixture com `G = 8`, modelo inteiro num codec só, contra a referência
 densa: RMSE de logits 0,686 (Q3), 0,447 (Q4) e 0,017 (Q8), com payload crescendo
 na ordem inversa. Os quatro codecs convivem no mesmo bundle.
+
+## Q2_GROUPED e RAW_F16_MATRIX
+
+O vigésimo terceiro incremento fecha a escala nas duas pontas.
+
+**Q2_GROUPED** guarda dois bits por valor: códigos ternários `-1`, `0` e `1`
+com `escala = max|v|` e `-2` reservado. É o codec mais grosseiro que o runtime
+executa, e o mais barato.
+
+**RAW_F16_MATRIX** é denso, sem escala: dois bytes por valor em IEEE binary16,
+com blocos e checksums como o denso F32. O kernel converte half para float sem
+depender de `_Float16` do compilador, e rejeita valores não finitos guardados —
+o intervalo do half é bem menor que o do float32, então um peso grande demais
+vira infinito na escrita em vez de silenciosamente saturar na leitura.
+
+A escala completa, medida num modelo sintético de duas camadas com grupo 8,
+cada linha com **todos** os pesos no mesmo codec:
+
+| Codec | Payload | Erro máximo nos logits |
+| --- | ---: | ---: |
+| Q2 | 3.512 B | 1,397 |
+| Q3 | 4.044 B | 0,556 |
+| Q4 | 4.576 B | 0,184 |
+| Q8 | 6.704 B | 0,012 |
+| F16 | 8.832 B | 0,002 |
+| F32 | 17.344 B | 0 |
+
+Bytes e erro são monotônicos, o que é exatamente o que um plano por degraus
+precisa. Um bundle pode misturar os seis.
+
+Um detalhe que aparece na prática: quando os pesos já são exatos em half — como
+na fixture de checkpoint, cujos valores são múltiplos de 1/16 — o F16 reproduz
+os logits **bit a bit** e sua sensibilidade medida é zero. Isso é propriedade do
+peso, não do codec, e a regressão registra o caso em vez de exigir diferença.
 
 ## Formato
 
@@ -118,8 +152,7 @@ O embedding denso lê um bloco inteiro por token alcançado, então um bloco gra
 custa I/O mesmo para um único token. Para prompts longos com vocabulário grande,
 prefira Q4 no embedding ou blocos menores.
 
-Q2 e RAW-F16 de **pesos** continuam pendentes em M1.05d, assim como o despacho
-de atenção para os demais layouts (M4.03d). A calibração mede e o PrecisionMap
-planeja com os três codecs empacotados mais o denso; cada codec novo acrescenta
-um degrau sem mudar o contrato do mapa. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
+O despacho de atenção para os demais layouts do **KV** continua pendente em
+M4.03d — esta escala é de pesos. A calibração mede e o PrecisionMap planeja com
+os cinco codecs mais o denso de referência. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
 registra a suíte, os comandos e a próxima tarefa.

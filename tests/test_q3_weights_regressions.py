@@ -221,7 +221,7 @@ class Q3CLIRegressions(_DenseFixture):
                       "--group-size", "8", "--block-rows", "3", "--tile-rows", "3",
                       "--memory-budget", "8MiB", "--report", str(report))
         measured = json.loads(report.read_text())
-        self.assertEqual(measured["measured_codecs"], ["q3", "q4", "q8"])
+        self.assertEqual(measured["measured_codecs"], ["q2", "q3", "q4", "q8", "f16"])
         # Coarser codecs move the logits more, whole model at a time.
         self.assertGreater(measured["all_packed"]["q3"]["sensitivity"]["rmse"],
                            measured["all_packed"]["q4"]["sensitivity"]["rmse"])
@@ -231,7 +231,7 @@ class Q3CLIRegressions(_DenseFixture):
         planned = self.run_tool("nexa_precision.py", "plan", "--calibration", str(report),
                                 "--budget", "900B", "--out", str(plan))
         self.assertLessEqual(planned["provenance"]["planned_bytes"], 900)
-        self.assertTrue(set(planned["codecs"].values()) <= {"q3", "q4", "q8", "f32"})
+        self.assertTrue(set(planned["codecs"].values()) <= {"q2", "q3", "q4", "q8", "f16", "f32"})
         bundle = self.directory / "planned"
         converted = self.run_tool("nexa_convert.py", "--checkpoint", str(self.checkpoint), "--out",
                                   str(bundle), "--precision-map", str(plan),

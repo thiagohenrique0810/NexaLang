@@ -36,7 +36,7 @@ def lower_model(config: ModelConfig, sequence_length: int, *, weight_storage=Non
         if (not isinstance(tensor, TensorDesc) or tensor.name != name or tensor.shape != shape
                 or tensor.logical_dtype != DType.F32):
             raise ValueError(f"weight_storage descriptor does not match {name}")
-        allowed = (DType.F32, DType.Q4) if len(shape) == 2 else (DType.F32,)
+        allowed = (DType.F32, DType.F16, DType.Q4) if len(shape) == 2 else (DType.F32,)
         if tensor.storage_dtype not in allowed:
             raise ValueError(f"unsupported physical storage for {name}")
         tensors.append(tensor)

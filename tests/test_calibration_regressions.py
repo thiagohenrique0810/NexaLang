@@ -52,7 +52,7 @@ class CalibrationMetricRegressions(unittest.TestCase):
         for group_size in (0, -1, 1.0, True):
             with self.assertRaises(ValueError):
                 quantization_error([[1.0, 2.0]], group_size)
-        for codec in ("q2", "f32", None):
+        for codec in ("q16", "f64", None):
             with self.subTest(codec=codec), self.assertRaises(ValueError):
                 quantization_error([[1.0, 2.0]], 2, codec)
         with self.assertRaises(ValueError):
@@ -163,14 +163,14 @@ class CalibrationCLIRegressions(_DenseFixture):
         self.assertFalse(report["sensitivity_measured"])
         self.assertFalse(report["quality_measured"])
         self.assertNotIn("reference", report)
-        self.assertEqual(report["measured_codecs"], ["q3", "q4", "q8"])
+        self.assertEqual(report["measured_codecs"], ["q2", "q3", "q4", "q8", "f16"])
         errors = [max(codec["quantization"]["relative_rmse"] for codec in tensor["codecs"].values())
                   for tensor in report["tensors"]]
         self.assertEqual(errors, sorted(errors, reverse=True))
         for tensor in report["tensors"]:
             self.assertGreater(tensor["dense_bytes"], 0)
             self.assertIn("outlier_ratio", tensor["statistics"])
-            self.assertEqual(set(tensor["codecs"]), {"q3", "q4", "q8"})
+            self.assertEqual(set(tensor["codecs"]), {"q2", "q3", "q4", "q8", "f16"})
             for codec, measured in tensor["codecs"].items():
                 self.assertNotIn("sensitivity", measured)
             # More levels always mean a smaller round-trip error.
@@ -178,6 +178,10 @@ class CalibrationCLIRegressions(_DenseFixture):
                             tensor["codecs"]["q4"]["quantization"]["rmse"])
             self.assertLess(tensor["codecs"]["q4"]["quantization"]["rmse"],
                             tensor["codecs"]["q3"]["quantization"]["rmse"])
+            self.assertLess(tensor["codecs"]["q3"]["quantization"]["rmse"],
+                            tensor["codecs"]["q2"]["quantization"]["rmse"])
+            self.assertLess(tensor["codecs"]["f16"]["quantization"]["rmse"],
+                            tensor["codecs"]["q8"]["quantization"]["rmse"])
 
     def test_sensitivity_pass_measures_each_tensor_and_codec(self):
         names = ["model.embed_tokens.weight", "model.layers.0.mlp.down_proj.weight"]
@@ -190,10 +194,17 @@ class CalibrationCLIRegressions(_DenseFixture):
         worst = [max(codec["sensitivity"]["rmse"] for codec in tensor["codecs"].values())
                  for tensor in report["tensors"]]
         self.assertEqual(worst, sorted(worst, reverse=True))
-        self.assertEqual(set(report["all_packed"]), {"q3", "q4", "q8"})
+        self.assertEqual(set(report["all_packed"]), {"q2", "q3", "q4", "q8", "f16"})
         for codec, summary in report["all_packed"].items():
-            self.assertNotEqual(report["reference"]["logits_sha256"], summary["logits_sha256"])
-            self.assertGreater(summary["sensitivity"]["rmse"], 0.0)
+            with self.subTest(codec=codec):
+                self.assertGreaterEqual(summary["sensitivity"]["rmse"], 0.0)
+                if codec != "f16":
+                    self.assertNotEqual(report["reference"]["logits_sha256"], summary["logits_sha256"])
+                    self.assertGreater(summary["sensitivity"]["rmse"], 0.0)
+        # This checkpoint's weights are exact in half precision, so f16 may
+        # reproduce the reference bit for bit; a coarse codec never does.
+        self.assertLessEqual(report["all_packed"]["f16"]["sensitivity"]["rmse"],
+                             report["all_packed"]["q8"]["sensitivity"]["rmse"])
         # The whole model in Q8 moves the logits less than the whole in Q4.
         self.assertLess(report["all_packed"]["q8"]["sensitivity"]["rmse"],
                         report["all_packed"]["q4"]["sensitivity"]["rmse"])
@@ -202,7 +213,7 @@ class CalibrationCLIRegressions(_DenseFixture):
                 self.assertGreater(measured["packed_bytes"], 0)
                 self.assertEqual(measured["saved_bytes"],
                                  tensor["dense_bytes"] - measured["packed_bytes"])
-                self.assertGreater(measured["cost_per_saved_kib"], 0.0)
+                self.assertGreaterEqual(measured["cost_per_saved_kib"], 0.0)
             self.assertLess(tensor["codecs"]["q8"]["sensitivity"]["rmse"],
                             tensor["codecs"]["q4"]["sensitivity"]["rmse"])
 

@@ -53,6 +53,9 @@ class OpKind(str, Enum):
 
 
 _PACKED_BITS = {DType.Q2: 2, DType.Q3: 3, DType.Q4: 4}
+# Weight storage a kernel can consume directly: dense float widths, or the
+# packed codecs whose layout the runtime dispatches per tensor.
+_WEIGHT_STORAGE = frozenset({DType.F32, DType.F16, DType.Q4})
 _ITEM_BYTES = {
     DType.BOOL: 1, DType.F16: 2, DType.BF16: 2, DType.F32: 4,
     DType.F64: 8, DType.I8: 1, DType.U8: 1, DType.I16: 2,
@@ -271,8 +274,9 @@ def _validate_operation(op, inputs, result):
         _rank((weight, result), 2, label)
         if tokens.logical_dtype != DType.U32 or tokens.storage_dtype != DType.U32:
             raise ValueError(f"{label}: token IDs must be dense U32")
-        if weight.logical_dtype != DType.F32 or weight.storage_dtype not in (DType.F32, DType.Q4):
-            raise ValueError(f"{label}: embedding weights must have F32 logical values and F32/Q4 storage")
+        if weight.logical_dtype != DType.F32 or weight.storage_dtype not in _WEIGHT_STORAGE:
+            raise ValueError(f"{label}: embedding weights must have F32 logical values "
+                             f"and one of {sorted(item.value for item in _WEIGHT_STORAGE)} storage")
         _dense_f32((result,), label)
         if result.shape != (tokens.shape[0], weight.shape[1]):
             raise ValueError(f"{label}: incompatible Embedding shapes")

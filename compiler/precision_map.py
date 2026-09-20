@@ -19,7 +19,7 @@ from types import MappingProxyType
 
 SCHEMA_VERSION = 1
 POLICY_ID = "GREEDY_SENSITIVITY_PER_BYTE_V2"
-CODECS = ("q3", "q4", "q8", "f32")
+CODECS = ("q2", "q3", "q4", "q8", "f16", "f32")
 MAX_MAP_TENSORS = 4096
 
 
@@ -109,6 +109,7 @@ def _options(name, entry):
     for codec, item in measured.items():
         if codec not in CODECS or codec == "f32":
             raise ValueError(f"Unsupported measured codec for {name}: {codec!r}")
+        # f32 is the reference itself and is appended below, never measured.
         size = item.get("packed_bytes")
         if type(size) is not int or size <= 0:
             raise ValueError(f"Calibration report lacks a valid packed_bytes for {name}/{codec}")
@@ -135,28 +136,49 @@ def _measured(report):
             for entry in tensors}
 
 
-def select_precision(report, budget_bytes):
-    """Choose a codec per tensor under a byte budget, from measured error.
+def _estimated_rmse(rows, chosen):
+    """Root-sum-square of the chosen codecs' measured errors.
 
-    Every tensor starts at its cheapest measured codec. While budget remains,
-    the upgrade with the best avoided error per extra byte is applied, anywhere
-    in the model; a tensor can climb more than one step, and a step that buys
-    no accuracy is never taken.
-
-    The selection is greedy over a ratio, so it is a heuristic, not an optimum.
-    The estimate also assumes errors add, which they do not: it ranks plans, it
-    does not certify quality.
+    Errors from different tensors are combined as if independent, which is an
+    assumption, not a measurement: use it to compare plans, never as a quality
+    figure for the model.
     """
-    if type(budget_bytes) is not int or budget_bytes < 0:
+    return math.sqrt(sum(rows[name][index]["sensitivity"] ** 2 for name, index in chosen.items()))
+
+
+def select_precision(report, budget_bytes=None, *, max_rmse=None):
+    """Choose a codec per tensor, bounded by bytes or by estimated error.
+
+    Every tensor starts at its cheapest measured codec. The upgrade with the
+    best avoided error per extra byte is applied repeatedly, anywhere in the
+    model; a tensor can climb more than one step, and a step that buys no
+    accuracy is never taken.
+
+    With `budget_bytes`, upgrades stop when the budget runs out. With
+    `max_rmse`, they stop as soon as the estimated error falls to the ceiling,
+    which yields the cheapest plan this heuristic reaches for that quality.
+
+    The selection is greedy over a ratio, so it is a heuristic, not an optimum,
+    and the error estimate combines measurements that were taken one tensor at
+    a time. It ranks plans; it does not certify quality.
+    """
+    if (budget_bytes is None) == (max_rmse is None):
+        raise ValueError("Pass exactly one of budget_bytes or max_rmse")
+    if budget_bytes is not None and (type(budget_bytes) is not int or budget_bytes < 0):
         raise ValueError("budget_bytes must be a non-negative integer")
+    if max_rmse is not None and (not isinstance(max_rmse, (int, float)) or isinstance(max_rmse, bool)
+                                 or not math.isfinite(max_rmse) or max_rmse < 0):
+        raise ValueError("max_rmse must be a finite non-negative number")
     rows = _measured(report)
     baseline = sum(options[0]["bytes"] for options in rows.values())
-    if baseline > budget_bytes:
+    if budget_bytes is not None and baseline > budget_bytes:
         raise ValueError(f"Budget {budget_bytes} is below {baseline} bytes at the cheapest codecs")
     chosen = {name: 0 for name in rows}
-    remaining = budget_bytes - baseline
+    remaining = math.inf if budget_bytes is None else budget_bytes - baseline
     upgrades = []
     while True:
+        if max_rmse is not None and _estimated_rmse(rows, chosen) <= max_rmse:
+            break
         best = None
         for name in sorted(rows):
             options = rows[name]
@@ -179,15 +201,20 @@ def select_precision(report, budget_bytes):
             break
         _, name, index, extra, avoided, codec = best
         chosen[name] = index
-        remaining -= max(extra, 0)
+        remaining -= max(extra, 0) if remaining != math.inf else 0
         upgrades.append({"tensor": name, "codec": codec, "extra_bytes": max(extra, 0),
                          "avoided_rmse": avoided})
     codecs = {name: rows[name][index]["codec"] for name, index in chosen.items()}
+    planned = sum(rows[name][index]["bytes"] for name, index in chosen.items())
+    estimate = _estimated_rmse(rows, chosen)
     provenance = {
-        "policy": POLICY_ID, "budget_bytes": budget_bytes,
+        "policy": POLICY_ID, "budget_bytes": budget_bytes, "max_rmse": max_rmse,
+        "bound": "bytes" if budget_bytes is not None else "estimated_rmse",
         "cheapest_baseline_bytes": baseline,
-        "planned_bytes": budget_bytes - remaining,
-        "unused_budget_bytes": remaining,
+        "planned_bytes": planned,
+        "unused_budget_bytes": (budget_bytes - planned) if budget_bytes is not None else None,
+        "estimated_rmse": estimate,
+        "meets_max_rmse": None if max_rmse is None else estimate <= max_rmse,
         "checkpoint": report.get("checkpoint"),
         "calibration_tokens": report.get("tokens"),
         "group_size": report.get("group_size"),
@@ -195,8 +222,8 @@ def select_precision(report, budget_bytes):
         "codec_counts": {codec: sum(value == codec for value in codecs.values()) for codec in CODECS},
         "upgrades": upgrades,
         "estimated_avoided_rmse_sum": sum(item["avoided_rmse"] for item in upgrades),
-        "estimate_scope": ("sum of individually measured logit RMSE; errors do not add, "
-                           "so this ranks plans and does not predict combined quality"),
+        "estimate_scope": ("individually measured logit RMSE, combined as independent errors; "
+                           "this ranks plans and does not predict combined quality"),
         "quality_measured": False,
     }
     return PrecisionMap(codecs, provenance)

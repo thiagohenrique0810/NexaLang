@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from runtime.nexapack.bundle import ModelBundleReader
+from runtime.nexapack.bundle import DENSE_CODECS, ModelBundleReader
 from runtime.nexapack.format import NexaPackReader
 
 
@@ -53,7 +53,7 @@ def inspect_artifact(path, *, verify=False):
             codecs = {item["name"]: item["codec"] for item in result["tensors"]}
             if verify:
                 for name, shape in bundle.config.required_tensor_shapes().items():
-                    if codecs[name] == "RAW_F32_MATRIX":
+                    if codecs[name] in DENSE_CODECS.values():
                         # Verify each stored block, which is the unit the
                         # executor reads and the unit a checksum covers.
                         for index, block in enumerate(bundle.matrix_blocks(name)):

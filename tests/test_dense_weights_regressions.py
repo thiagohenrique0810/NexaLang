@@ -201,7 +201,7 @@ class DenseWeightRegressions(_DenseFixture):
         config = self.config()
         values = self.exact_weights(config)
         for codecs in ({"model.norm.weight": "q4"}, {"missing.tensor": "f32"},
-                       {"model.embed_tokens.weight": "q2"}, {"model.embed_tokens.weight": None}):
+                       {"model.embed_tokens.weight": "q16"}, {"model.embed_tokens.weight": None}):
             with self.subTest(codecs=sorted(codecs)), self.assertRaises(ModelBundleError):
                 self.write(self.directory / f"invalid-{abs(hash(str(codecs)))}", config, values, codecs=codecs)
 

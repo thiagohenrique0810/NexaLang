@@ -27,7 +27,10 @@ ALIGNMENT = 64
 # Matmul and single-row decode kernels for each packed weight codec.
 _PACKED_KERNELS = {"Q4_GROUPED": ("nexa_q4_matmul", "nexa_q4_decode_row"),
                    "Q8_GROUPED": ("nexa_q8_matmul", "nexa_q8_decode_row"),
-                   "Q3_GROUPED": ("nexa_q3_matmul", "nexa_q3_decode_row")}
+                   "Q3_GROUPED": ("nexa_q3_matmul", "nexa_q3_decode_row"),
+                   "Q2_GROUPED": ("nexa_q2_matmul", "nexa_q2_decode_row")}
+# Dense matrices: the stored width decides the kernel and the row copy.
+_DENSE_WIDTH = {"RAW_F32_MATRIX": 4, "RAW_F16_MATRIX": 2}
 
 
 @lru_cache(maxsize=1)
@@ -45,6 +48,10 @@ def _load_kernels():
         "nexa_q8_decode_row": [bp, sz, sz, sz, fp, sz],
         "nexa_q3_matmul": [fp, sz, sz, bp, sz, sz, sz, sz, fp, sz],
         "nexa_q3_decode_row": [bp, sz, sz, sz, fp, sz],
+        "nexa_q2_matmul": [fp, sz, sz, bp, sz, sz, sz, sz, fp, sz],
+        "nexa_q2_decode_row": [bp, sz, sz, sz, fp, sz],
+        "nexa_f16_matmul": [fp, sz, sz, bp, sz, sz, sz, fp, sz],
+        "nexa_f16_decode_row": [bp, sz, sz, fp, sz],
         "nexa_q4_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_q3_quantize": [fp, sz, sz, sz, sz, bp, sz],
         "nexa_rmsnorm": [fp, sz, fp, sz, sz, sz, dbl, fp, sz],
@@ -115,14 +122,16 @@ class TransformerSession:
             self._storage = {}
             self._matrix_layouts = {}
             self._dense_matrices = set()
+            self._dense_widths = {}
             self._packed_kernels = {}
             for item in summary["tensors"]:
                 name, shape = item["name"], tuple(item["shape"])
                 q4 = item["codec"] in _PACKED_KERNELS
-                dense = item["codec"] == "RAW_F32_MATRIX"
+                dense = item["codec"] in _DENSE_WIDTH
                 if q4:
                     self._packed_kernels[name] = _PACKED_KERNELS[item["codec"]]
-                self._storage[name] = TensorDesc(name, shape, storage_dtype="q4" if q4 else "f32",
+                storage = "q4" if q4 else ("f16" if item["codec"] == "RAW_F16_MATRIX" else "f32")
+                self._storage[name] = TensorDesc(name, shape, storage_dtype=storage,
                                                  storage_nbytes=item["packed_payload_bytes"])
                 if q4:
                     row_bytes = item["packed_payload_bytes"] // shape[0]
@@ -134,12 +143,14 @@ class TransformerSession:
                     # A dense matrix is verified per stored block, so the block
                     # the writer chose is also the tile this reader consumes.
                     blocks = self._bundle.matrix_blocks(name)
-                    row_bytes = shape[1] * 4
+                    width = _DENSE_WIDTH[item["codec"]]
+                    self._dense_matrices.add(name)
+                    self._dense_widths[name] = width
+                    row_bytes = shape[1] * width
                     rows = max(block["row_count"] for block in blocks)
                     if rows * row_bytes > MAX_READ_BYTES:
                         raise ValueError("Dense weight block exceeds the reader limit; convert with fewer block_rows")
                     self._matrix_layouts[name] = (rows, row_bytes)
-                    self._dense_matrices.add(name)
             self._weights_bytes = summary["packed_payload_bytes"]
             manifest = json.dumps(self._bundle.manifest, sort_keys=True, separators=(",", ":"))
             self._manifest_sha256 = hashlib.sha256(manifest.encode()).hexdigest()
@@ -320,18 +331,30 @@ class TransformerSession:
                         weight_name, index, packed_view[:size])
                     read_seconds += time.perf_counter() - tick
                     io["packed_bytes_consumed"] += size
-                    weights = (ctypes.c_float * (count * cols)).from_address(ctypes.addressof(packed))
+                    width = self._dense_widths[weight_name]
                     if kind == "Embedding":
                         for position, token in enumerate(tokens):
                             if not block["start_row"] <= token < block["start_row"] + count:
                                 continue
-                            ctypes.memmove(ctypes.addressof(out) + position * cols * 4,
-                                           ctypes.addressof(packed) + (token - block["start_row"]) * cols * 4,
-                                           cols * 4)
+                            row_offset = (token - block["start_row"]) * cols * width
+                            target = (ctypes.c_float * cols).from_address(
+                                ctypes.addressof(out) + position * cols * 4)
+                            if width == 4:
+                                ctypes.memmove(target, ctypes.addressof(packed) + row_offset, cols * 4)
+                            else:
+                                row = (ctypes.c_uint8 * (cols * width)).from_address(
+                                    ctypes.addressof(packed) + row_offset)
+                                call("nexa_f16_decode_row", row, len(row), cols, target, cols)
                             io["embedding_rows_read"] += 1
                         continue
-                    call("nexa_f32_matmul", left, len(left), length, weights, len(weights),
-                         count, cols, tile_output, length * count)
+                    if width == 4:
+                        weights = (ctypes.c_float * (count * cols)).from_address(ctypes.addressof(packed))
+                        call("nexa_f32_matmul", left, len(left), length, weights, len(weights),
+                             count, cols, tile_output, length * count)
+                    else:
+                        weights = (ctypes.c_uint8 * size).from_address(ctypes.addressof(packed))
+                        call("nexa_f16_matmul", left, len(left), length, weights, len(weights),
+                             count, cols, tile_output, length * count)
                     for row in range(length):
                         ctypes.memmove(ctypes.addressof(out) + (row * rows + block["start_row"]) * 4,
                                        ctypes.addressof(tile_output) + row * count * 4, count * 4)

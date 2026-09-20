@@ -59,7 +59,7 @@ class PrecisionSelectionRegressions(unittest.TestCase):
         precision = select_precision(LADDER, 300)
         self.assertEqual(dict(precision.codecs), {"alpha": "q8", "beta": "q4"})
         self.assertEqual(precision.provenance["codec_counts"],
-                         {"q3": 0, "q4": 1, "q8": 1, "f32": 0})
+                         {"q2": 0, "q3": 0, "q4": 1, "q8": 1, "f16": 0, "f32": 0})
         self.assertEqual([item["codec"] for item in precision.provenance["upgrades"]], ["q8"])
         # Room for alpha's q8 step and beta's jump straight to dense.
         precision = select_precision(LADDER, 600)
@@ -150,9 +150,55 @@ class PrecisionSelectionRegressions(unittest.TestCase):
     def test_reports_state_that_the_estimate_is_not_a_quality_claim(self):
         precision = select_precision(REPORT, 1300)
         self.assertFalse(precision.provenance["quality_measured"])
-        self.assertIn("errors do not add", precision.provenance["estimate_scope"])
+        self.assertIn("combined as independent errors", precision.provenance["estimate_scope"])
+        self.assertIn("does not predict combined quality", precision.provenance["estimate_scope"])
         self.assertEqual(precision.provenance["policy"], POLICY_ID)
         self.assertEqual(precision.provenance["calibration_tokens"], [1, 3])
+
+
+class QualityCeilingRegressions(unittest.TestCase):
+    def test_a_ceiling_buys_only_what_it_needs(self):
+        # Two tensors, so the estimate combines them as independent errors.
+        report = calibration([
+            ("alpha", 800, {"q4": (100, 0.30), "q8": (200, 0.05)}),
+            ("beta", 800, {"q4": (100, 0.40), "q8": (200, 0.10)}),
+        ], measured=("q4", "q8"))
+        loose = select_precision(report, max_rmse=1.0)
+        self.assertEqual(set(loose.codecs.values()), {"q4"})
+        self.assertEqual(loose.provenance["planned_bytes"], 200)
+        self.assertAlmostEqual(loose.provenance["estimated_rmse"], 0.5)
+        self.assertTrue(loose.provenance["meets_max_rmse"])
+        tighter = select_precision(report, max_rmse=0.2)
+        self.assertEqual(set(tighter.codecs.values()), {"q8"})
+        self.assertLessEqual(tighter.provenance["estimated_rmse"], 0.2)
+        exact = select_precision(report, max_rmse=0.0)
+        self.assertEqual(set(exact.codecs.values()), {"f32"})
+        self.assertEqual(exact.provenance["estimated_rmse"], 0.0)
+
+    def test_the_cheapest_plan_that_reaches_a_ceiling_is_kept(self):
+        report = calibration([
+            ("alpha", 900, {"q4": (100, 0.50), "q8": (200, 0.02)}),
+            ("beta", 900, {"q4": (100, 0.03), "q8": (800, 0.01)}),
+        ], measured=("q4", "q8"))
+        plan = select_precision(report, max_rmse=0.05)
+        # Only alpha needed upgrading: beta already sat under the ceiling.
+        self.assertEqual(plan.codecs, {"alpha": "q8", "beta": "q4"})
+        self.assertEqual(plan.provenance["planned_bytes"], 300)
+        self.assertEqual(plan.provenance["bound"], "estimated_rmse")
+        self.assertIsNone(plan.provenance["unused_budget_bytes"])
+
+    def test_the_two_bounds_are_mutually_exclusive_and_validated(self):
+        for arguments in ({}, {"budget_bytes": 1000, "max_rmse": 0.1}):
+            with self.subTest(arguments=sorted(arguments)), self.assertRaises(ValueError):
+                select_precision(REPORT, **arguments)
+        for ceiling in (-0.1, float("nan"), float("inf"), True, "0.1"):
+            with self.subTest(ceiling=ceiling), self.assertRaises(ValueError):
+                select_precision(REPORT, max_rmse=ceiling)
+        byte_bound = select_precision(REPORT, 1300)
+        self.assertEqual(byte_bound.provenance["bound"], "bytes")
+        self.assertIsNone(byte_bound.provenance["max_rmse"])
+        self.assertIsNone(byte_bound.provenance["meets_max_rmse"])
+        self.assertGreater(byte_bound.provenance["estimated_rmse"], 0.0)
 
 
 class PrecisionMapContractRegressions(unittest.TestCase):
@@ -173,7 +219,7 @@ class PrecisionMapContractRegressions(unittest.TestCase):
             mutate(data)
             with self.subTest(data=sorted(data)), self.assertRaises(ValueError):
                 PrecisionMap.from_dict(data)
-        for codecs in ({}, {"a": "q2"}, {"": "q4"}, {"a": None}):
+        for codecs in ({}, {"a": "q16"}, {"": "q4"}, {"a": None}):
             with self.subTest(codecs=codecs), self.assertRaises(ValueError):
                 PrecisionMap(codecs)
         with self.assertRaises(ValueError):
@@ -201,6 +247,39 @@ class PrecisionMapCLIRegressions(_DenseFixture):
         self.assertNotIn("Traceback", result.stderr)
         return json.loads(result.stdout) if expect == 0 else result.stderr
 
+    def test_a_calibration_set_aggregates_and_bounds_by_quality(self):
+        report = self.directory / "set.json"
+        self.run_tool("nexa_calibrate.py", "--checkpoint", str(self.checkpoint),
+                      "--tokens", "1,3", "--tokens", "5,7,2", "--prompt-label", "short",
+                      "--prompt-label", "long", "--codec", "q4", "--codec", "q8",
+                      "--group-size", "8", "--block-rows", "3", "--tile-rows", "3",
+                      "--memory-budget", "8MiB", "--report", str(report))
+        measured = json.loads(report.read_text())
+        self.assertEqual([item["label"] for item in measured["calibration_set"]], ["short", "long"])
+        self.assertEqual([item["tokens"] for item in measured["calibration_set"]], [2, 3])
+        self.assertEqual(len(measured["reference"]["logits_sha256"]), 2)
+        sensitivity = measured["all_packed"]["q4"]["sensitivity"]
+        self.assertEqual([item["prompt"] for item in sensitivity["prompts"]], ["short", "long"])
+        self.assertIn(sensitivity["worst_prompt"], ("short", "long"))
+        self.assertGreaterEqual(sensitivity["max_abs_delta"],
+                                max(item["max_abs_delta"] for item in sensitivity["prompts"]))
+        # The aggregate sits between the individual prompt errors.
+        rmses = [item["rmse"] for item in sensitivity["prompts"]]
+        self.assertGreaterEqual(sensitivity["rmse"], min(rmses))
+        self.assertLessEqual(sensitivity["rmse"], max(rmses))
+        plan = self.directory / "quality.json"
+        planned = self.run_tool("nexa_precision.py", "plan", "--calibration", str(report),
+                                "--max-rmse", "0.05", "--out", str(plan))
+        self.assertLessEqual(planned["provenance"]["estimated_rmse"], 0.05)
+        self.assertTrue(planned["provenance"]["meets_max_rmse"])
+        cheap = self.run_tool("nexa_precision.py", "plan", "--calibration", str(report),
+                              "--max-rmse", "10")
+        self.assertLess(cheap["provenance"]["planned_bytes"], planned["provenance"]["planned_bytes"])
+        for arguments in (("--budget", "2KiB", "--max-rmse", "0.1"), ()):
+            message = self.run_tool("nexa_precision.py", "plan", "--calibration", str(report),
+                                    *arguments, expect=2)
+            self.assertTrue(message.strip())
+
     def test_calibrate_plan_convert_and_run(self):
         report = self.directory / "calibration.json"
         self.run_tool("nexa_calibrate.py", "--checkpoint", str(self.checkpoint), "--tokens", "1,3",
@@ -221,7 +300,8 @@ class PrecisionMapCLIRegressions(_DenseFixture):
         self.assertEqual(set(converted["dense_tensors"]), dense)
         inspected = self.run_tool("nexa_inspect.py", str(bundle), "--verify")
         codecs = {item["name"]: item["codec"] for item in inspected["tensors"]}
-        stored = {"f32": "RAW_F32_MATRIX", "q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
+        stored = {"f32": "RAW_F32_MATRIX", "f16": "RAW_F16_MATRIX", "q2": "Q2_GROUPED",
+                  "q3": "Q3_GROUPED", "q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
         for name, codec in planned["codecs"].items():
             self.assertEqual(codecs[name], stored[codec])
         self.assertTrue(set(planned["codecs"].values()) <= set(stored))

@@ -132,12 +132,15 @@ jobs:
           python tools/nexa_inspect.py artifacts/models/ci-q8 --verify
           python tools/nexa_run.py artifacts/models/ci-q8 --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB --report artifacts/reports/ci-q8.json
 
-      - name: Calibrate one tensor against a dense reference
-        run: python tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/ci-tiny --tokens 1,3 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --tensor model.embed_tokens.weight --report artifacts/reports/ci-calibration.json
+      - name: Calibrate one tensor over a prompt set
+        run: python tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/ci-tiny --tokens 1,3 --tokens 5,7 --prompt-label short --prompt-label long --group-size 8 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --tensor model.embed_tokens.weight --report artifacts/reports/ci-calibration.json
+
+      - name: Plan by a quality ceiling
+        run: python tools/nexa_precision.py plan --calibration artifacts/reports/ci-calibration.json --max-rmse 0.05 --out artifacts/precision/ci-quality.json
 
       - name: Plan a precision map and convert by it
         run: |
-          python tools/nexa_precision.py plan --calibration artifacts/reports/ci-calibration.json --budget 4KiB --out artifacts/precision/ci-map.json
+          python tools/nexa_precision.py plan --calibration artifacts/reports/ci-calibration.json --budget 8KiB --out artifacts/precision/ci-map.json
           python tools/nexa_precision.py show artifacts/precision/ci-map.json
           python tools/nexa_convert.py --checkpoint artifacts/checkpoints/ci-tiny --out artifacts/models/ci-planned --precision-map artifacts/precision/ci-map.json --group-size 4 --block-rows 3
           python tools/nexa_run.py artifacts/models/ci-planned --tokens 1,3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/ci-planned.json

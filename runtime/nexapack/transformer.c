@@ -49,6 +49,81 @@ static int binary_buffers(const float *left, size_t left_count,
     return NEXA_Q4_OK;
 }
 
+/* IEEE-754 binary16 to float, without assuming the compiler has _Float16.
+ * Subnormals and zero are handled explicitly; inf/NaN are rejected upstream. */
+static float half_to_float(uint16_t bits) {
+    unsigned int sign = (bits >> 15) & 1u;
+    unsigned int exponent = (bits >> 10) & 0x1Fu;
+    unsigned int mantissa = bits & 0x3FFu;
+    double value;
+    if (!exponent) {
+        value = ldexp((double)mantissa, -24);
+    } else if (exponent == 0x1Fu) {
+        value = mantissa ? NAN : INFINITY;
+    } else {
+        value = ldexp((double)(mantissa | 0x400u), (int)exponent - 25);
+    }
+    return (float)(sign ? -value : value);
+}
+
+static uint16_t load_half(const uint8_t *source) {
+    return (uint16_t)((unsigned int)source[0] | ((unsigned int)source[1] << 8));
+}
+
+/* Dense F16 weights: same contract and reduction order as the F32 kernel,
+ * reading two bytes per coordinate without expanding the tile. */
+int nexa_f16_matmul(const float *inputs, size_t input_count, size_t batch,
+                    const uint8_t *weights, size_t weight_bytes,
+                    size_t rows, size_t cols,
+                    float *output, size_t output_count) {
+    if (!inputs || !weights || !output || !rows || !cols || !batch)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    size_t weight_elements, needed, input_elements, output_elements;
+    size_t input_bytes, output_bytes;
+    if (!checked_mul(rows, cols, &weight_elements) ||
+        !checked_mul(weight_elements, 2, &needed) ||
+        !checked_mul(batch, cols, &input_elements) ||
+        !checked_mul(batch, rows, &output_elements) ||
+        !float_bytes(input_elements, &input_bytes) ||
+        !float_bytes(output_elements, &output_bytes)) return NEXA_Q4_OVERFLOW;
+    if (input_count < input_elements || weight_bytes < needed ||
+        output_count < output_elements) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(inputs, input_bytes, output, output_bytes) ||
+        !disjoint(weights, needed, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    if (!finite_input(inputs, input_elements)) return NEXA_Q4_INVALID_DATA;
+    for (size_t i = 0; i < weight_elements; i++) {
+        if (!isfinite(half_to_float(load_half(weights + i * 2)))) return NEXA_Q4_INVALID_DATA;
+    }
+    for (size_t item = 0; item < batch; item++) {
+        const float *input = inputs + item * cols;
+        for (size_t row = 0; row < rows; row++) {
+            const uint8_t *record = weights + row * cols * 2;
+            double sum = 0.0;
+            for (size_t i = 0; i < cols; i++)
+                sum += (double)input[i] * (double)half_to_float(load_half(record + i * 2));
+            int status = write_float(output + item * rows + row, sum);
+            if (status) return status;
+        }
+    }
+    return NEXA_Q4_OK;
+}
+
+int nexa_f16_decode_row(const uint8_t *weights, size_t weight_bytes,
+                        size_t cols, float *output, size_t output_count) {
+    if (!weights || !output || !cols) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t needed, output_bytes;
+    if (!checked_mul(cols, 2, &needed) || !float_bytes(cols, &output_bytes))
+        return NEXA_Q4_OVERFLOW;
+    if (weight_bytes < needed || output_count < cols) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(weights, needed, output, output_bytes)) return NEXA_Q4_INVALID_ARGUMENT;
+    for (size_t i = 0; i < cols; i++) {
+        float value = half_to_float(load_half(weights + i * 2));
+        if (!isfinite(value)) return NEXA_Q4_INVALID_DATA;
+        output[i] = value;
+    }
+    return NEXA_Q4_OK;
+}
+
 /* Dense F32 weights, same reduction order and accumulator as nexa_q4_matmul,
  * so a tensor kept in F32 differs from its packed form only by quantization.
  * The weight tile is read from the bundle; nothing is dequantized or copied. */
