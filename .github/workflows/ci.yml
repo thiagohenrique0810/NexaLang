@@ -120,6 +120,9 @@ jobs:
           python tools/nexa_inspect.py artifacts/models/ci-dense --verify
           python tools/nexa_run.py artifacts/models/ci-dense --tokens 1,3 --decode-tokens 5 --tile-rows 3 --memory-budget 4MiB --report artifacts/reports/ci-dense.json
 
+      - name: Calibrate one tensor against a dense reference
+        run: python tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/ci-tiny --tokens 1,3 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --tensor model.embed_tokens.weight --report artifacts/reports/ci-calibration.json
+
       - name: Train a tokenizer and verify its asset offline
         run: |
           python -c "from pathlib import Path; p = Path('artifacts/corpus'); p.mkdir(parents=True, exist_ok=True); (p / 'sample.txt').write_text('O NexaLang executa modelos com memoria limitada e atencao paginada.\n' * 24, encoding='utf-8')"

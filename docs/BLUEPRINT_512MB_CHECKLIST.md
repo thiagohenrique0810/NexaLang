@@ -181,6 +181,18 @@ precisavam para consumir um precision map. Passaram **595 regressões + 110
 testes bootstrap = 705 testes**, sem falhas ou skips. Checklist: **36 concluídos
 e 107 pendentes**.
 
+**Décimo oitavo incremento implementado e validado:** calibração por tensor com
+duas medições separadas — erro estático do codec e sensibilidade real nos
+logits, executando o modelo com todos os pesos densos e depois com um único
+tensor empacotado. As variantes ligam os payloads já escritos em vez de
+reconverter o modelo por tensor, e são publicadas atomicamente. O resultado
+justifica a medição fim a fim: na fixture, o erro estático é quase igual entre
+os tensores (~3,5% de RMSE relativo) enquanto o impacto nos logits varia mais de
+três vezes, com o embedding no topo — ordenar pelo erro do codec daria a ordem
+errada. `quality_measured` permanece falso: são proxies sobre pesos sintéticos,
+não perplexidade. Passaram **606 regressões + 110 testes bootstrap = 716
+testes**, sem falhas ou skips. Checklist: **37 concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -197,12 +209,12 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M6.01 — calibração de sensibilidade por tensor.** Com o
-despacho por codec e a referência densa, dá para medir o efeito real de
-quantizar cada tensor: executar o modelo com todos os pesos densos, depois com
-um único tensor em Q4, e comparar logits. O custo é O(tensores) execuções;
-registrar isso e amostrar quando necessário. Perplexidade de modelo treinado
-continua fora do alcance até LLM.04b.
+**Próxima tarefa: M6.02 — PrecisionMap por tensor sob orçamento.** A calibração
+já produz `cost_per_saved_kib`, que é a ordenação que a seleção precisa: dado um
+teto de bytes, escolher o codec de cada tensor maximizando qualidade estimada,
+gravar o mapa no manifesto e permitir converter por ele. Hoje só há dois codecs
+de peso (Q4 e denso); Q2/Q3/Q8/F16 entram em M1.05b e ampliam o espaço de
+escolha sem mudar o contrato do mapa.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -647,7 +659,12 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
 
 ## M6 — precisão, compressão e fusão (PDF fases 7/8, P01–15/P28/P30)
 
-- [ ] M6.01 Calibração por tensor/grupo: sensibilidade, outliers e orçamento de qualidade.
+- [x] M6.01a Calibração por tensor: distribuição e outliers, erro de round-trip
+  do codec e sensibilidade medida nos logits contra referência densa, com
+  variantes atômicas que reusam payloads e custo por byte economizado.
+- [ ] M6.01b Calibração por grupo dentro do tensor, conjunto de calibração
+  representativo por domínio e orçamento de qualidade; sensibilidade em
+  checkpoint treinado com perplexidade, dependente de LLM.04b.
 - [ ] M6.02 PrecisionMap Q2/Q3/Q4/Q8/F16 por tensor/bloco e seleção por custo físico
   medido; misturar codecs dentro do tensor exige formato versionado, identidade/
   offsets por bloco e despacho compatível (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
@@ -1289,6 +1306,30 @@ Décimo primeiro incremento:
 - Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **36 concluídos e
   107 pendentes**; M1.05 foi dividido preservando Q2/Q3/Q8/F16 em M1.05b.
 
+## Registro do décimo oitavo incremento — calibração
+
+- Concluído M6.01a: `compiler/calibration.py` (estatísticas, erro de codec,
+  delta de logits e montagem de variantes) e `tools/nexa_calibrate.py`.
+- Duas medições separadas: a estática lê o checkpoint sem executar; a de
+  sensibilidade executa o modelo uma vez por tensor medido, com referência
+  densa e comparação de logits. `--static-only` e `--tensor` controlam o custo.
+- Variantes reusam os payloads do bundle denso e do empacotado por hard link,
+  com cópia como fallback, e são publicadas por rename a partir de `.partial`;
+  falha de link, cópia ou espaço não deixa bundle incompleto.
+- Evidência do método: na fixture, o RMSE relativo do codec fica em torno de
+  3,5% para todos os tensores, mas o RMSE nos logits vai de 0,0572 a 0,1896.
+  Ordenar pelo erro estático daria uma ordem diferente da real.
+- Honestidade do relatório: `quality_measured` falso, nota explicando que são
+  proxies, e o custo O(tensores) declarado no guia junto do peso do bundle denso.
+- Validação macOS ARM64/Python 3.14.5: **606 regressões + 110 bootstrap = 716
+  testes, zero falhas e zero skips**. Os 11 novos cobrem estatísticas com
+  valores conhecidos, erro zero em pesos exatos, rejeições de entrada, delta de
+  logits, variante com um só tensor empacotado, sensibilidade nula onde a
+  quantização é exata, bundles incompatíveis, falha sem diretório parcial e as
+  três formas da CLI.
+- Guia: [calibração](NEXALM_CALIBRACAO.md). Checklist: **37 concluídos e 107
+  pendentes**; M6.01 foi dividido preservando grupo/orçamento em M6.01b.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1331,6 +1372,11 @@ python3 -m unittest discover -s tests -p 'test_reload_cache_regressions.py' -v
 # Sequência derivada que continua o prefixo sem recomputá-lo.
 python3 tools/nexa_run.py artifacts/models/nexalm-tiny --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB --fork-tokens 2,4 --report artifacts/reports/kv-sequencias-tiny.json
 python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
+
+# Calibração: erro estático e sensibilidade real nos logits.
+python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --static-only
+python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3,5 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibracao.json
+python3 -m unittest discover -s tests -p 'test_calibration_regressions.py' -v
 
 # Codec de peso por tensor: referência densa e bundle misto.
 python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-dense --dense-all --block-rows 3
@@ -1549,6 +1595,14 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Décimo oitavo incremento acrescenta:
+
+- `compiler/calibration.py`: estatísticas, erro de codec, delta de logits e
+  montagem atômica de variantes por hard link.
+- `tools/nexa_calibrate.py`: passe estático, sensibilidade por tensor, seleção
+  por `--tensor`, `--work-dir` e relatório com custo por byte economizado.
+- `tests/test_calibration_regressions.py` e `docs/NEXALM_CALIBRACAO.md`.
 
 Décimo sétimo incremento acrescenta:
 
