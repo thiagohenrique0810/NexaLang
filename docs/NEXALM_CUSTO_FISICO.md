@@ -88,8 +88,13 @@ precisa ser demonstrado: o overhead fixo medido aqui é **por arquivo**, e
 metadados por bloco heterogêneo tendem a aumentá-lo.
 
 O custo físico cobre o que está no disco. Não é a residência em RAM durante a
-execução, que os relatórios de memória já reportam separadamente, nem prediz
-velocidade: um codec menor pode decodificar mais devagar.
+execução, que os relatórios de memória já reportam separadamente.
+
+A suspeita que esta seção registrava — "um codec menor pode decodificar mais
+devagar" — deixou de ser suspeita em M6.03a: **Q2 guarda 40% menos bytes que Q4
+e leva 12,6% mais tempo para decodificar**, medido no kernel que o executor
+roda. A escada inteira, as duas ordenações e o teto por tempo estão em
+[compressão](NEXALM_COMPRESSAO.md).
 
 O [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
 próxima tarefa.

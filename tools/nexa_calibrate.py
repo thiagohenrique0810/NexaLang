@@ -28,6 +28,7 @@ import math
 from compiler.calibration import (
     MAX_CALIBRATION_TENSORS, build_variant, logit_delta, quantization_error, row_statistics,
 )
+from compiler.codec_speed import DEFAULT_TRIALS, measure_decode_rates
 from compiler.importers.llama import import_llama_checkpoint
 from compiler.importers.safetensors import SafeTensorCheckpoint
 from runtime.nexapack.bundle import ModelBundleReader
@@ -91,6 +92,13 @@ def main(argv=None):
                         help="Codecs to measure against dense (default: q2, q3, q4, q8 and f16)")
     parser.add_argument("--static-only", action="store_true",
                         help="Report distribution and codec error without executing the model")
+    parser.add_argument("--decode-time-trials", type=int, default=DEFAULT_TRIALS,
+                        help="Timed trials per codec for the decode-rate measurement; 0 skips it")
+    parser.add_argument("--decode-time-cols", type=int, default=None,
+                        help="Row width of the timed block (default: the largest multiple of "
+                             "--group-size at or below 1024)")
+    parser.add_argument("--decode-time-rows", type=int, default=None,
+                        help="Rows in the timed block (default: 32)")
     parser.add_argument("--work-dir", type=Path, help="Keep intermediate bundles here instead of a temp dir")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
@@ -140,6 +148,18 @@ def main(argv=None):
                   "quality_note": ("logit deltas over this calibration set on these weights; "
                                    "perplexity needs a trained checkpoint"),
                   "aggregation": "RMSE pooled over every prompt, with the worst prompt reported"}
+
+        if args.decode_time_trials:
+            # Decode speed is a property of the host and the kernel, not of the
+            # checkpoint, so it is measured the same way in both passes. The
+            # timed block is a whole number of groups by construction.
+            cols = args.decode_time_cols or max(args.group_size,
+                                                (1024 // args.group_size) * args.group_size)
+            report["decode_time"] = measure_decode_rates(
+                cols=cols, rows=args.decode_time_rows or 32, group_size=args.group_size,
+                trials=args.decode_time_trials)
+            report["decode_time"]["measured_for"] = ("the ladder, not only the codecs this run "
+                                                     "calibrated: a rate does not depend on the tensor")
 
         def rank(entry):
             """Worst case across measured codecs; the cheapest one bounds it."""

@@ -16,8 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from compiler.planner.compression import CompressionPlanner
 from compiler.planner.memory import parse_memory_size
-from compiler.precision_map import PrecisionMap, select_precision
+from compiler.precision_map import PrecisionMap
 
 MAX_REPORT_BYTES = 64 * 1024 * 1024
 
@@ -45,6 +46,12 @@ def main(argv=None):
     planner.add_argument("--cost", choices=("payload", "physical"), default="payload",
                          help="Byte count to optimize: the codec payload, or what the "
                               "tensor files actually hold (default: payload)")
+    planner.add_argument("--max-decode-ns", type=int,
+                         help="Ceiling on the measured nanoseconds to decode every weight once; "
+                              "needs a calibration report with a 'decode_time' block")
+    planner.add_argument("--axes", type=Path,
+                         help="Write the axis provenance here: what the planner considered and "
+                              "what it refused to consider")
 
     shower = commands.add_parser("show", help="Validate a precision map and summarize it")
     shower.add_argument("map", type=Path)
@@ -54,13 +61,17 @@ def main(argv=None):
         if (args.budget is None) == (args.max_rmse is None):
             parser.error("pass exactly one of --budget or --max-rmse")
         report = read_report(args.calibration)
-        precision = (select_precision(report, parse_memory_size(args.budget), cost=args.cost)
-                     if args.budget else
-                     select_precision(report, max_rmse=args.max_rmse, cost=args.cost))
-        encoded = precision.to_json()
+        plan = CompressionPlanner(report, cost=args.cost, max_decode_ns=args.max_decode_ns,
+                                  max_bytes=parse_memory_size(args.budget) if args.budget else None,
+                                  max_rmse=args.max_rmse).plan()
+        encoded = plan.to_json()
         if args.out is not None:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(encoded + "\n", encoding="utf-8")
+        if args.axes is not None:
+            args.axes.parent.mkdir(parents=True, exist_ok=True)
+            args.axes.write_text(json.dumps(plan.axes, indent=2, sort_keys=True) + "\n",
+                                 encoding="utf-8")
         print(encoded)
         return 0
     precision = PrecisionMap.from_json(Path(args.map).read_text(encoding="utf-8"))
