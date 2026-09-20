@@ -9,6 +9,10 @@ recomputá-lo e sem copiar suas páginas completas. O décimo quinto estende iss
 O vigésimo sexto estende ao backing store: páginas cold são arquivos, e duas
 sequências passam a **compartilhar o arquivo** em vez de copiá-lo.
 
+O trigésimo tira o parentesco da conta: `adopt_prefix()` e
+`--reuse-prefix-tokens` deixam duas sessões construídas separadamente
+compartilharem as páginas em que seus prompts coincidem.
+
 ## Por que o compartilhamento é seguro
 
 Uma página completa é imutável. `append` só escreve na página parcial mais nova
@@ -60,6 +64,107 @@ store. Daí as duas propriedades que importam:
 Cada sequência escreve suas próprias páginas novas no seu próprio store, então
 nada é escrito no store de outra. `copied_bytes` permanece zero na adoção: o
 prefixo inteiro é compartilhado, inclusive a parte em disco.
+
+## Reuso sem parentesco: duas sessões que só combinam nos tokens
+
+`fork` exige parentesco: a derivada nasce do pai. O reuso de prefixo não exige
+nada disso. Os bytes de uma página completa dependem **apenas dos tokens nas
+posições absolutas que ela cobre** — não de quem os calculou, nem de como a
+sequência chegou até lá, nem do tamanho dos chunks. Então duas sessões
+construídas separadamente podem dividir uma página sempre que seus prompts
+concordam em todos os tokens daquela página.
+
+A regra vive sozinha em `runtime/nexapack/prefix_reuse.py`, sem sessão, sem
+alocação e sem I/O:
+
+```python
+common_page_prefix(tokens_a, tokens_b, page_tokens)  # = len(prefixo comum) // page_tokens
+```
+
+O piso é deliberado. A página parcial mais nova continua sendo escrita pelo seu
+dono, então ela nunca é imutável e nunca é adotada — mesmo quando os dois
+prompts concordam nos tokens que ela já contém.
+
+O adotante declara o prompt que **pretende** rodar e recebe exatamente o
+prefixo de páginas que os dois prompts têm em comum:
+
+```python
+with PagedTransformerSession(bundle, page_tokens=16, kv_codec="q4",
+                             kv_group_size=32, max_sequence_length=512) as reuse:
+    adoption = reuse.adopt_prefix(source, prompt)       # nenhuma relação com source
+    reuse.append(prompt[adoption["inherited_tokens"]:])  # só o que falta é executado
+```
+
+`kv_prefix_adoption` ganha, nesse caminho, `source: "shared_page_prefix"`,
+`common_tokens` (onde os prompts deixaram de concordar), `requested_tokens` e
+`source_tokens`. `copied_bytes` é zero: a adoção para numa fronteira de página,
+então não existe página parcial para copiar. As demais propriedades são as de
+`fork` — contagem de referências, imutabilidade da página compartilhada,
+orçamento próprio e independência das duas sessões em qualquer ordem.
+
+Pela linha de comando, `--reuse-prefix-tokens` roda um segundo prompt numa
+sessão **independente** e publica o bloco `reused_prefix`:
+
+```bash
+python3 tools/nexa_run.py artifacts/models/nexalm-tiny \
+  --tokens 1,3,5,7 --kv-cache --kv-page-tokens 2 --kv-codec q4 --kv-group-size 4 \
+  --max-sequence-length 8 --tile-rows 3 --memory-budget 1MiB \
+  --reuse-prefix-tokens 1,3,5,2,4
+```
+
+### O que é recusado
+
+Manifesto diferente, layout de página diferente (codec, `page_tokens`, grupo,
+bits/seed/codebook TQ), prefixo comum menor que uma página inteira, sessão
+adotante que já tem prefixo próprio, sessão de origem fechada e prompt maior
+que a capacidade do adotante.
+
+A recusa que precisa de explicação é a **política de idade**. A intuição diz que
+truncar um prefixo o deixa mais velho; é o contrário. Em
+`compiler/tiered_kv_plan.py::desired_pages` a idade conta a partir da página mais
+nova — `age = count - 1 - page_index` —, então adotar K das N páginas da origem
+**reduz** a idade de cada página herdada em N-K e faz a política exigir *mais*
+precisão dela. Uma página que a origem já envelheceu para Q4 ou Q3 teria de ser
+promovida de volta a F32, e nada promove: o F32 que a recodificação destruiu não
+volta dos bytes empacotados.
+
+A recusa é mais estreita do que parece, e o código mede a diferença em vez de
+supor. Quando toda página herdada já tem pelo menos a precisão que a nova idade
+exige, a adoção é aceita — na prática, um prefixo que a origem nunca envelheceu,
+já que a página K-1 vira idade zero, sempre hot F32. O caso restante — páginas
+herdadas *acima* da nova idade, que é o que o teto de qualidade produz — é
+representável apenas como retenção contra `retain_pages`, um orçamento que esta
+adoção não admite; fica recusado de propósito. Sob backing store a recusa é
+total, inclusive no caso hot: uma página cold é um arquivo no store da origem, e
+a ordem de aposentadoria de holds parciais não foi provada aqui.
+
+### Evidências do reuso
+
+Mesma fixture D64 do `fork`: prompt de 256 tokens em chunks de 32, páginas de
+16 tokens, KV Q4 G32, capacidade 512, cauda de 4 tokens por sequência, macOS
+ARM64/Python 3.14.5. A segunda sessão foi construída sozinha e nunca derivou da
+primeira; seus logits foram idênticos aos de uma sessão independente que
+recomputou os 260 tokens.
+
+| Métrica | Duas sessões sem parentesco | Com prefixo reusado |
+| --- | ---: | ---: |
+| KV residente somado | 45.662 B | 24.174 B |
+| Prefixo | 2 × 21.488 B | 21.488 B, uma vez |
+| Páginas próprias por sessão | 1.343 B | 1.343 B |
+| Páginas copiadas na adoção | — | 0 (`copied_bytes` = 0) |
+| Segunda sessão, já aquecido | ~0,051 s | ~0,007 s |
+
+São os mesmos 45.662 B → 24.174 B do `fork`, como tinha de ser: o que muda é a
+origem do direito de compartilhar, não a contabilidade. O tempo é amostra local
+única depois do primeiro uso (a primeira execução do processo paga a compilação
+da biblioteca nativa, ~0,63 s), não benchmark repetido.
+
+A prova central da suíte não é o número, é a **identidade byte a byte**: as
+páginas adotadas são comparadas com `ctypes.string_at(page.address,
+page_extent_bytes)` contra as de um controle que só executou os primeiros
+K × `page_tokens` tokens. Se qualquer byte de página dependesse de algo além da
+posição absoluta, a comparação falharia — nos quatro codecs, e tanto quando os
+prompts divergem numa fronteira de página quanto no meio de uma.
 
 ## Custo, orçamento e relatórios
 
@@ -137,6 +242,7 @@ Regressões:
 ```sh
 python3 -m unittest discover -s tests -p 'test_paged_sequences_regressions.py' -v
 python3 -m unittest discover -s tests -p 'test_tiered_sequences_regressions.py' -v
+python3 -m unittest discover -s tests -p 'test_prefix_reuse_regressions.py' -v
 ```
 
 ## Limites
@@ -148,7 +254,9 @@ rollback de falhas e de interrupções.
 
 Uma sessão continua **uma sequência**, síncrona, sem uso concorrente; várias
 sequências são várias sessões que compartilham páginas, cada uma com sua arena e
-seu orçamento. Não há escalonador, batch, admissão conjunta nem deduplicação
-automática de prefixos entre sessões independentes: o compartilhamento é
-explícito, por `fork`. O [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
+seu orçamento. Não há escalonador, batch nem deduplicação **automática** de
+prefixos: não existe índice de páginas por conteúdo, e ninguém procura uma
+origem candidata. O compartilhamento é sempre explícito — `fork` entre
+parentes, `adopt_prefix` entre sessões que só combinam nos tokens, e em ambos
+os casos quem chama escolhe a origem. O [checklist](BLUEPRINT_512MB_CHECKLIST.md) registra a suíte, os comandos e a
 próxima tarefa.

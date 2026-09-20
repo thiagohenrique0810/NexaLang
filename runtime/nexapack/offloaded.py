@@ -101,8 +101,18 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
         options.update({"kv_backing_store": self._backing_parent, "kv_reload_slots": self._reload_slots})
         return options
 
-    def _adopt_state(self, parent):
-        super()._adopt_state(parent)
+    def _check_adoption(self, parent, pages):
+        super()._check_adoption(parent, pages)
+        if pages is not None:
+            # Even the all-hot case the tiers would admit is refused here: a
+            # cold page is a file in the source's store, and a partial adoption
+            # inherits holds whose retirement order this increment has not
+            # proven. `fork`, which takes the whole prefix, stays supported.
+            raise ValueError("A backing store shares whole prefixes only; a truncated "
+                             "page prefix would inherit unproven file holds")
+
+    def _adopt_state(self, parent, *, pages=None):
+        super()._adopt_state(parent, pages=pages)
         if parent is None:
             for store in self._inherited_stores:
                 store.close()

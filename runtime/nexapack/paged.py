@@ -14,6 +14,7 @@ from compiler.paged_kv_plan import make_paged_kv_cache_plan, plan_paged_step
 from compiler.planner.memory import MemoryRequest
 from .format import READ_CHUNK_BYTES
 from .incremental import IncrementalTransformerSession
+from .prefix_reuse import common_page_prefix, common_prefix_length
 from .transformer import ALIGNMENT, TransformerSession, _positive
 from .tq_kv import TQKVContext, TQKernelDispatch, tq_kv_memory
 
@@ -170,7 +171,40 @@ class PagedTransformerSession(IncrementalTransformerSession):
             raise
         return child
 
-    def _adopt_prefix(self, parent):
+    def adopt_prefix(self, source, token_ids):
+        """Adopt the whole-page prefix this session shares with another one.
+
+        No kinship is required: the adopter states the prompt it intends to
+        run, and what it adopts is the longest whole-page prefix the two
+        prompts agree on token by token. A page's bytes depend only on the
+        tokens at its own absolute positions, so that agreement is the entire
+        precondition. The remaining tokens are this session's to append.
+        """
+        self._check_open()
+        tokens = self._validate_tokens(token_ids)
+        if not isinstance(source, PagedTransformerSession):
+            raise ValueError("A prefix can only be adopted from the same paged executor")
+        source._check_open()
+        common = common_prefix_length(list(source.token_ids), list(tokens))
+        pages = common_page_prefix(list(source.token_ids), list(tokens), self.page_tokens)
+        if not pages:
+            raise ValueError("The two prompts share less than one complete KV page")
+        self._adopt_prefix(source, pages=pages)
+        adoption = self._last_report["kv_prefix_adoption"]
+        # fork publishes the same four fields; a reuse adds what only it can
+        # state: where the two prompts stopped agreeing, and how much of that
+        # agreement a whole-page boundary could actually carry.
+        adoption.update({"source": "shared_page_prefix", "common_tokens": common,
+                         "requested_tokens": len(tokens), "source_tokens": len(source.token_ids)})
+        return dict(adoption)
+
+    def _adopt_prefix(self, parent, *, pages=None):
+        """Take over `pages` complete pages of `parent`, or its whole prefix.
+
+        pages=None is what fork needs: the entire committed prefix, copying the
+        partial page. A page limit is what an unrelated sequence needs: it
+        stops at a page boundary both prompts agree on, so nothing is copied.
+        """
         if not isinstance(parent, PagedTransformerSession) or type(self) is not type(parent):
             raise ValueError("A prefix can only be adopted from the same paged executor")
         if self._pages or self._tokens:
@@ -183,38 +217,49 @@ class PagedTransformerSession(IncrementalTransformerSession):
         if (self._manifest_sha256 != parent._manifest_sha256
                 or self._layout_identity() != parent._layout_identity()):
             raise ValueError("A derived sequence requires the same bundle and KV page layout")
-        if len(parent._tokens) > self.max_sequence_length:
-            raise ValueError("The inherited prefix exceeds this sequence's context capacity")
         # Pages before the newest partial one hold only committed tokens.
         complete = parent.cache_length // self.page_tokens
-        pages, copied = [], 0
+        if pages is None:
+            limit, inherited, sources = complete, parent._tokens, parent._pages
+        else:
+            if type(pages) is not int or pages <= 0:
+                raise ValueError("An adopted page count must be a positive integer")
+            if pages > complete:
+                raise ValueError("Only complete pages of the source prefix can be adopted")
+            limit, sources = pages, parent._pages[:pages]
+            inherited = parent._tokens[:pages * self.page_tokens]
+        if len(inherited) > self.max_sequence_length:
+            raise ValueError("The inherited prefix exceeds this sequence's context capacity")
+        # Last, so an executor veto reads a page count already known to exist.
+        self._check_adoption(parent, pages)
+        adopted, copied = [], 0
         try:
-            for index, page in enumerate(parent._pages):
-                if index < complete:
-                    pages.append(page.retain())
+            for index, page in enumerate(sources):
+                if index < limit:
+                    adopted.append(page.retain())
                     continue
                 copy = self._allocate_page()
                 try:
-                    pages.append(copy)
+                    adopted.append(copy)
                 except BaseException:
                     copy.release()
                     raise
                 ctypes.memmove(copy.address, page.address, self._cache_plan.page_extent_bytes)
                 copied += 1
             graph, plan = self._make_plan(self.max_sequence_length)
-            self._tokens, self._pages = parent._tokens, pages
-            self._adopt_state(parent)
+            self._tokens, self._pages = inherited, adopted
+            self._adopt_state(parent, pages=pages)
             report = self._report(graph, plan, executed=False)
         except BaseException:
             self._tokens, self._pages = (), []
             self._adopt_state(None)
-            for page in pages:
+            for page in adopted:
                 page.release()
             raise
         # A report for a sequence that has not executed yet has no io block;
         # adoption costs are stated separately from executed KV traffic.
         report["kv_prefix_adoption"] = {"inherited_tokens": len(self._tokens),
-                                        "shared_pages": len(pages) - copied, "copied_pages": copied,
+                                        "shared_pages": len(adopted) - copied, "copied_pages": copied,
                                         "copied_bytes": copied * self._cache_plan.page_extent_bytes}
         self._last_report = report
 
@@ -222,7 +267,16 @@ class PagedTransformerSession(IncrementalTransformerSession):
         """Canonical description of every layout an inherited page may use."""
         return self._cache_plan.to_json(indent=None)
 
-    def _adopt_state(self, parent):
+    def _check_adoption(self, parent, pages):
+        """Executor-specific veto, once bundle and page layout already agree.
+
+        Homogeneous pages have nothing else to check: every page carries the
+        same codec whatever its position, so a shorter prefix is still a valid
+        prefix. Executors whose page codec depends on the page's age do not
+        have that freedom and override this.
+        """
+
+    def _adopt_state(self, parent, *, pages=None):
         """Executor state an inherited prefix implies, before its first report."""
 
     def _tq_memory(self):
