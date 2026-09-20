@@ -576,3 +576,150 @@ int nexa_q4_decode_row(const uint8_t *packed, size_t packed_bytes,
     }
     return NEXA_Q4_OK;
 }
+
+/* ── qint<N>/PackedVector<N> storage: one layout for every grouped width ──
+ *
+ * Q2, Q3, Q4 and Q8 are not four layouts, they are one: a little-endian F32
+ * scale followed by N-bit two's-complement codes packed from the least
+ * significant bit, with the tail of the last group left at zero. Writing a
+ * single kernel over `bits` is what lets the language guarantee that what it
+ * emits is byte-identical to what the Python writers emit; four hand-written
+ * packers would only be *likely* to agree.
+ */
+
+static int qpack_layout(size_t bits, size_t count, size_t group_size,
+                        size_t *groups, size_t *group_bytes, size_t *total) {
+    if (bits != 2 && bits != 3 && bits != 4 && bits != 8)
+        return NEXA_Q4_INVALID_ARGUMENT;
+    if (!count || !group_size) return NEXA_Q4_INVALID_ARGUMENT;
+    if (group_size > (SIZE_MAX - 7) / bits) return NEXA_Q4_OVERFLOW;
+    size_t payload = (bits * group_size + 7) / 8;
+    if (payload > SIZE_MAX - 4) return NEXA_Q4_OVERFLOW;
+    *group_bytes = 4 + payload;
+    *groups = count / group_size + (count % group_size != 0);
+    if (!checked_mul(*groups, *group_bytes, total)) return NEXA_Q4_OVERFLOW;
+    return NEXA_Q4_OK;
+}
+
+/* The payload is pre-zeroed, so writing means setting the bits that are one. */
+static void store_packed_code(uint8_t *payload, size_t index, unsigned int bits,
+                              unsigned int code) {
+    size_t bit = index * bits;
+    for (unsigned int offset = 0; offset < bits; offset++) {
+        if ((code >> offset) & 1u)
+            payload[(bit + offset) >> 3] |= (uint8_t)(1u << ((bit + offset) & 7u));
+    }
+}
+
+size_t nexa_qpack_size(size_t bits, size_t count, size_t group_size) {
+    size_t groups, group_bytes, total;
+    return qpack_layout(bits, count, group_size, &groups, &group_bytes, &total) == 0
+        ? total : 0;
+}
+
+size_t nexa_qpack_groups(size_t bits, size_t count, size_t group_size) {
+    size_t groups, group_bytes, total;
+    return qpack_layout(bits, count, group_size, &groups, &group_bytes, &total) == 0
+        ? groups : 0;
+}
+
+/* Scale is max|v| / (2^(N-1) - 1) rounded to F32, values are divided by that
+ * stored scale and rounded half away from zero. The reserved -2^(N-1) code is
+ * unreachable because the magnitude is clamped before the sign is applied.
+ * That clamp is defensive only: with a scale derived from the group's own
+ * maximum, the largest quotient is levels*(1 + 2^-24) and still rounds to
+ * levels, so no finite input can drive the magnitude past it. */
+int nexa_qpack_pack(size_t bits, const float *values, size_t value_count,
+                    size_t count, size_t group_size,
+                    uint8_t *packed, size_t packed_bytes) {
+    if (!values || !packed) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, total, value_bytes;
+    int status = qpack_layout(bits, count, group_size, &groups, &group_bytes, &total);
+    if (status) return status;
+    if (!checked_mul(count, sizeof(float), &value_bytes)) return NEXA_Q4_OVERFLOW;
+    if (value_count < count || packed_bytes < total) return NEXA_Q4_BUFFER_TOO_SMALL;
+    if (!disjoint(values, value_bytes, packed, total)) return NEXA_Q4_INVALID_ARGUMENT;
+    for (size_t i = 0; i < count; i++) {
+        if (!isfinite(values[i])) return NEXA_Q4_INVALID_DATA;
+    }
+    double levels = (double)((1u << (bits - 1u)) - 1u);
+    memset(packed, 0, total);
+    size_t start = 0;
+    for (size_t group = 0; group < groups; group++) {
+        size_t valid = count - start < group_size ? count - start : group_size;
+        const float *lane = values + start;
+        uint8_t *record = packed + group * group_bytes;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < valid; i++) {
+            float magnitude = fabsf(lane[i]);
+            if (magnitude > maximum) maximum = magnitude;
+        }
+        float scale = (float)((double)maximum / levels);
+        if (maximum > 0.0f && scale == 0.0f) return NEXA_Q4_NUMERIC_RANGE;
+        store_scale(record, scale);
+        if (scale > 0.0f) {
+            for (size_t i = 0; i < valid; i++) {
+                double quotient = (double)lane[i] / (double)scale;
+                double magnitude = floor(fabs(quotient) + 0.5);
+                if (magnitude > levels) magnitude = levels;
+                int quantized = (int)magnitude;
+                if (quotient < 0.0) quantized = -quantized;
+                unsigned int code = (unsigned int)quantized & ((1u << bits) - 1u);
+                store_packed_code(record + 4, i, (unsigned int)bits, code);
+            }
+        }
+        start += valid;
+    }
+    return NEXA_Q4_OK;
+}
+
+/* Decoding reuses the per-codec row kernels, so a language unpack and a
+ * runtime decode cannot drift apart into two different validation rules. */
+int nexa_qpack_unpack(size_t bits, const uint8_t *packed, size_t packed_bytes,
+                      size_t count, size_t group_size,
+                      float *output, size_t output_count) {
+    switch (bits) {
+        case 2: return nexa_q2_decode_row(packed, packed_bytes, count, group_size,
+                                          output, output_count);
+        case 3: return nexa_q3_decode_row(packed, packed_bytes, count, group_size,
+                                          output, output_count);
+        case 4: return nexa_q4_decode_row(packed, packed_bytes, count, group_size,
+                                          output, output_count);
+        case 8: return nexa_q8_decode_row(packed, packed_bytes, count, group_size,
+                                          output, output_count);
+        default: return NEXA_Q4_INVALID_ARGUMENT;
+    }
+}
+
+int nexa_qpack_code(size_t bits, const uint8_t *packed, size_t packed_bytes,
+                    size_t count, size_t group_size, size_t index, int8_t *code) {
+    if (!packed || !code) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, total;
+    int status = qpack_layout(bits, count, group_size, &groups, &group_bytes, &total);
+    if (status) return status;
+    if (index >= count) return NEXA_Q4_INVALID_ARGUMENT;
+    if (packed_bytes < total) return NEXA_Q4_BUFFER_TOO_SMALL;
+    const uint8_t *record = packed + (index / group_size) * group_bytes;
+    float scale = load_scale(record);
+    if (!isfinite(scale) || scale < 0.0f) return NEXA_Q4_INVALID_DATA;
+    int value = packed_code(record + 4, group_bytes - 4, index % group_size,
+                            (unsigned int)bits);
+    if (value == -(int)(1u << (bits - 1u))) return NEXA_Q4_INVALID_DATA;
+    if (scale == 0.0f && value != 0) return NEXA_Q4_INVALID_DATA;
+    *code = (int8_t)value;
+    return NEXA_Q4_OK;
+}
+
+int nexa_qpack_scale(size_t bits, const uint8_t *packed, size_t packed_bytes,
+                     size_t count, size_t group_size, size_t group, float *scale) {
+    if (!packed || !scale) return NEXA_Q4_INVALID_ARGUMENT;
+    size_t groups, group_bytes, total;
+    int status = qpack_layout(bits, count, group_size, &groups, &group_bytes, &total);
+    if (status) return status;
+    if (group >= groups) return NEXA_Q4_INVALID_ARGUMENT;
+    if (packed_bytes < total) return NEXA_Q4_BUFFER_TOO_SMALL;
+    float value = load_scale(packed + group * group_bytes);
+    if (!isfinite(value) || value < 0.0f) return NEXA_Q4_INVALID_DATA;
+    *scale = value;
+    return NEXA_Q4_OK;
+}

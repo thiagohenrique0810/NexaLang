@@ -24,6 +24,8 @@ def run_jit(llvm_ir):
     runtime_names = []
     if any(name.startswith("tq_") for name in required):
         runtime_names.append("turboquant")
+    if any(name.startswith("nexa_qpack_") for name in required):
+        runtime_names.append("nexa_q4")
     if any(name.startswith("__nexa_") for name in required) or (os.name == "nt" and "sched_yield" in required):
         runtime_names.append("nexa_async")
     if runtime_names:
@@ -67,4 +69,8 @@ def run_jit(llvm_ir):
                 return run(1, argv) or 0
             return ctypes.CFUNCTYPE(result_type)(address)() or 0
         finally:
+            # The program wrote to descriptor 1 through the C runtime's buffer,
+            # which this process does not otherwise touch. Draining it here is
+            # what keeps a later Python line from landing inside its output.
+            libraries[0].fflush(None)
             engine.run_static_destructors()

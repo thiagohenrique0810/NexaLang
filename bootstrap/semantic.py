@@ -1,8 +1,39 @@
 from lexer import Lexer
-from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt, TypeAlias, LambdaExpr
+from n_parser import Parser, FunctionDef, StructDef, EnumDef, ImplDef, TraitDef, MatchExpr, CaseArm, ArrayLiteral, IndexAccess, UnaryExpr, VariableExpr, IfStmt, WhileStmt, ForStmt, VarDecl, Assignment, CallExpr, MemberAccess, MethodCall, ReturnStmt, BinaryExpr, RegionStmt, FloatLiteral, CharLiteral, IntegerLiteral, BreakStmt, ContinueStmt, UseStmt, TypeAlias, LambdaExpr, SUPPORTED_EXTERN_ABIS
 from errors import CompilerError
 import sys
 import copy
+
+# qint<N> is one stored level code and PackedVector<N> is a buffer of them.
+# Only these widths exist because only these have a grouped codec in
+# runtime/nexapack/format.py to be byte-identical to; a width with no codec
+# behind it would be a promise the compiler cannot keep, so it is refused.
+QUANTIZED_WIDTHS = (2, 3, 4, 8)
+QUANTIZED_BASES = ('qint', 'PackedVector')
+
+
+def quantized_argument(type_name):
+    """Return the raw <...> argument of qint/PackedVector, else None."""
+    if not isinstance(type_name, str) or not type_name.endswith('>'):
+        return None
+    base, separator, argument = type_name[:-1].partition('<')
+    if not separator or base not in QUANTIZED_BASES:
+        return None
+    return argument
+
+
+def quantized_width(type_name, base=None):
+    """Return N for a valid qint<N>/PackedVector<N>, else None."""
+    argument = quantized_argument(type_name)
+    if argument is None or (base is not None and not type_name.startswith(base + '<')):
+        return None
+    return int(argument) if argument.isdigit() and int(argument) in QUANTIZED_WIDTHS else None
+
+
+def quantized_levels(width):
+    """Largest magnitude a code may hold: -2**(N-1) stays reserved."""
+    return (1 << (width - 1)) - 1
+
 
 class SemanticAnalyzer:
     def __init__(self):
@@ -17,7 +48,8 @@ class SemanticAnalyzer:
         self.impls = set() # {(struct_name, trait_name)}
         self.aliases = {} # {alias_name: full_qualified_name}
         self.loop_stack = [] # list of labels (None if no label)
-        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert', 'compress::create', 'compress::create_mse', 'compress::destroy', 'compress::quantize', 'compress::dequantize', 'compress::mse'])
+        self.functions = set(['print', 'gpu::global_id', 'gpu::dispatch', 'panic', 'assert', 'slice_from_array', 'fs::read_file', 'fs::write_file', 'fs::append_file', '__nexa_panic', '__nexa_assert', 'compress::create', 'compress::create_mse', 'compress::destroy', 'compress::quantize', 'compress::dequantize', 'compress::mse',
+                              'qpack::pack', 'qpack::unpack', 'qpack::code', 'qpack::scale'])
         self.function_defs = {} # name -> list of FunctionDef
         self.structs = {} # name -> {field: type}
         self.struct_defs = {} # name -> StructDef (for privacy check)
@@ -38,6 +70,26 @@ class SemanticAnalyzer:
         self.lambda_capture_stack = [] # Stack of dicts: {name: type}
 
 
+    def check_quantized_type(self, name, argument, node=None):
+        base = name.split('<', 1)[0]
+        widths = ', '.join(str(width) for width in QUANTIZED_WIDTHS)
+        if not argument.isdigit():
+            self.error(f"{base}<{argument}> needs an integer width; supported widths are {widths}",
+                       node, error_code="E0008")
+        if int(argument) not in QUANTIZED_WIDTHS:
+            self.error(f"{base}<{argument}> has no packed codec; supported widths are {widths}",
+                       node,
+                       hint="Q2_GROUPED, Q3_GROUPED, Q4_GROUPED and Q8_GROUPED are the codecs that exist",
+                       error_code="E0008")
+
+    def quantized_code_literal(self, expr):
+        """Value of an integer literal, with an optional leading minus."""
+        if isinstance(expr, IntegerLiteral):
+            return expr.value
+        if isinstance(expr, UnaryExpr) and expr.op == '-' and isinstance(expr.operand, IntegerLiteral):
+            return -expr.operand.value
+        return None
+
     def get_suggestion(self, name, possibilities):
         import difflib
         matches = difflib.get_close_matches(name, possibilities, n=1, cutoff=0.6)
@@ -48,7 +100,7 @@ class SemanticAnalyzer:
         column = getattr(node, 'column', None)
         raise CompilerError(message, line, column, hint=hint, error_code=error_code)
 
-    def resolve_type_name(self, name):
+    def resolve_type_name(self, name, node=None):
         if not name: return name
         # Normalize: remove spaces
         name = name.replace(' ', '')
@@ -56,11 +108,19 @@ class SemanticAnalyzer:
             parameters, _, result = name[3:].rpartition(')->')
             return f"fn({','.join(self.resolve_type_name(p) for p in self.split_generic_args(parameters))})->{self.resolve_type_name(result)}"
         if name.startswith('&mut'):
-            return self.resolve_type_name(name[4:]) + '*'
+            return self.resolve_type_name(name[4:], node) + '*'
         if name.startswith('&'):
-            return self.resolve_type_name(name[1:]) + '*'
+            return self.resolve_type_name(name[1:], node) + '*'
         if name.endswith('*'):
-            return self.resolve_type_name(name[:-1]) + '*'
+            return self.resolve_type_name(name[:-1], node) + '*'
+
+        # Checked before the generic machinery: qint/PackedVector are storage
+        # types, not user generics, and an unchecked width would only surface
+        # much later as a confusing mismatch or an LLVM crash.
+        argument = quantized_argument(name)
+        if argument is not None:
+            self.check_quantized_type(name, argument, node)
+            return name
         
         # Mark as used if it's a known struct/enum
         base_name = name.split('<')[0] if '<' in name else name
@@ -743,7 +803,16 @@ class SemanticAnalyzer:
             node.type_name = result
         return result
 
-    def visit_ExternBlock(self, node): pass
+    def visit_ExternBlock(self, node):
+        # An extern block declares signatures and never emits a body, so an ABI
+        # the backend does not implement produces a program that links and runs
+        # against the wrong convention instead of failing. Refuse it here.
+        if node.abi not in SUPPORTED_EXTERN_ABIS:
+            supported = ', '.join(f'"{abi}"' for abi in SUPPORTED_EXTERN_ABIS)
+            self.error(f'Unsupported extern ABI: "{node.abi}"', node,
+                       hint=f"the backend emits {supported} only",
+                       error_code="E0009")
+
     def visit_TraitDef(self, node): pass
     def visit_StructDef(self, node): pass
     def visit_EnumDef(self, node): pass
@@ -1449,7 +1518,7 @@ class SemanticAnalyzer:
         return False
 
     def visit_VarDecl(self, node):
-        if node.type_name: node.type_name = self.resolve_type_name(node.type_name)
+        if node.type_name: node.type_name = self.resolve_type_name(node.type_name, node)
         if node.type_name and '<' in node.type_name and isinstance(node.initializer, CallExpr):
             callee = node.initializer.callee
             callee = callee.name if isinstance(callee, VariableExpr) else callee
@@ -1459,6 +1528,18 @@ class SemanticAnalyzer:
                     node.initializer.callee = f"{node.type_name}::{member}"
         init_t = self.visit(node.initializer)
         if node.type_name is None: node.type_name = init_t
+        width = quantized_width(node.type_name, 'qint')
+        if width:
+             # A literal that is in range is a code; anything else is an i32 the
+             # programmer must narrow on purpose, so it keeps failing E0002.
+             literal = self.quantized_code_literal(node.initializer)
+             if literal is not None:
+                  levels = quantized_levels(width)
+                  if not -levels <= literal <= levels:
+                       self.error(f"{literal} is not a qint<{width}> code; the range is "
+                                  f"[{-levels}, {levels}] and {-levels - 1} is reserved",
+                                  node, error_code="E0008")
+                  init_t = node.type_name
         if '<' in node.type_name: self.instantiate_generic_type(node.type_name)
         if init_t != node.type_name and not self.check_type_compatibility(node.type_name, init_t, node):
              self.error(f"Type Error: {init_t} != {node.type_name}", node, error_code="E0002")
@@ -1749,8 +1830,51 @@ class SemanticAnalyzer:
 
     # ── CallExpr helpers ─────────────────────────────────────────────────────
 
+    # Arity and the position of the buffer argument. N is never a value: it
+    # comes from PackedVector<N> for the readers and from a turbofish for the
+    # sizes, so a packed buffer can never be measured at the wrong width.
+    QPACK_INTRINSICS = {'pack': 4, 'unpack': 4, 'code': 4, 'scale': 4}
+    QPACK_SIZES = {'size', 'groups'}
+
+    def _visit_qpack_intrinsic(self, callee, node):
+        """qpack::* pack/unpack surface over PackedVector<N> and qint<N>."""
+        name, separator, turbofish = callee[len('qpack::'):].partition('<')
+        if name in self.QPACK_SIZES:
+            if not separator:
+                self.error(f"qpack::{name} needs an explicit width, as qpack::{name}::<4>(...)",
+                           node, error_code="E0008")
+            self.check_quantized_type(f"qint<{turbofish[:-1]}>", turbofish[:-1], node)
+            if len(node.args) != 2:
+                self.error(f"qpack::{name} expects (count, group_size)", node, error_code="E0002")
+            for argument in node.args:
+                self.visit(argument)
+            node.callee = callee
+            return 'i64'
+        if name not in self.QPACK_INTRINSICS or separator:
+            self.error(f"Unknown intrinsic: '{callee}'", node,
+                       hint="qpack has pack, unpack, code, scale and the sizes size::<N>/groups::<N>",
+                       error_code="E0004")
+        if len(node.args) != self.QPACK_INTRINSICS[name]:
+            self.error(f"qpack::{name} expects {self.QPACK_INTRINSICS[name]} arguments",
+                       node, error_code="E0002")
+        buffer_type = self.visit(node.args[0])
+        for argument in node.args[1:]:
+            self.visit(argument)
+        width = quantized_width(buffer_type, 'PackedVector')
+        if not width:
+            self.error(f"qpack::{name} expects a PackedVector<N>, got '{buffer_type}'",
+                       node, error_code="E0002")
+        node.callee = callee
+        if name == 'code':
+            return f'qint<{width}>'
+        if name == 'scale':
+            return 'f32'
+        return 'i32'
+
     def _visit_call_intrinsic(self, callee, node):
         """Handle built-in intrinsics. Returns type string or None if not intrinsic."""
+        if isinstance(callee, str) and callee.startswith('qpack::'):
+            return self._visit_qpack_intrinsic(callee, node)
         INTRINSICS = ('print', 'panic', 'assert', 'slice_from_array',
                       'fs::read_file', 'fs::write_file', 'fs::append_file',
                       'malloc', 'free', 'realloc', 'memcpy',

@@ -300,8 +300,16 @@ class TypeAlias(ASTNode):
         self.original_type = original_type
         self.is_pub = is_pub
 
+
+# The backend emits one calling convention: the platform C ABI. An extern
+# block only declares signatures, so nothing downstream would ever notice a
+# name it cannot honour -- the list has to gate it at the front.
+SUPPORTED_EXTERN_ABIS = ('C',)
+
+
 class ExternBlock(ASTNode):
     def __init__(self, abi, functions):
+        super().__init__()
         self.abi = abi
         self.functions = functions
 
@@ -407,7 +415,7 @@ class Parser:
         return attrs
 
     def parse_extern(self):
-        self.consume('EXTERN')
+        start_token = self.consume('EXTERN')
         abi = self.consume('STRING').value
         self.consume('LBRACE')
         functions = []
@@ -416,7 +424,10 @@ class Parser:
             functions.append(self.parse_function(allow_empty_body=True))
             # parse_function already handles semicolon if allow_empty_body is True
         self.consume('RBRACE')
-        return ExternBlock(abi, functions)
+        node = ExternBlock(abi, functions)
+        node.line = start_token.line
+        node.column = start_token.column
+        return node
 
     def parse_mod(self, is_pub=False):
         self.consume('MOD')
