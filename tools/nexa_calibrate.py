@@ -59,8 +59,8 @@ def main(argv=None):
     parser.add_argument("--memory-budget", default="512MiB")
     parser.add_argument("--tensor", action="append", dest="tensors",
                         help="Measure only these tensors; repeat per tensor")
-    parser.add_argument("--codec", action="append", dest="codecs", choices=("q4", "q8"),
-                        help="Packed codecs to measure (default: q4 and q8)")
+    parser.add_argument("--codec", action="append", dest="codecs", choices=("q3", "q4", "q8"),
+                        help="Packed codecs to measure (default: q3, q4 and q8)")
     parser.add_argument("--static-only", action="store_true",
                         help="Report distribution and codec error without executing the model")
     parser.add_argument("--work-dir", type=Path, help="Keep intermediate bundles here instead of a temp dir")
@@ -82,7 +82,7 @@ def main(argv=None):
         if len(selected) > MAX_CALIBRATION_TENSORS:
             raise ValueError("Too many tensors requested for one calibration run")
 
-        codecs = tuple(dict.fromkeys(args.codecs or ("q4", "q8")))
+        codecs = tuple(dict.fromkeys(args.codecs or ("q3", "q4", "q8")))
         tensors = []
         for name in selected:
             statistics = row_statistics(source.iter_rows(name))

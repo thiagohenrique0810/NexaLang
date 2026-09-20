@@ -56,10 +56,9 @@ RMSE, RMSE relativo e SNR em dB), `packed_bytes`, `saved_bytes`, `sensitivity`
 (delta máximo, RMSE e RMSE relativo dos logits) e `cost_per_saved_kib` — o
 custo em logits por KiB economizado, que é a ordenação que o plano usa.
 
-`--codec` restringe os codecs medidos; sem ele, a calibração mede Q4 e Q8. Numa
-fixture com grupo 4, o modelo inteiro em Q4 moveu os logits 0,2167 de RMSE,
-contra 0,0065 em Q8, economizando 0,31 KiB e 0,25 KiB por tensor — é essa
-diferença que dá ao plano um degrau intermediário real.
+`--codec` restringe os codecs medidos; sem ele, a calibração mede Q3, Q4 e Q8.
+Numa fixture com grupo 8, o modelo inteiro num codec só moveu os logits 0,686
+(Q3), 0,447 (Q4) e 0,017 (Q8) de RMSE — a escala de degraus que o plano usa.
 
 `outlier_ratio` compara o pico da pior linha com o da linha mediana: é o que
 torna um tensor difícil de quantizar com uma escala só.
@@ -118,10 +117,14 @@ qualidade do conjunto, e `quality_measured` permanece `false`. A seleção tamb�
 é gulosa sobre uma razão — com escolha binária por tensor, é heurística, não
 ótimo.
 
-O espaço de escolha tem hoje três pontos por tensor: Q4, Q8 e denso. Num teto
-apertado o plano mistura Q4 e Q8; com mais bytes, sobe para denso onde o ganho
-por byte é maior. Q2/Q3/F16 entram em M1.05c e ampliam a escala sem mudar o
-contrato do mapa.
+O espaço de escolha tem hoje quatro pontos por tensor: Q3, Q4, Q8 e denso. Na
+fixture com grupo 8, o teto mínimo planeja tudo em Q3; mais 100 bytes já
+misturam Q3, Q4 e Q8; e tetos maiores sobem para denso onde o ganho por byte é
+maior. Q2 e RAW-F16 entram em M1.05d e ampliam a escala sem mudar o contrato.
+
+Um codec grosseiro nem sempre é o mais barato: com grupos pequenos, a escala de
+quatro bytes domina e Q3 ocupa o mesmo que Q4 errando mais. A fronteira remove
+essa opção antes da escolha, sem precisar de regra especial.
 
 ## Limites
 

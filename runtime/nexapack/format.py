@@ -30,8 +30,10 @@ CODEC_ID = 'Q4_GROUPED'
 CODEC_VERSION = 1
 Q8_CODEC_ID = 'Q8_GROUPED'
 Q8_CODEC_VERSION = 1
+Q3_CODEC_ID = 'Q3_GROUPED'
+Q3_CODEC_VERSION = 1
 # Storage dtype per matrix codec; the container layout is otherwise identical.
-_GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8'}
+_GROUPED_CODECS = {CODEC_ID: 'q4', Q8_CODEC_ID: 'q8', Q3_CODEC_ID: 'q3'}
 TQ_CODEC_ID = 'TQ_MSE_SRHT'
 TQ_CODEC_VERSION = 1
 TQ_TRANSFORM_ID = 'SRHT_XOSHIRO256SS_V1'
@@ -72,6 +74,10 @@ def _group_bytes(group_size, codec=CODEC_ID):
     if codec == Q8_CODEC_ID:
         # One signed byte per value, after the shared float32 scale.
         return 4 + group_size
+    if codec == Q3_CODEC_ID:
+        # Three bits per value, packed from the least significant bit, with
+        # the same layout the paged KV cache already stores.
+        return 4 + (3 * group_size + 7) // 8
     if codec != CODEC_ID:
         raise NexaPackError(f'Unsupported grouped codec: {codec}')
     return 4 + (group_size + 1) // 2
@@ -132,6 +138,75 @@ def _encode_group_q8(values, group_size):
     return bytes(output)
 
 
+def _encode_group_q3(values, group_size):
+    """Q3_GROUPED v1: scale = max|v| / 3, signed codes in [-3, 3], -4 invalid."""
+    maximum = max(abs(value) for value in values)
+    scale = _FLOAT32.unpack(_FLOAT32.pack(maximum / 3.0))[0]
+    if maximum and not scale:
+        raise NexaPackError('Q3 scale underflows float32; rescale the input')
+    payload_bytes = _group_bytes(group_size, Q3_CODEC_ID) - 4
+    codes = 0
+    if scale:
+        for index, value in enumerate(values):
+            quotient = value / scale
+            magnitude = math.floor(abs(quotient) + 0.5)
+            quantized = max(-3, min(3, -magnitude if quotient < 0 else magnitude))
+            codes |= (quantized & 7) << (3 * index)
+    return _FLOAT32.pack(scale) + codes.to_bytes(payload_bytes, 'little')
+
+
+def _iter_decoded_q3_row(data, cols, group_size):
+    size = _row_bytes(cols, group_size, Q3_CODEC_ID)
+    try:
+        payload = memoryview(data).cast('B')
+    except (TypeError, ValueError) as error:
+        raise NexaPackError('Q3 row must be a contiguous byte buffer') from error
+    if len(payload) != size:
+        raise NexaPackError(f'Q3 row has {len(payload)} bytes; expected {size}')
+    group_bytes = _group_bytes(group_size, Q3_CODEC_ID)
+    payload_bytes = group_bytes - 4
+    decoded = 0
+    for offset in range(0, size, group_bytes):
+        scale = _FLOAT32.unpack_from(payload, offset)[0]
+        if not math.isfinite(scale) or scale < 0:
+            raise NexaPackError('Q3 scale must be finite and nonnegative')
+        packed = int.from_bytes(bytes(payload[offset + 4:offset + 4 + payload_bytes]), 'little')
+        if packed >> (3 * group_size):
+            raise NexaPackError('Q3 padding bits must be zero')
+        count = min(group_size, cols - decoded)
+        for index in range(group_size):
+            code = (packed >> (3 * index)) & 7
+            value = code if code < 4 else code - 8
+            if value == -4:
+                raise NexaPackError('Q3 code -4 is reserved and invalid')
+            if (index >= count or not scale) and value:
+                raise NexaPackError('Q3 padding and zero-scale groups must contain zero codes')
+            if index < count:
+                yield scale * value
+        decoded += count
+
+
+def validate_q3_row(data, cols: int, group_size: int) -> None:
+    for _ in _iter_decoded_q3_row(data, cols, group_size):
+        pass
+
+
+def decode_q3_row(data: bytes, cols: int, group_size: int) -> list[float]:
+    """Decode one Q3 row for reference and calibration, never for execution."""
+    return list(_iter_decoded_q3_row(data, cols, group_size))
+
+
+def quantize_q3_row(values: Iterable[float], group_size: int) -> bytes:
+    return b''.join(_iter_grouped(values, group_size, None, Q3_CODEC_ID))
+
+
+def write_q3_matrix(path, rows: int, cols: int, group_size: int,
+                    row_source: Iterable[Iterable[float]], *, block_rows: int = 64) -> None:
+    """Atomically write a row-major Q3 matrix; three bits per coordinate."""
+    write_grouped_matrix(path, rows, cols, group_size, row_source,
+                         block_rows=block_rows, codec=Q3_CODEC_ID)
+
+
 def _iter_decoded_q8_row(data, cols, group_size):
     size = _row_bytes(cols, group_size, Q8_CODEC_ID)
     try:
@@ -175,7 +250,7 @@ def quantize_q8_row(values: Iterable[float], group_size: int) -> bytes:
 
 def _iter_grouped(values, group_size, cols=None, codec=CODEC_ID):
     group_bytes = _group_bytes(group_size, codec)
-    encode = _encode_group_q8 if codec == Q8_CODEC_ID else _encode_group
+    encode = {Q8_CODEC_ID: _encode_group_q8, Q3_CODEC_ID: _encode_group_q3}.get(codec, _encode_group)
     if cols is not None:
         _row_bytes(cols, group_size, codec)
     try:
@@ -722,6 +797,8 @@ class NexaPackReader:
             validate_q4_row(data, self.cols, self.group_size)
         elif self.codec_id == Q8_CODEC_ID:
             validate_q8_row(data, self.cols, self.group_size)
+        elif self.codec_id == Q3_CODEC_ID:
+            validate_q3_row(data, self.cols, self.group_size)
         else:
             from .tq import validate_tq_row
             try:

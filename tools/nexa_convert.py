@@ -228,8 +228,8 @@ def main(argv=None):
     parser.add_argument("--precision-map", type=Path,
                         help="Apply a planned per-tensor codec map; requires --checkpoint")
     parser.add_argument("--tensor-codec", action="append", dest="tensor_codecs", metavar="NAME=CODEC",
-                        help="Store this matrix with q4, q8 or f32; repeat per tensor")
-    parser.add_argument("--matrix-codec", choices=("q4", "q8", "f32"),
+                        help="Store this matrix with q3, q4, q8 or f32; repeat per tensor")
+    parser.add_argument("--matrix-codec", choices=("q3", "q4", "q8", "f32"),
                         help="Store every matrix with this codec; requires --checkpoint")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--rows", type=int)
@@ -291,8 +291,8 @@ def main(argv=None):
                     codecs = {}
                     for item in args.tensor_codecs:
                         name, separator, codec = item.partition("=")
-                        if not separator or codec not in ("q4", "q8", "f32") or name not in matrices:
-                            parser.error(f"--tensor-codec expects NAME=q4|q8|f32 for a matrix: {item}")
+                        if not separator or codec not in ("q3", "q4", "q8", "f32") or name not in matrices:
+                            parser.error(f"--tensor-codec expects NAME=q3|q4|q8|f32 for a matrix: {item}")
                         codecs[name] = codec
             elif args.dense_all or args.dense_tensors:
                 from compiler.model_config import ModelConfig

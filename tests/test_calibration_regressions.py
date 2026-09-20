@@ -163,19 +163,21 @@ class CalibrationCLIRegressions(_DenseFixture):
         self.assertFalse(report["sensitivity_measured"])
         self.assertFalse(report["quality_measured"])
         self.assertNotIn("reference", report)
-        self.assertEqual(report["measured_codecs"], ["q4", "q8"])
+        self.assertEqual(report["measured_codecs"], ["q3", "q4", "q8"])
         errors = [max(codec["quantization"]["relative_rmse"] for codec in tensor["codecs"].values())
                   for tensor in report["tensors"]]
         self.assertEqual(errors, sorted(errors, reverse=True))
         for tensor in report["tensors"]:
             self.assertGreater(tensor["dense_bytes"], 0)
             self.assertIn("outlier_ratio", tensor["statistics"])
-            self.assertEqual(set(tensor["codecs"]), {"q4", "q8"})
+            self.assertEqual(set(tensor["codecs"]), {"q3", "q4", "q8"})
             for codec, measured in tensor["codecs"].items():
                 self.assertNotIn("sensitivity", measured)
             # More levels always mean a smaller round-trip error.
             self.assertLess(tensor["codecs"]["q8"]["quantization"]["rmse"],
                             tensor["codecs"]["q4"]["quantization"]["rmse"])
+            self.assertLess(tensor["codecs"]["q4"]["quantization"]["rmse"],
+                            tensor["codecs"]["q3"]["quantization"]["rmse"])
 
     def test_sensitivity_pass_measures_each_tensor_and_codec(self):
         names = ["model.embed_tokens.weight", "model.layers.0.mlp.down_proj.weight"]
@@ -188,7 +190,7 @@ class CalibrationCLIRegressions(_DenseFixture):
         worst = [max(codec["sensitivity"]["rmse"] for codec in tensor["codecs"].values())
                  for tensor in report["tensors"]]
         self.assertEqual(worst, sorted(worst, reverse=True))
-        self.assertEqual(set(report["all_packed"]), {"q4", "q8"})
+        self.assertEqual(set(report["all_packed"]), {"q3", "q4", "q8"})
         for codec, summary in report["all_packed"].items():
             self.assertNotEqual(report["reference"]["logits_sha256"], summary["logits_sha256"])
             self.assertGreater(summary["sensitivity"]["rmse"], 0.0)

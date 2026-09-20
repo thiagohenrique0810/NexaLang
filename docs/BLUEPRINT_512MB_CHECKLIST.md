@@ -230,6 +230,20 @@ relatórios de um codec só continuam planejando. Passaram **634 regressões + 1
 testes bootstrap = 744 testes**, sem falhas ou skips. Checklist: **41 concluídos
 e 107 pendentes**.
 
+**Vigésimo segundo incremento implementado e validado:** codec de peso
+Q3_GROUPED, três bits com sinal por valor no **mesmo layout** que o cache KV já
+armazena — uma regressão compara byte a byte com a referência independente do
+KV, porque duas grafias do mesmo codec fariam a mesma página lógica significar
+coisas diferentes. Kernels próprios de matmul e de decode de linha, despacho no
+executor e codec por tensor em toda a cadeia: conversão, calibração e plano.
+A escala de decisão passou a ter quatro pontos por tensor. Registro honesto do
+limite: com grupos pequenos a escala de quatro bytes domina e Q3 ocupa o mesmo
+que Q4 errando mais; a fronteira do planejador descarta essa opção sem regra
+especial, e isso está fixado em regressão com os dois tamanhos de grupo. Com
+grupo 8, o modelo inteiro num codec só move os logits 0,686 (Q3), 0,447 (Q4) e
+0,017 (Q8) de RMSE. Passaram **647 regressões + 110 testes bootstrap = 757
+testes**, sem falhas ou skips. Checklist: **42 concluídos e 107 pendentes**.
+
 Objetivo completo: modelo importado maior que a VRAM, execução sem PyTorch, pesos
 streamados sem expansão integral, KV comprimido e pico de dispositivo comprovado
 dentro de 512 MB. Esse objetivo permanece pendente até o gate M5.
@@ -246,12 +260,13 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M1.05c — codecs de peso Q2/Q3 e RAW-F16.** A escala de
-decisão já funciona com três pontos por tensor; cada codec novo acrescenta um
-degrau sem mudar o contrato do mapa. Q3 já existe para KV, com quantizador e
-referência próprios, então o trabalho é o writer de pesos, o matmul sem
-expansão integral e as caudas. Isso também destrava M4.03d. Alternativas em
-aberto: M6.01b (calibração por grupo e conjunto representativo) e M4.06c.
+**Próxima tarefa: M6.01b — conjunto de calibração e orçamento de qualidade.**
+A escala de codecs está pronta, mas o plano depende de um prompt só: tokens
+diferentes exercitam caminhos diferentes, e não há critério de qualidade além
+do RMSE de logits. Definir um conjunto representativo por domínio, agregação
+entre prompts e um teto de erro aceitável — em vez de apenas um teto de bytes —
+é o que falta para o plano significar algo fora da fixture. Alternativas em
+aberto: M1.05d (Q2/RAW-F16), M4.03d (atenção para os demais layouts) e M4.06c.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -575,7 +590,10 @@ medições. Telemetria e baseline de modelos continuam pendentes.
   bloco a bloco e equivalência exata com Q4 quando a quantização é exata.
 - [x] M1.05b Codec de peso Q8_GROUPED com kernel de matmul e de decode, caudas,
   códigos reservados, comparação numérica contra Q4/denso e bundles mistos.
-- [ ] M1.05c Kernels Q2/Q3 e RAW-F16 de pesos, caudas e comparação numérica,
+- [x] M1.05c Codec de peso Q3_GROUPED no layout do KV, com matmul e decode
+  nativos, caudas, códigos reservados e bits de padding verificados, e
+  comparação numérica contra a referência independente e os demais codecs.
+- [ ] M1.05d Kernels Q2 e RAW-F16 de pesos, caudas e comparação numérica,
   usando o despacho por codec já existente.
 - [x] M1.06 Integrar armazenamento TurboQuant MSE no NexaPack: TQ02 portátil,
   dimensão/bits/seed/SRHT/codebook explícitos, norma F32LE e migração TQ01 com
@@ -1457,6 +1475,32 @@ Décimo primeiro incremento:
   **41 concluídos e 107 pendentes**; M6.02 ganhou o subitem M6.02c com os
   codecs restantes e a seleção por bloco.
 
+## Registro do vigésimo segundo incremento — codec de peso Q3
+
+- Concluído M1.05c: `Q3_GROUPED` no NexaPack, `nexa_q3_matmul` e
+  `nexa_q3_decode_row` no runtime nativo, despacho no executor e o codec
+  disponível em conversão, calibração e PrecisionMap.
+- Layout idêntico ao do KV: escala F32, códigos de três bits a partir do bit
+  menos significativo, `-4` reservado e bits de padding zerados. A regressão
+  compara os bytes com `tests/q3_reference.py`, que não chama o codec nativo.
+- `nexa_q3_row_size` já existia nos kernels do transformer; o novo código reusa
+  esse símbolo em vez de duplicá-lo — o link falhou até a duplicata sair.
+- Limite registrado: o custo por grupo é `4 + ceil(3G/8)`, então com `G = 4` o
+  Q3 ocupa o mesmo que o Q4 e apenas erra mais. A fronteira do planejador
+  descarta opções dominadas sem regra especial, e a regressão fixa os dois casos.
+- Medições com `G = 8`, modelo inteiro num codec: RMSE de logits 0,686 (Q3),
+  0,447 (Q4), 0,017 (Q8), com payload crescendo na ordem inversa. Plano na
+  fixture: teto mínimo → tudo Q3; +100 B → mistura Q3/Q4/Q8; tetos maiores →
+  denso onde o ganho por byte é maior.
+- Validação macOS ARM64/Python 3.14.5: **647 regressões + 110 bootstrap = 757
+  testes, zero falhas e zero skips**. Os 13 novos cobrem igualdade com a
+  referência do KV em quatro tamanhos de grupo, layout e dominância, erro contra
+  Q4, códigos reservados/padding/escala, contêiner, kernel em três grupos,
+  rejeições, decode de linha, escala de quatro codecs em bytes e erro, bundle
+  com todos os codecs e o fluxo calibrar → planejar → converter → executar.
+- Guia: [codecs de peso](NEXALM_CODECS_PESOS.md). Checklist: **42 concluídos e
+  107 pendentes**; M1.05c foi dividido preservando Q2/RAW-F16 em M1.05d.
+
 ## Comandos para validar e retomar
 
 ```sh
@@ -1510,7 +1554,11 @@ python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --o
 python3 tools/nexa_inspect.py artifacts/models/nexalm-q8 --verify
 python3 -m unittest discover -s tests -p 'test_q8_weights_regressions.py' -v
 
-# Calibração por codec e plano com escala Q4/Q8/denso.
+# Codec de peso Q3 e escala completa de quatro codecs.
+python3 tools/nexa_convert.py --checkpoint artifacts/checkpoints/nexalm-tiny --out artifacts/models/nexalm-q3 --matrix-codec q3 --group-size 8 --block-rows 3
+python3 -m unittest discover -s tests -p 'test_q3_weights_regressions.py' -v
+
+# Calibração por codec e plano com escala Q3/Q4/Q8/denso.
 python3 tools/nexa_calibrate.py --checkpoint artifacts/checkpoints/nexalm-tiny --tokens 1,3 --group-size 4 --block-rows 3 --tile-rows 3 --memory-budget 8MiB --report artifacts/reports/calibracao.json
 python3 tools/nexa_precision.py plan --calibration artifacts/reports/calibracao.json --budget 1800B --out artifacts/precision/map.json
 
@@ -1737,6 +1785,16 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo segundo incremento acrescenta:
+
+- `runtime/nexapack/format.py`: `Q3_GROUPED`, writer, decode e validação de
+  linha no layout do KV.
+- `runtime/nexapack/q4.c/.h`: `nexa_q3_matmul` e `nexa_q3_decode_row`.
+- `runtime/nexapack/bundle.py`/`transformer.py`: quarto codec no despacho, com
+  o par matmul/decode por codec numa tabela.
+- `tools/nexa_convert.py`, `tools/nexa_calibrate.py` e `compiler/precision_map.py`
+  aceitam q3; `tests/test_q3_weights_regressions.py`.
 
 Vigésimo primeiro incremento acrescenta:
 

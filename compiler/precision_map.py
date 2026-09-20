@@ -19,7 +19,7 @@ from types import MappingProxyType
 
 SCHEMA_VERSION = 1
 POLICY_ID = "GREEDY_SENSITIVITY_PER_BYTE_V2"
-CODECS = ("q4", "q8", "f32")
+CODECS = ("q3", "q4", "q8", "f32")
 MAX_MAP_TENSORS = 4096
 
 

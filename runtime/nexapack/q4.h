@@ -54,6 +54,20 @@ NEXA_Q4_API int nexa_q4_quantize(
  * Callers must discard output on error: numeric errors may leave partial data.
  * Buffers may have excess capacity; bytes/elements beyond the shape are unused.
  */
+/* Q3_GROUPED v1: float32 scale then three-bit signed codes packed from the
+ * least significant bit, the same layout the paged KV cache stores. Code -4
+ * and nonzero padding bits are rejected as invalid data. The row size helper
+ * lives in the transformer kernels, which already store this layout. */
+NEXA_Q4_API int nexa_q3_decode_row(
+    const uint8_t *packed, size_t packed_bytes, size_t cols, size_t group_size,
+    float *output, size_t output_count);
+
+NEXA_Q4_API int nexa_q3_matmul(
+    const float *inputs, size_t input_count, size_t batch,
+    const uint8_t *packed, size_t packed_bytes,
+    size_t rows, size_t cols, size_t group_size,
+    float *output, size_t output_count);
+
 /* Q8_GROUPED: float32 scale then one signed byte per coordinate, per group.
  * Contract matches nexa_q4_matmul; code -128 is rejected as invalid data. */
 NEXA_Q4_API size_t nexa_q8_row_size(size_t cols, size_t group_size);

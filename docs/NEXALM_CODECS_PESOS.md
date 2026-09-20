@@ -1,4 +1,4 @@
-# Codecs de peso por tensor: Q4, Q8 e matrizes RAW_F32
+# Codecs de peso por tensor: Q3, Q4, Q8 e matrizes RAW_F32
 
 O décimo sétimo incremento acrescenta o **segundo codec de peso** e o despacho
 por tensor no executor. Até aqui toda matriz era Q4 e o executor só sabia
@@ -28,6 +28,26 @@ Os três codecs convivem no mesmo bundle. Uma regressão constrói um modelo com
 embedding denso, um tensor Q8 e outro Q4, usando pesos que **todos** os codecs
 guardam sem erro (zero e ±máximo do grupo, já que Q4 escala por `max/7` e Q8 por
 `max/127`), e verifica que os três caminhos produzem os mesmos logits.
+
+## Q3_GROUPED
+
+O vigésimo segundo incremento acrescenta o quarto ponto da escala: três bits com
+sinal por valor, empacotados a partir do bit menos significativo, com
+`escala = max|v| / 3` e o código `-4` reservado. O layout é **o mesmo** que o
+cache KV já armazena — uma regressão compara byte a byte com a referência
+independente do KV, porque duas grafias do mesmo codec fariam a mesma página
+lógica significar coisas diferentes.
+
+**Q3 nem sempre compensa.** O custo por grupo é `4 + ceil(3G/8)` bytes, e a
+escala de 4 bytes domina em grupos pequenos: com `G = 4`, Q3 e Q4 ocupam os
+mesmos 6 bytes, e Q3 apenas erra mais. Só a partir de grupos maiores o codec
+economiza de fato — com `G = 8` são 7 bytes contra 8. O planejador trata isso
+sozinho: uma opção que custa mais sem errar menos sai da fronteira antes da
+escolha, e uma regressão fixa esse comportamento com os dois tamanhos de grupo.
+
+Medição na fixture com `G = 8`, modelo inteiro num codec só, contra a referência
+densa: RMSE de logits 0,686 (Q3), 0,447 (Q4) e 0,017 (Q8), com payload crescendo
+na ordem inversa. Os quatro codecs convivem no mesmo bundle.
 
 ## Formato
 
@@ -64,7 +84,7 @@ que um bundle misto mostra os dois caminhos ativos.
 ## Uso
 
 ```bash
-# Um codec para todas as matrizes.
+# Um codec para todas as matrizes (q3, q4, q8 ou f32).
 python3 tools/nexa_convert.py --checkpoint CHECKPOINT --out artifacts/models/q8 --matrix-codec q8 --group-size 32
 
 # Codec por tensor, misturando livremente.
@@ -98,9 +118,8 @@ O embedding denso lê um bloco inteiro por token alcançado, então um bloco gra
 custa I/O mesmo para um único token. Para prompts longos com vocabulário grande,
 prefira Q4 no embedding ou blocos menores.
 
-Q2, Q3 e F16 de **pesos** continuam pendentes em M1.05c, assim como o despacho
-de atenção para esses layouts (M4.03d). A calibração e o PrecisionMap ainda
-comparam apenas Q4 contra denso: medir e planejar com Q8 no espaço de escolha
-é M6.01c/M6.02b, e o contrato do mapa não muda por isso — apenas ganha mais um
-valor possível por tensor. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
+Q2 e RAW-F16 de **pesos** continuam pendentes em M1.05d, assim como o despacho
+de atenção para os demais layouts (M4.03d). A calibração mede e o PrecisionMap
+planeja com os três codecs empacotados mais o denso; cada codec novo acrescenta
+um degrau sem mudar o contrato do mapa. O [checklist](BLUEPRINT_512MB_CHECKLIST.md)
 registra a suíte, os comandos e a próxima tarefa.

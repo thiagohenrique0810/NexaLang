@@ -27,9 +27,10 @@ from .format import (NexaPackError, NexaPackReader, READ_CHUNK_BYTES,
                      write_grouped_matrix)
 
 # Matrix codecs a bundle may store, with the NexaPack id each one publishes.
-PACKED_CODECS = {"q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
+PACKED_CODECS = {"q3": "Q3_GROUPED", "q4": "Q4_GROUPED", "q8": "Q8_GROUPED"}
 MATRIX_CODECS = (*PACKED_CODECS, "f32")
-CODEC_BITS = {"Q4_GROUPED": 4, "Q8_GROUPED": 8, "RAW_F32_MATRIX": 32, "RAW_F32": 32}
+CODEC_BITS = {"Q3_GROUPED": 3, "Q4_GROUPED": 4, "Q8_GROUPED": 8,
+              "RAW_F32_MATRIX": 32, "RAW_F32": 32}
 
 FORMAT = "NexaModelBundle"
 FORMAT_VERSION = 1

@@ -58,7 +58,8 @@ class PrecisionSelectionRegressions(unittest.TestCase):
         # 200 at the cheapest codecs, 100 spare: only alpha's q8 step fits.
         precision = select_precision(LADDER, 300)
         self.assertEqual(dict(precision.codecs), {"alpha": "q8", "beta": "q4"})
-        self.assertEqual(precision.provenance["codec_counts"], {"q4": 1, "q8": 1, "f32": 0})
+        self.assertEqual(precision.provenance["codec_counts"],
+                         {"q3": 0, "q4": 1, "q8": 1, "f32": 0})
         self.assertEqual([item["codec"] for item in precision.provenance["upgrades"]], ["q8"])
         # Room for alpha's q8 step and beta's jump straight to dense.
         precision = select_precision(LADDER, 600)

@@ -24,12 +24,14 @@ import shutil
 
 from runtime.nexapack.bundle import PACKED_CODECS
 from runtime.nexapack.format import (
-    decode_q4_row, decode_q8_row, quantize_q4_row, quantize_q8_row,
+    decode_q3_row, decode_q4_row, decode_q8_row,
+    quantize_q3_row, quantize_q4_row, quantize_q8_row,
 )
 
 MAX_CALIBRATION_TENSORS = 4096
 # Round-trip helpers per packed weight codec; dense needs none by definition.
 _CODEC_ROUND_TRIP = {
+    "q3": (quantize_q3_row, decode_q3_row),
     "q4": (quantize_q4_row, decode_q4_row),
     "q8": (quantize_q8_row, decode_q8_row),
 }
