@@ -67,6 +67,10 @@ def main(argv=None):
                         help="Optional CPU page aging: hot F32, warm Q4, cold Q3")
     parser.add_argument("--kv-hot-pages", type=int, help="Newest F32 pages under the age policy (default: 1)")
     parser.add_argument("--kv-warm-pages", type=int, help="Intermediate Q4 pages under the age policy (default: 1)")
+    parser.add_argument("--kv-quality-max-rmse", type=float,
+                        help="A page whose re-encode RMSE exceeds this keeps its current codec")
+    parser.add_argument("--kv-retain-pages", type=int, default=0,
+                        help="How many pages the quality ceiling may keep above their age (default: 0)")
     parser.add_argument("--kv-backing-store", type=Path,
                         help="Private temporary cache for cold Q3 pages; requires --kv-policy age")
     parser.add_argument("--kv-reload-slots", type=int,
@@ -106,10 +110,21 @@ def main(argv=None):
             parser.error("--kv-hot-pages must be positive")
         if args.kv_warm_pages is not None and args.kv_warm_pages < 0:
             parser.error("--kv-warm-pages must be nonnegative")
-    elif args.kv_hot_pages is not None or args.kv_warm_pages is not None:
-        parser.error("--kv-hot-pages/--kv-warm-pages require --kv-policy age")
+        if args.kv_quality_max_rmse is not None and not args.kv_quality_max_rmse >= 0:
+            parser.error("--kv-quality-max-rmse must be nonnegative")
+        if args.kv_retain_pages < 0:
+            parser.error("--kv-retain-pages must be nonnegative")
+        if args.kv_retain_pages and args.kv_quality_max_rmse is None:
+            parser.error("--kv-retain-pages needs --kv-quality-max-rmse to compare against")
+        if args.kv_quality_max_rmse is not None and not args.kv_retain_pages:
+            parser.error("--kv-quality-max-rmse needs --kv-retain-pages to bound the admitted budget")
+    elif (args.kv_hot_pages is not None or args.kv_warm_pages is not None
+          or args.kv_quality_max_rmse is not None or args.kv_retain_pages):
+        parser.error("--kv-hot-pages/--kv-warm-pages/--kv-quality-* require --kv-policy age")
     if args.kv_backing_store is not None and args.kv_policy != "age":
         parser.error("--kv-backing-store requires --kv-policy age")
+    if args.kv_backing_store is not None and args.kv_quality_max_rmse is not None:
+        parser.error("--kv-quality-max-rmse is not supported with --kv-backing-store")
     if args.kv_reload_slots is not None and (args.kv_backing_store is None or args.kv_reload_slots < 1):
         parser.error("--kv-reload-slots requires --kv-backing-store and at least one slot")
     if (args.tokens is None) == (args.prompt is None):
@@ -170,7 +185,9 @@ def main(argv=None):
                             session_options["kv_reload_slots"] = args.kv_reload_slots
                     session_options.update({"hot_pages": 1 if args.kv_hot_pages is None else args.kv_hot_pages,
                                             "warm_pages": 1 if args.kv_warm_pages is None else args.kv_warm_pages,
-                                            "kv_group_size": 32 if args.kv_group_size is None else args.kv_group_size})
+                                            "kv_group_size": 32 if args.kv_group_size is None else args.kv_group_size,
+                                            "kv_quality_max_rmse": args.kv_quality_max_rmse,
+                                            "kv_retain_pages": args.kv_retain_pages})
                 else:
                     session_options["kv_codec"] = args.kv_codec
                     if args.kv_codec == "tq":

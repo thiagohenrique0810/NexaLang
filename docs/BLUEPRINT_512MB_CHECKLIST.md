@@ -129,6 +129,24 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Vigésimo sétimo incremento implementado e validado:** critérios de qualidade
+para as transições de idade. `--kv-quality-max-rmse T --kv-retain-pages N` mede o
+erro de re-encode **por página** antes de publicar qualquer coisa e descarta o
+destino cujo RMSE ultrapassa `T`, deixando a página no codec em que já estava.
+Como a transação já mantinha origem e destino residentes até o commit, a página
+retida é byte a byte a que o prefill escreveu — não uma reconstrução: promoção
+real de precisão (Q3 → F32) continua impossível e foi declarada assim. O
+orçamento `N` entra na reserva antes da primeira alocação; esgotado, a página
+envelhece mesmo falhando no teto e o relatório registra `retentions_declined`.
+Na fixture tiny, F32→Q4 erra 0,030–0,044 de RMSE e Q4→Q3 erra 0,077–0,097; contra
+um oráculo sem envelhecimento, idade pura erra 0,05480 nos logits, teto 0 com duas
+páginas erra 0,01114 e com quatro erra 0. O teto 0,05 com duas páginas melhora
+apenas 0,00006: **teto local de RMSE não é garantia de qualidade global**, e
+escolher quais páginas merecem o orçamento depende da importância por página, que
+ficou em M4.05e. A sessão com backing store recusa a opção em vez de ignorá-la.
+Passaram **705 testes**, sem falhas ou skips. Checklist: **48 concluídos e 104
+pendentes**.
+
 **Décimo quarto incremento implementado e validado:** sequências derivadas com
 prefixo compartilhado no executor paginado homogêneo. `fork()` retém as páginas
 completas do prefixo — imutáveis, com contagem de referências — e copia apenas a
@@ -297,12 +315,14 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M4.05d — promoção de precisão e critérios de qualidade.**
-É o que resta de M4 junto de M4.06d. Continua dependendo de qualidade medida em
-checkpoint treinado (LLM.04b) e da calibração de M6.01 para definir importância
-por página; o que dá para fazer antes é o contrato de transição e a comparação
-contra idade uniforme na fixture. Alternativas em aberto: M4.06d (cancelamento e
-admissão conjunta), M6.01d (conjunto representativo) e M5.01 com modelo real.
+**Próxima tarefa: M4.06d — cancelamento de chamada em andamento e admissão
+conjunta.** É o que resta de M4 junto de M4.05e. Cancelar exige executar a
+chamada fora da thread que cancela; hoje só há rollback de falhas. Admissão
+conjunta por processo é o passo que falta para várias sessões coexistirem sob um
+único teto de 512 MB, já que hoje cada sessão admite o próprio orçamento e o
+compartilhamento reduz residência real sem reduzir a reserva. Alternativas em
+aberto: M4.05e (importância por página, que depende de M6.01), M6.01d (conjunto
+representativo) e M5.01 com modelo real.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -317,16 +337,17 @@ em andamento exige executá-la fora da thread que cancela; hoje só há rollback
 falhas e interrupções. Admissão conjunta: cada sessão admite o próprio orçamento,
 e o compartilhamento reduz residência real sem reduzir a reserva.
 
-**Também pendente: critérios de qualidade e importância por página, M4.05d.**
-Depende de qualidade medida em checkpoint treinado (LLM.04b) e da calibração
-M6.01, porque selecionar páginas por importância altera logits.
-O número de slots é hoje um parâmetro do operador, sem política que decida
-quantos admitir nem quais páginas priorizar. Definir importância por página e
-budgets por camada exige a calibração de M6.01 e comparação contra idade
-uniforme; medir também um cenário sem ganho. Promoção de **precisão** continua
-aberta e não se confunde com residência: converter Q3 para F32 não recupera o
-original. Prefetch, leitura assíncrona, TQ misto, checkpoint treinado, pesos TQ,
-GPU e o gate M4 completo continuam abertos. NexaData/tokenizer e contratos Omni
+**Também pendente: importância por página e budgets por camada, M4.05e.**
+O teto de qualidade de M4.05d limita o dano de uma transição individual, mas não
+escolhe quais páginas merecem o orçamento; essa escolha depende de qualidade
+medida em checkpoint treinado (LLM.04b) e da calibração M6.01, porque selecionar
+páginas por importância altera logits. O número de slots também é hoje um
+parâmetro do operador, sem política que decida quantos admitir. Falta ainda a
+comparação contra idade uniforme em modelo treinado e medir um cenário sem ganho.
+Promoção de **precisão** foi declarada impossível e não se confunde com retenção:
+converter Q3 para F32 não recupera o original; o que M4.05d faz é decidir antes de
+descartar. O teto sob backing store, prefetch, leitura assíncrona, TQ misto,
+checkpoint treinado, pesos TQ, GPU e o gate M4 completo continuam abertos. NexaData/tokenizer e contratos Omni
 F0 podem avançar em paralelo.
 
 Use os guias de [importação](NEXALM_IMPORTACAO.md) e
@@ -719,10 +740,15 @@ transferidos e limite máximo documentados.
   determinística de admissão/substituição sob varredura cíclica, ownership e
   liberação; bytes, ordem de redução e logits preservados, bytes/recargas
   evitados, pico e cenário sem ganho medidos.
-- [ ] M4.05d Promoção de precisão e critérios de qualidade para transições;
-  custo/orçamento sem descartar contexto causal. Importância por página e budgets
-  por camada exigem calibração em M6.01 e comparação com idade uniforme
-  (Blueprint pp.9–10, P16–19; p.15, §7.3). Prefetch e leitura assíncrona incluídos.
+- [x] M4.05d Critérios de qualidade para transições: erro de re-encode medido por
+  página antes de qualquer publicação, teto de RMSE que faz a página manter o
+  codec atual, orçamento de retenção admitido na reserva, retenção sem promoção
+  (a página retida é a original, byte a byte), recusa explícita sob backing store
+  e comparação contra o oráculo sem envelhecimento (Blueprint pp.9–10, P16–19).
+- [ ] M4.05e Importância por página e budgets por camada, que exigem a calibração
+  de M6.01 e comparação com idade uniforme em checkpoint treinado; teto de
+  qualidade sob backing store, com plano físico e slots refeitos; prefetch e
+  leitura assíncrona (Blueprint p.15, §7.3).
 - [x] M4.06a Múltiplas sequências no executor paginado homogêneo: prefixo
   compartilhado por contagem de referências, cópia apenas da página parcial,
   escrita em página compartilhada rejeitada, capacidade por sequência e
@@ -1309,6 +1335,39 @@ Décimo primeiro incremento:
   **32 concluídos e 107 pendentes**; a divisão de M4.05 e as duas tarefas CC
   acrescentadas na mesma revisão aumentam a contagem, sem equivaler a percentual
   de conclusão ou prazo. Próximo incremento técnico: M4.05d.
+
+## Registro do vigésimo sétimo incremento — qualidade nas transições
+
+- Concluído M4.05d: `TieredKVPolicy` ganhou `quality_max_rmse` e `retain_pages`,
+  ambos no `policy_id` serializado e na identidade de layout, de modo que uma
+  sequência derivada não herda um prefixo decidido sob outro teto.
+- `TieredKVCachePlan.desired_pages(length, retained)` aceita páginas acima da
+  precisão que a idade daria, e **apenas** acima: envelhecer não anda para trás.
+  `quality_retention_bytes` soma `N × (A_f32 − A_q3)` à reserva antes da primeira
+  alocação. Em D64 com `N=4`, a reserva vai de 7.295.164 B para 9.130.172 B.
+- `TieredKVTransition` carrega `retained_pages` (o que entra) e
+  `final_retained_pages` (o que sobrevive); um prefixo substituído não compartilha
+  página nenhuma com o anterior, então `prefill` e `reset` devolvem o orçamento.
+- `runtime/nexapack/tiered.py::_migrate_pages` mede o erro por página, e não só
+  agregado, e descarta o destino que ultrapassa o teto — a página de origem
+  permanece em `final_pages` e o destino é liberado no commit, sem alocação nova.
+  `_residency_fields`/`_publish_retention` reescrevem `kv_pages` e os campos de
+  residência depois do veredito, porque o relatório é montado antes dele.
+- Medições na fixture tiny (páginas de 1 token, grupo 3): F32→Q4 erra 0,030–0,044
+  de RMSE por página e Q4→Q3 erra 0,077–0,097. Contra o oráculo sem envelhecimento,
+  o erro máximo nos logits é 0,05480 (idade pura), 0,05474 (teto 0,05 · 2 páginas),
+  0,01114 (teto 0 · 2) e 0 (teto 0 · 4). O teto 0,05 quase não melhora o resultado:
+  um teto local de RMSE limita o dano por transição, não a qualidade global.
+- Limite declarado: `OffloadedTieredTransformerSession` **recusa** o teto, e a CLI
+  recusa `--kv-quality-max-rmse` junto de `--kv-backing-store`. Uma página retida
+  deixa de ser cold, o que muda plano físico, slots de recarga e evicção; ficou em
+  M4.05e, junto de importância por página, prefetch e leitura assíncrona.
+- `tests/test_tiered_quality_regressions.py`: 23 regressões cobrindo o plano (9),
+  o runtime (11) e a CLI (3), incluindo retenção byte a byte contra a origem,
+  orçamento esgotado, herança em `fork`, rollback e rejeições.
+- Passaram **705 testes** (`python3 -m unittest discover -s tests`), sem falhas ou
+  skips. Guia: [critérios de qualidade](NEXALM_KV_QUALIDADE.md). Checklist:
+  **48 concluídos e 104 pendentes**. Próximo incremento técnico: M4.06d.
 
 ## Registro do décimo quarto incremento — sequências derivadas
 
@@ -1957,6 +2016,17 @@ Décimo quarto incremento acrescenta:
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
 
+Vigésimo sétimo incremento acrescenta:
+
+- `compiler/tiered_kv_plan.py`: `quality_max_rmse`/`retain_pages` na política,
+  `normalize_retained`, `desired_pages(length, retained)`, `quality_retention_bytes`
+  e `retained_pages`/`final_retained_pages` na transição.
+- `runtime/nexapack/tiered.py`: erro por página na migração, descarte do destino
+  acima do teto, `_residency_fields`, `_publish_retention` e `kv_retained_pages`.
+- `runtime/nexapack/offloaded.py`: recusa explícita do teto sob backing store.
+- `tools/nexa_run.py`: `--kv-quality-max-rmse` e `--kv-retain-pages`.
+- `tests/test_tiered_quality_regressions.py` e `docs/NEXALM_KV_QUALIDADE.md`.
+
 Vigésimo sexto incremento acrescenta:
 
 - `runtime/nexapack/kv_store.py`: contagem de donos por arquivo e por store,
@@ -2064,9 +2134,11 @@ orquestrado em Python, uma sequência, KV paginado como caminho padrão, com
 baseline por recomputação e cache de dois bancos por flag; F32 (dois bancos/páginas), Q4/Q3/TQ paginado ou política mista F32/Q4/Q3
 por idade em RAM, com backing store opcional para evicção/recarga de cold Q3 CPU.
 Páginas cold podem ser reutilizadas em slots admitidos, e sequências derivadas
-compartilham o prefixo paginado, homogêneo ou por idade. Pesos Q3/TQ, TQ misto,
-promoção de precisão, prefetch, múltiplas sequências e compartilhamento de
-prefixos permanecem pendentes. O cache privado CPU não implementa residência
+compartilham o prefixo paginado, homogêneo ou por idade. Um teto de RMSE por
+página pode impedir que uma transição de idade seja adotada, dentro de um
+orçamento de retenção admitido. Pesos Q3/TQ, TQ misto, importância por página,
+prefetch e admissão conjunta entre sessões permanecem pendentes; promoção real de
+precisão foi declarada impossível. O cache privado CPU não implementa residência
 GPU de experts, roteamento condicional ou Plastic Learning.
 Há tokenizer byte-level com execução a partir de texto, ainda sem vocabulário
 congelado em corpus real.

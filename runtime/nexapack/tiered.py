@@ -30,10 +30,13 @@ class _TieredPage(_KVPage):
 class TieredTransformerSession(PagedTransformerSession):
     """One sequence with a fixed page-age policy, no eviction or concurrent calls."""
     def __init__(self, bundle_path, *, page_tokens=16, max_chunk_length=None,
-                 hot_pages=1, warm_pages=1, kv_group_size=32, **kwargs):
-        self._policy = TieredKVPolicy(hot_pages, warm_pages, kv_group_size)
+                 hot_pages=1, warm_pages=1, kv_group_size=32,
+                 kv_quality_max_rmse=None, kv_retain_pages=0, **kwargs):
+        self._policy = TieredKVPolicy(hot_pages, warm_pages, kv_group_size,
+                                      kv_quality_max_rmse, kv_retain_pages)
         self._tier_plan = None
         self._page_descriptors = ()
+        self._retained = {}
         self._transaction = None
         if any(name in kwargs for name in ("kv_codec", "kv_bits", "kv_seed", "kv_codebook_f32le")):
             raise ValueError("Age tiers use fixed F32/Q4/Q3 codecs and do not accept homogeneous codec options")
@@ -70,7 +73,9 @@ class TieredTransformerSession(PagedTransformerSession):
         for name in ("kv_codec", "kv_bits", "kv_seed", "kv_codebook_f32le"):
             options.pop(name)
         options.update({"hot_pages": self.policy.hot_pages, "warm_pages": self.policy.warm_pages,
-                        "kv_group_size": self.policy.group_size})
+                        "kv_group_size": self.policy.group_size,
+                        "kv_quality_max_rmse": self.policy.quality_max_rmse,
+                        "kv_retain_pages": self.policy.retain_pages})
         return options
 
     def _layout_identity(self):
@@ -83,6 +88,8 @@ class TieredTransformerSession(PagedTransformerSession):
         # a migration is private to the sequence performing it: the shared page
         # stays valid, and each sequence may pay that re-encode separately.
         self._page_descriptors = parent._page_descriptors if parent is not None else ()
+        # The retained set describes the inherited pages, not a private decision.
+        self._retained = dict(parent._retained) if parent is not None else {}
 
     def _make_plan(self, length, *, execution_context=None):
         self._configure_cache()
@@ -144,11 +151,7 @@ class TieredTransformerSession(PagedTransformerSession):
         total = transition.new_length if transition is not None else self.cache_length
         resident = sum(page.page_allocation_bytes for page in descriptors)
         live = self._pending_pages if self._pending_pages is not None else self._pages
-        shared = [page for page in live if getattr(page, "shared", False)]
-        shared_bytes = sum(page.allocation_bytes for page in shared)
-        payload = sum(self._tier_plan.layout(page.codec).page_payload_bytes for page in descriptors)
-        valid_bytes = sum(page.valid_tokens * self._tier_plan.layout(page.codec).token_bytes *
-                          self.config.num_hidden_layers * 2 for page in descriptors)
+        residency = self._residency_fields(descriptors, live)
         reserved = self._tier_plan.allocation_limit_bytes(self.max_chunk_length)
         scratch = self._tier_plan.migration_scratch_bytes
         report.update({"decode_strategy": "tiered_paged_incremental_kv", "persistent_kv_cache": True,
@@ -156,7 +159,9 @@ class TieredTransformerSession(PagedTransformerSession):
                        "kv_policy": self.policy.to_dict(), "max_chunk_length": self.max_chunk_length,
                        "kv_partial_page_policy": "hot_f32_until_full",
                        "kv_cache_plan": self._tier_plan.to_dict(),
-                       "kv_pages": [page.to_dict() for page in descriptors],
+                       "kv_pages": residency["kv_pages"],
+                       "kv_retained_pages": [[index, self._retained[index]]
+                                             for index in sorted(self._retained)],
                        "context_length": total, "cache_length": total,
                        "cache_position_offset": execution_context.position_offset if execution_context else 0,
                        "model_ir_scope": "chunk graph; per-page attention layouts and post-compute migrations in execution_plan"})
@@ -178,19 +183,11 @@ class TieredTransformerSession(PagedTransformerSession):
         migration_pages = transition.transaction_peak_bytes if transition else resident
         migration_scratch = scratch if transition and transition.migrations else 0
         memory.update({"scope": "managed CPU workspace, mixed KV pages/tables, migration buffers and reader scratch; excludes RSS/VRAM",
-                       "kv_page_tokens": self.page_tokens, "kv_resident_page_count": len(descriptors),
-                       "kv_resident_allocation_bytes": resident, "persistent_kv_bytes": payload,
-                       # Shared pages are resident once for the whole process;
-                       # summing sequences would count the same page twice.
-                       "kv_shared_page_count": len(shared),
-                       "kv_shared_allocation_bytes": shared_bytes,
-                       "kv_owned_allocation_bytes": resident - shared_bytes,
-                       "kv_valid_prefix_bytes": valid_bytes,
+                       "kv_page_tokens": self.page_tokens,
+                       **residency["memory"],
                        "kv_valid_prefix_f32_bytes": total * self.config.num_hidden_layers * 2 * self._cache_plan.token_bytes,
                        "kv_f32_bytes_per_token": self.config.num_hidden_layers * 2 * self._cache_plan.token_bytes,
                        "kv_full_dequantized_buffer_bytes": 0, "kv_prefix_copy_buffer_bytes": 0,
-                       "kv_tier_counts": {tier: sum(page.tier == tier for page in descriptors)
-                                          for tier in ("hot", "warm", "cold")},
                        "kv_page_table_bytes": sum(plan.allocations[name].size_bytes for name in
                                                   ("__key_pages", "__value_pages", "__page_codecs", "__page_bytes")),
                        "kv_reserved_capacity_bytes": reserved,
@@ -206,9 +203,53 @@ class TieredTransformerSession(PagedTransformerSession):
                                                                migration_pages + migration_scratch)})
         return report
 
+    def _residency_fields(self, descriptors, live):
+        """Report fields that depend on which page is resident at which codec.
+
+        The quality gate decides that only after the report is built, so the
+        computation lives here and is applied a second time on the way out.
+        """
+        resident = sum(page.page_allocation_bytes for page in descriptors)
+        shared = [page for page in live if getattr(page, "shared", False)]
+        shared_bytes = sum(page.allocation_bytes for page in shared)
+        return {"kv_pages": [page.to_dict() for page in descriptors],
+                "memory": {
+                    "kv_resident_page_count": len(descriptors),
+                    "kv_resident_allocation_bytes": resident,
+                    "persistent_kv_bytes": sum(self._tier_plan.layout(page.codec).page_payload_bytes
+                                               for page in descriptors),
+                    # Shared pages are resident once for the whole process;
+                    # summing sequences would count the same page twice.
+                    "kv_shared_page_count": len(shared),
+                    "kv_shared_allocation_bytes": shared_bytes,
+                    "kv_owned_allocation_bytes": resident - shared_bytes,
+                    "kv_valid_prefix_bytes": sum(page.valid_tokens *
+                                                 self._tier_plan.layout(page.codec).token_bytes *
+                                                 self.config.num_hidden_layers * 2 for page in descriptors),
+                    "kv_tier_counts": {tier: sum(page.tier == tier for page in descriptors)
+                                       for tier in ("hot", "warm", "cold")}}}
+
+    def _publish_retention(self, report, transition, migration, final_pages):
+        """Final descriptors and retention set once the gate has spoken."""
+        kept = dict(transition.final_retained_pages)
+        kept.update(migration["retained"])
+        descriptors = transition.final_pages
+        if migration["retained"]:
+            descriptors = self._tier_plan.desired_pages(transition.new_length, kept)
+            residency = self._residency_fields(descriptors, final_pages)
+            report["kv_pages"] = residency["kv_pages"]
+            report["memory"].update(residency["memory"])
+        report["kv_retained_pages"] = [[index, kept[index]] for index in sorted(kept)]
+        return descriptors, kept
+
     def _migrate_pages(self, transition, pending, final_pages, staged):
+        ceiling = self.policy.quality_max_rmse
+        budget = self.policy.retain_pages - len(transition.final_retained_pages)
         result = {"pages_reencoded": 0, "source_bytes": 0, "target_bytes": 0,
                   "max_abs_error": 0.0, "sum_squared_error": 0.0, "value_count": 0, "rmse": 0.0,
+                  "quality_max_rmse": ceiling, "retain_pages_available": max(budget, 0),
+                  "pages_retained": 0, "retentions_declined": 0, "discarded_target_bytes": 0,
+                  "worst_page_rmse": 0.0, "retained": [], "page_rmse": [],
                   "scope": "error between source and destination reconstructed KV, including the F32 bridge"}
         if not transition.migrations:
             return result
@@ -230,10 +271,11 @@ class TieredTransformerSession(PagedTransformerSession):
                 except BaseException:
                     target.release()
                     raise
-                final_pages[index] = target
                 rows = migration.source.valid_tokens * self.config.num_key_value_heads
                 input_bytes = rows * source.layout.head_row_bytes
                 output_bytes = rows * target.layout.head_row_bytes
+                page_max = page_squared = 0.0
+                page_values = 0
                 for layer in range(self.config.num_hidden_layers):
                     for kind in ("key", "value"):
                         inputs = (ctypes.c_uint8 * input_bytes).from_address(
@@ -246,11 +288,28 @@ class TieredTransformerSession(PagedTransformerSession):
                             scratch, len(scratch), stats, len(stats))
                         if status:
                             raise ArithmeticError(f"Native nexa_kv_reencode_rows failed with status {status}")
-                        result["max_abs_error"] = max(result["max_abs_error"], stats[0])
-                        result["sum_squared_error"] += stats[1]
-                        result["value_count"] += int(stats[2])
-                        result["source_bytes"] += input_bytes
-                        result["target_bytes"] += output_bytes
+                        page_max = max(page_max, stats[0])
+                        page_squared += stats[1]
+                        page_values += int(stats[2])
+                page_rmse = math.sqrt(page_squared / page_values) if page_values else 0.0
+                result["worst_page_rmse"] = max(result["worst_page_rmse"], page_rmse)
+                result["page_rmse"].append([index, page_rmse])
+                # The destination exists and was measured before anything was
+                # published: a page too damaged to age simply is not adopted.
+                if ceiling is not None and page_rmse > ceiling:
+                    if budget > 0:
+                        budget -= 1
+                        result["pages_retained"] += 1
+                        result["discarded_target_bytes"] += output_bytes * 2 * self.config.num_hidden_layers
+                        result["retained"].append([index, source.codec])
+                        continue  # target stays in staged and is released on commit
+                    result["retentions_declined"] += 1
+                final_pages[index] = target
+                result["max_abs_error"] = max(result["max_abs_error"], page_max)
+                result["sum_squared_error"] += page_squared
+                result["value_count"] += page_values
+                result["source_bytes"] += input_bytes * 2 * self.config.num_hidden_layers
+                result["target_bytes"] += output_bytes * 2 * self.config.num_hidden_layers
                 result["pages_reencoded"] += 1
             result["rmse"] = math.sqrt(result["sum_squared_error"] / result["value_count"]) if result["value_count"] else 0.0
             return result
@@ -266,7 +325,9 @@ class TieredTransformerSession(PagedTransformerSession):
                              "kv_migration_source_bytes": migration["source_bytes"],
                              "kv_migration_target_bytes": migration["target_bytes"],
                              "kv_pages_allocated": len(transition.fresh_pages) + len(transition.migrations),
-                             "kv_pages_reencoded": len(transition.migrations)})
+                             "kv_pages_reencoded": migration["pages_reencoded"],
+                             "kv_pages_quality_retained": migration["pages_retained"],
+                             "kv_migration_discarded_bytes": migration["discarded_target_bytes"]})
         report["timing"]["migration_wall_seconds"] = migration_seconds
         report["timing"]["execution_wall_seconds"] += migration_seconds
         return report
@@ -279,7 +340,8 @@ class TieredTransformerSession(PagedTransformerSession):
         if mode == "decode" and not self._tokens:
             raise ValueError("append/decode requires a successful prefill first")
         candidate = chunk if mode == "prefill" else self._validate_tokens(self._tokens + chunk)
-        transition = self._tier_plan.plan_transition(self.cache_length, len(chunk), mode, self._page_descriptors)
+        transition = self._tier_plan.plan_transition(self.cache_length, len(chunk), mode,
+                                                     self._page_descriptors, self._retained)
         context = self._context(len(chunk), mode=mode)
         self._make_plan(len(chunk), execution_context=context)
         old_pages = self._pages
@@ -302,10 +364,11 @@ class TieredTransformerSession(PagedTransformerSession):
             migration = self._migrate_pages(transition, pending, final_pages, staged)
             elapsed = time.perf_counter() - started
             report = self._finalize_report(report, candidate, chunk, transition, migration, elapsed)
+            descriptors, kept = self._publish_retention(report, transition, migration, final_pages)
             # All fallible result preparation precedes the single state publication.
             retained = {id(page) for page in final_pages}
-            self._tokens, self._last_report, self._pages, self._page_descriptors = (
-                candidate, report, final_pages, transition.final_pages)
+            self._tokens, self._last_report, self._pages, self._page_descriptors, self._retained = (
+                candidate, report, final_pages, descriptors, kept)
             committed = True
         finally:
             self._pending_pages = self._transaction = None
@@ -327,7 +390,8 @@ class TieredTransformerSession(PagedTransformerSession):
         # Compute the empty report before publishing the reset.
         graph, plan = self._make_plan(self.max_sequence_length)
         report = self._report(graph, plan, executed=False)
-        report.update({"context_length": 0, "cache_length": 0, "cache_position_offset": 0, "kv_pages": []})
+        report.update({"context_length": 0, "cache_length": 0, "cache_position_offset": 0,
+                       "kv_pages": [], "kv_retained_pages": []})
         memory = report["memory"]
         for name in ("kv_resident_page_count", "kv_resident_allocation_bytes", "persistent_kv_bytes",
                      "kv_shared_page_count", "kv_shared_allocation_bytes", "kv_owned_allocation_bytes",
@@ -338,9 +402,11 @@ class TieredTransformerSession(PagedTransformerSession):
         memory["managed_buffers_peak_bound_bytes"] = plan.peak_bytes["host"] + ALIGNMENT - 1 + READ_CHUNK_BYTES
         memory["kv_attention_phase_bound_bytes"] = memory["managed_buffers_peak_bound_bytes"]
         self._tokens, self._last_report, self._pages, self._page_descriptors = (), report, [], ()
+        self._retained = {}
         for page in old_pages:
             page.release()
 
     def close(self):
         super().close()
         self._page_descriptors = ()
+        self._retained = {}

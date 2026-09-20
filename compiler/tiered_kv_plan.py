@@ -13,6 +13,7 @@ scratch is reported separately for admission alongside those other resources.
 from dataclasses import dataclass, field, fields
 import hashlib
 import json
+import math
 from types import MappingProxyType
 
 from .kv_plan import _strict_equal
@@ -27,8 +28,33 @@ from .paged_kv_plan import (
 SCHEMA_VERSION = 1
 POLICY_ID = "CPU_PAGE_AGE_F32_Q4_Q3_V1"
 _CODECS = {"hot": "f32", "warm": "q4", "cold": "q3"}
+# Higher rank means more precision: a page may be kept above what its age
+# would give it, never below. Ageing does not run backwards.
+_PRECISION_RANK = {"q3": 0, "q4": 1, "f32": 2}
 _TIERS = {value: key for key, value in _CODECS.items()}
 _CODEC_IDS = {"f32": "F32_NATIVE", "q4": "Q4_GROUPED", "q3": "Q3_GROUPED"}
+
+
+def normalize_retained(retained):
+    """Canonical retained-page form: pairs sorted by page index, JSON friendly."""
+    if retained is None:
+        return ()
+    items = retained.items() if isinstance(retained, dict) else retained
+    result = []
+    seen = set()
+    for pair in items:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError("A retained page is a (page_index, codec) pair")
+        page_index, codec = pair
+        _integer(page_index, "retained page index")
+        if page_index in seen:
+            raise ValueError("A retained page index appears twice")
+        if not isinstance(codec, str) or codec not in _PRECISION_RANK:
+            raise ValueError("A retained page codec must be f32, q4 or q3")
+        seen.add(page_index)
+        result.append((page_index, codec))
+    result.sort()
+    return tuple(result)
 
 
 def _byte_range(value, label):
@@ -55,11 +81,26 @@ class TieredKVPolicy(_JSON):
     hot_pages: int = 1
     warm_pages: int = 1
     group_size: int = 32
+    # A page whose re-encode error exceeds this RMSE keeps its current codec,
+    # up to retain_pages of them. Zero pages means ageing is unconditional.
+    quality_max_rmse: float | None = None
+    retain_pages: int = 0
 
     def __post_init__(self):
         _integer(self.hot_pages, "hot_pages", 1)
         _integer(self.warm_pages, "warm_pages")
         _integer(self.group_size, "group_size", 1)
+        _integer(self.retain_pages, "retain_pages")
+        if self.quality_max_rmse is not None:
+            if (not isinstance(self.quality_max_rmse, (int, float))
+                    or isinstance(self.quality_max_rmse, bool)
+                    or not math.isfinite(self.quality_max_rmse) or self.quality_max_rmse < 0):
+                raise ValueError("quality_max_rmse must be a finite non-negative number")
+            object.__setattr__(self, "quality_max_rmse", float(self.quality_max_rmse))
+        elif self.retain_pages:
+            raise ValueError("retain_pages needs a quality_max_rmse to compare against")
+        if self.retain_pages > MAX_PLAN_SEGMENTS:
+            raise ValueError("retain_pages exceeds the page metadata limit")
         if self.hot_pages > MAX_PLAN_SEGMENTS or self.warm_pages > MAX_PLAN_SEGMENTS:
             raise ValueError("Tier counts exceed the page metadata limit")
         if self.group_size > MAX_Q4_GROUP_SIZE:
@@ -67,12 +108,15 @@ class TieredKVPolicy(_JSON):
 
     def to_dict(self):
         return {"policy_id": POLICY_ID, "hot_pages": self.hot_pages,
-                "warm_pages": self.warm_pages, "group_size": self.group_size}
+                "warm_pages": self.warm_pages, "group_size": self.group_size,
+                "quality_max_rmse": self.quality_max_rmse, "retain_pages": self.retain_pages}
 
     @classmethod
     def from_dict(cls, data):
-        _keys(data, {"policy_id", "hot_pages", "warm_pages", "group_size"}, "TieredKVPolicy")
-        result = cls(data["hot_pages"], data["warm_pages"], data["group_size"])
+        _keys(data, {"policy_id", "hot_pages", "warm_pages", "group_size",
+                     "quality_max_rmse", "retain_pages"}, "TieredKVPolicy")
+        result = cls(data["hot_pages"], data["warm_pages"], data["group_size"],
+                     data["quality_max_rmse"], data["retain_pages"])
         if not _strict_equal(data, result.to_dict()):
             raise ValueError("Tiered KV policy differs from its canonical contract")
         return result
@@ -213,6 +257,15 @@ class TieredKVCachePlan(_JSON):
     def page_count(self, length):
         return self.layout("f32").page_count(length)
 
+    @property
+    def quality_retention_bytes(self):
+        """Extra allocation the admitted retentions may cost over ageing."""
+        if not self.policy.retain_pages:
+            return 0
+        spread = (self.layout("f32").page_allocation_bytes -
+                  self.layout("q3").page_allocation_bytes)
+        return self.policy.retain_pages * max(spread, 0)
+
     def allocation_limit_bytes(self, max_chunk_length):
         """Conservative page-only bound for arbitrary prefill replacement/append.
 
@@ -222,7 +275,7 @@ class TieredKVCachePlan(_JSON):
         """
         self.layout("f32").reservation_pages(max_chunk_length)
         extra = self.page_count(max_chunk_length)
-        bound = (self.capacity_resident_bytes_bound
+        bound = (self.capacity_resident_bytes_bound + self.quality_retention_bytes
                  + extra * self.layout("f32").page_allocation_bytes
                  + self.max_pages * self.max_packed_page_allocation_bytes)
         return _byte_range(bound, "Tiered KV reservation")
@@ -235,8 +288,16 @@ class TieredKVCachePlan(_JSON):
                             _TIERS[codec], count - 1 - page_index, codec, _CODEC_IDS[codec], 1,
                             layout.group_size, self._identities[codec], layout.page_allocation_bytes)
 
-    def desired_pages(self, length):
+    def desired_pages(self, length, retained=None):
+        """Canonical layout, with the pages quality kept above their age."""
+        retained = {} if retained is None else dict(retained)
+        if len(retained) > self.policy.retain_pages:
+            raise ValueError("More retained pages than the policy admits")
         count = self.page_count(length)
+        for page_index in retained:
+            _integer(page_index, "retained page index")
+            if page_index >= count:
+                raise ValueError("A retained page index falls outside the prefix")
         result = []
         for page_index in range(count):
             age = count - 1 - page_index
@@ -246,11 +307,17 @@ class TieredKVCachePlan(_JSON):
                 codec = "q4"
             else:
                 codec = "q3"
+            kept = retained.get(page_index)
+            if kept is not None:
+                if kept not in _PRECISION_RANK or _PRECISION_RANK[kept] < _PRECISION_RANK[codec]:
+                    raise ValueError("A retained page may only keep more precision than its age gives")
+                codec = kept
             result.append(self._page(page_index, length, codec))
         return tuple(result)
 
-    def plan_transition(self, past_length, chunk_length, mode, committed_pages):
-        return TieredKVTransition(self, past_length, chunk_length, mode, committed_pages)
+    def plan_transition(self, past_length, chunk_length, mode, committed_pages, retained=None):
+        return TieredKVTransition(self, past_length, chunk_length, mode, committed_pages,
+                                  normalize_retained(retained))
 
     def to_dict(self):
         return {"schema_version": SCHEMA_VERSION, "config": self.config.to_dict(),
@@ -280,6 +347,8 @@ class TieredKVTransition(_JSON):
     chunk_length: int
     mode: str
     committed_pages: tuple[TieredKVPage, ...]
+    retained_pages: tuple = ()
+    final_retained_pages: tuple = field(init=False)
     position_offset: int = field(init=False)
     new_length: int = field(init=False)
     attention_pages: tuple[TieredKVPage, ...] = field(init=False)
@@ -296,6 +365,8 @@ class TieredKVTransition(_JSON):
         if not isinstance(self.cache_plan, TieredKVCachePlan):
             raise ValueError("Transition requires a TieredKVCachePlan")
         cache = self.cache_plan
+        object.__setattr__(self, "retained_pages", normalize_retained(self.retained_pages))
+        retained = dict(self.retained_pages)
         old_count = cache.page_count(self.past_length)
         _integer(self.chunk_length, "chunk_length", 1)
         if self.mode not in ("prefill", "decode"):
@@ -304,7 +375,7 @@ class TieredKVTransition(_JSON):
             raise ValueError("Decode requires a committed KV prefix")
         if (not isinstance(self.committed_pages, tuple) or len(self.committed_pages) != old_count
                 or any(not isinstance(page, TieredKVPage) for page in self.committed_pages)
-                or self.committed_pages != cache.desired_pages(self.past_length)):
+                or self.committed_pages != cache.desired_pages(self.past_length, retained)):
             raise ValueError("Committed pages do not match the canonical policy and prefix layout")
         position = 0 if self.mode == "prefill" else self.past_length
         length = position + self.chunk_length
@@ -315,7 +386,11 @@ class TieredKVTransition(_JSON):
         keep = 0 if self.mode == "prefill" else old_count
         attention = tuple(cache._page(index, length, self.committed_pages[index].codec
                                       if index < keep else "f32") for index in range(count))
-        final = cache.desired_pages(length)
+        # A replaced prefix keeps nothing: retention belongs to the pages that
+        # survive the transition, and prefill rebuilds every page from scratch.
+        surviving = normalize_retained({index: codec for index, codec in retained.items()
+                                        if index < keep})
+        final = cache.desired_pages(length, dict(surviving))
         migrations = tuple(TieredKVMigration(source, target) for source, target in zip(attention, final)
                            if source.codec != target.codec)
         if any(m.source.valid_tokens != cache.page_tokens for m in migrations):
@@ -324,7 +399,8 @@ class TieredKVTransition(_JSON):
         old_bytes = sum(page.page_allocation_bytes for page in self.committed_pages)
         attention_bytes = old_bytes + sum(page.page_allocation_bytes for page in fresh)
         replacement_bytes = sum(m.target.page_allocation_bytes for m in migrations)
-        values = {"position_offset": position, "new_length": length,
+        values = {"final_retained_pages": surviving,
+                  "position_offset": position, "new_length": length,
                   "attention_pages": attention, "final_pages": final,
                   "migrations": migrations, "fresh_pages": fresh,
                   "old_resident_bytes": old_bytes, "attention_resident_bytes": attention_bytes,
@@ -337,7 +413,10 @@ class TieredKVTransition(_JSON):
 
     def to_dict(self):
         result = {"schema_version": SCHEMA_VERSION, "cache_plan": self.cache_plan.to_dict(),
-                  "past_length": self.past_length, "chunk_length": self.chunk_length, "mode": self.mode}
+                  "past_length": self.past_length, "chunk_length": self.chunk_length,
+                  "mode": self.mode,
+                  "retained_pages": [[index, codec] for index, codec in self.retained_pages],
+                  "final_retained_pages": [[index, codec] for index, codec in self.final_retained_pages]}
         for name in ("committed_pages", "attention_pages", "final_pages", "migrations", "fresh_pages"):
             result[name] = [item.to_dict() for item in getattr(self, name)]
         for name in ("position_offset", "new_length", "old_resident_bytes", "attention_resident_bytes",
@@ -353,8 +432,12 @@ class TieredKVTransition(_JSON):
         committed = data["committed_pages"]
         if not isinstance(committed, list) or len(committed) > MAX_PLAN_SEGMENTS:
             raise ValueError("Committed pages exceed the page metadata limit")
+        kept = data["retained_pages"]
+        if not isinstance(kept, list):
+            raise ValueError("Retained pages must be a list of pairs")
         result = cls(cache, data["past_length"], data["chunk_length"], data["mode"],
-                     tuple(TieredKVPage.from_dict(page) for page in committed))
+                     tuple(TieredKVPage.from_dict(page) for page in committed),
+                     normalize_retained(kept))
         if not _strict_equal(data, result.to_dict()):
             raise ValueError("Tiered KV transition differs from canonical pages, migrations or byte counts")
         return result

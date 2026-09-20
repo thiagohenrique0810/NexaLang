@@ -51,6 +51,12 @@ class OffloadedTieredTransformerSession(TieredTransformerSession):
     layers and calls of this session; slots are allocated only on a real miss.
     """
     def __init__(self, bundle_path, *, kv_backing_store, kv_reload_slots=1, **kwargs):
+        if kwargs.get("kv_quality_max_rmse") is not None or kwargs.get("kv_retain_pages"):
+            # A retained page stops being cold, which moves it out of the
+            # backing store and changes the physical plan, the reload slots and
+            # the eviction contract. Declared out of scope rather than silently
+            # published with descriptors that do not match what is resident.
+            raise ValueError("The KV quality ceiling is not supported over a backing store")
         self._backing_parent = Path(kv_backing_store)
         self._reload_slots = kv_reload_slots
         self._offload_plan = self._reload_cache = None
