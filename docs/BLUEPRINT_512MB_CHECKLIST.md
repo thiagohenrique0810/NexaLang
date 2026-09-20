@@ -129,6 +129,22 @@ padrão. Passaram **547 regressões + 110 testes bootstrap = 657 testes**, sem
 falhas ou skips. M4.05c passa a identificar reuso/promoção de residência; o
 restante ficou em M4.05d. Checklist: **32 concluídos e 107 pendentes**.
 
+**Vigésimo nono incremento implementado e validado:** seleção de precisão por
+custo físico. O planejador otimizava o **payload** — os bytes que o codec
+codifica. O container NexaPack cobra um overhead fixo por tensor empacotado que
+não escala com o tamanho da matriz, então abaixo de cerca de 2–8 mil valores
+(grupo 32) **empacotar aumenta o arquivo**: o Q4 de uma matriz de 512 valores
+codifica 192 bytes e ocupa 4.416. Na fixture tiny, o plano por payload escolhe
+8× Q2 e promete 880 bytes; entrega 33.744 bytes de tensores. O plano por custo
+físico escolhe 8× F16, promete 1.408 e entrega 1.504 — o plano "mais barato"
+produz um bundle **22 vezes maior**. A calibração passa a medir `physical_bytes`
+na mesma variante real que já constrói, com `container_overhead_bytes` e um
+`physical_saved_bytes` que fica **negativo** quando empacotar não compensa. O
+custo entra no `policy_id`, que deixou de ser constante do módulo e virou campo
+do mapa. Q2/Q3/F16 já atravessavam o pipeline desde a escada de codecs de pesos.
+Misturar codecs dentro do tensor ficou em M6.02d. Passaram **742 testes**, sem
+falhas ou skips. Checklist: **50 concluídos e 104 pendentes**.
+
 **Vigésimo oitavo incremento implementado e validado:** admissão conjunta e
 cancelamento. `SessionMemoryPool` é o termo compartilhado que faltava: cada
 sessão admitia só o próprio orçamento, então duas de 300 MiB passavam nas duas
@@ -332,15 +348,15 @@ Ao retomar:
    registre subtarefa, arquivos, evidências, decisão pendente e próximo comando.
 5. Atualize este checkpoint, os comandos reais, os arquivos e o próximo passo.
 
-**Próxima tarefa: M6.02c — PrecisionMap por bloco e seleção por custo físico.**
-O planejador já escolhe codec por tensor sob orçamento de bytes ou teto de RMSE;
-falta escolher por bloco dentro do tensor e trocar o custo nominal pelo custo
-físico, que é o que de fato vai à memória. É autocontido e mede-se na fixture,
-sem depender de GPU nem de checkpoint treinado. Alternativas em aberto: M1.10b
-(pacote `.nxb`), M4.06e (reuso de prefixo parcial), M4.05e e M6.01d — ambos
-dependentes da calibração em modelo treinado — e M5.01 com modelo real, que
-continua sendo o maior desbloqueio e depende de uma decisão de qual checkpoint
-baixar, sob qual licença e onde guardar os pesos fora do Git.
+**Próxima tarefa: M1.10b — pacote executável `.nxb`.** Plano, kernels, variantes
+e fallback num container só, versionado e verificável, que é o que falta para um
+bundle deixar de ser um diretório de artefatos soltos. É autocontido, reaproveita
+o contêiner NexaPack e o overhead por arquivo medido em M6.02c passa a importar
+na decisão de layout. Alternativas em aberto: M6.02d (codec por bloco dentro do
+tensor), M4.06e (reuso de prefixo parcial), M4.05e e M6.01d — ambos dependentes
+da calibração em modelo treinado — e M5.01 com modelo real, que continua sendo o
+maior desbloqueio e depende de uma decisão de qual checkpoint baixar, sob qual
+licença e onde guardar os pesos fora do Git.
 
 **Também pendente: M5.01 com um modelo real.** Com o tokenizer pronto, falta
 importar um modelo de 250–500M por Safetensors (M1.08 já suporta Llama), fixar
@@ -833,9 +849,15 @@ qualidade aprovada e orçamento respeitado durante prefill e decode.
   conversão e limites da estimativa declarados.
 - [x] M6.02b PrecisionMap com escala de codecs por tensor e seleção que sobe
   degraus por erro evitado/byte, descartando opções dominadas.
-- [ ] M6.02c PrecisionMap Q2/Q3/F16 e por bloco, e seleção por custo físico
-  medido; misturar codecs dentro do tensor exige formato versionado, identidade/
-  offsets por bloco e despacho compatível (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
+- [x] M6.02c PrecisionMap Q2/Q3/F16 e seleção por custo físico medido: a
+  calibração reporta `physical_bytes`, `container_overhead_bytes` e
+  `physical_saved_bytes` da mesma variante real que mede sensibilidade, e
+  `--cost physical` planeja contra o que o arquivo ocupa, com o custo no
+  `policy_id` (Blueprint p.4, §4.3; Primeira LLM p.10, §8).
+- [ ] M6.02d Misturar codecs **dentro** do tensor: formato versionado com codec,
+  offset e identidade por bloco, despacho que troque de kernel dentro do mesmo
+  matmul, e demonstração de ganho — o overhead fixo medido em M6.02c é por
+  arquivo, e metadados por bloco heterogêneo tendem a aumentá-lo.
 - [ ] M6.03 CompressionPlanner escolhe codec/sparsity/low-rank sem presumir speedup.
 - [ ] M6.04 Fusões dequant+GEMM, RMSNorm+QKV, QKV+RoPE e FFN/SwiGLU por custo.
 - [ ] M6.05 StreamingRegions entre operações com dependências e register pressure.
@@ -1367,6 +1389,43 @@ Décimo primeiro incremento:
   **32 concluídos e 107 pendentes**; a divisão de M4.05 e as duas tarefas CC
   acrescentadas na mesma revisão aumentam a contagem, sem equivaler a percentual
   de conclusão ou prazo. Próximo incremento técnico: M4.05d.
+
+## Registro do vigésimo nono incremento — custo físico na seleção de precisão
+
+- Concluído M6.02c. `tools/nexa_calibrate.py` mede `physical_bytes` de cada
+  variante real que já constrói para medir sensibilidade — é o
+  `physical_file_bytes` do bundle, não estimativa — e acrescenta
+  `container_overhead_bytes`, `dense_physical_bytes` e `physical_saved_bytes`,
+  este último **negativo** quando empacotar não compensa.
+- `compiler/precision_map.py`: `select_precision(..., cost="payload"|"physical")`
+  e `_COST_FIELDS`. O custo entra na política — `GREEDY_SENSITIVITY_PER_BYTE_V2`
+  e `GREEDY_SENSITIVITY_PER_PHYSICAL_BYTE_V3` — e o `policy_id` deixou de ser
+  constante do módulo para ser campo do mapa, com `cost_basis` para lê-lo de
+  volta. Mapas antigos continuam válidos; política desconhecida é recusada.
+- Medido direto sobre o escritor (grupo 32, oito linhas): o overhead do container
+  é **fixo por arquivo**, idêntico em 512, 8.192 e 131.072 valores. O ponto de
+  virada Q4 × F16 fica entre 2.048 e 8.192 valores; abaixo dele empacotar
+  aumenta o arquivo — Q4 de 512 valores codifica 192 bytes e ocupa 4.416.
+- Prova ponta a ponta na fixture tiny: o plano por payload escolhe 8× Q2,
+  promete 880 bytes e entrega 33.744 de tensores (bundle 39.073); o plano por
+  custo físico escolhe 8× F16, promete 1.408 e entrega 1.504 (bundle 9.555). O
+  plano "mais barato" produz um bundle 22 vezes maior. Ambos convertem,
+  verificam e executam.
+- Nenhum codec empacotado sobrevive à seleção física nessa fixture, e isso sai
+  de graça: a fronteira de dominância já descartava opção que custa mais sem ser
+  mais precisa. Q2/Q3/F16 já atravessavam o pipeline desde a escada de pesos.
+- `tools/nexa_precision.py plan --cost payload|physical`.
+- `tests/test_physical_cost_regressions.py`: 17 regressões — seleção (9),
+  medição direta do escritor (4), CLI (3) e o pipeline completo comparando os
+  dois bundles no disco (1). Mais uma em `tests/test_calibration_regressions.py`
+  para os campos físicos do relatório.
+- Fora de escopo, registrado em M6.02d: misturar codecs dentro do tensor exige
+  formato versionado com codec/offset/identidade por bloco e despacho que troque
+  de kernel dentro do mesmo matmul; o ganho precisa ser demonstrado, porque o
+  overhead medido aqui é por arquivo.
+- Passaram **742 testes** (`python3 -m unittest discover -s tests`), sem falhas
+  ou skips. Guia: [custo físico](NEXALM_CUSTO_FISICO.md). Checklist:
+  **50 concluídos e 104 pendentes**. Próximo: M1.10b.
 
 ## Registro do vigésimo oitavo incremento — admissão conjunta e cancelamento
 
@@ -2081,6 +2140,16 @@ Décimo quarto incremento acrescenta:
   isolamento de bytes, migração privada, ownership, limites, falhas,
   relatórios e CLI.
 - `docs/NEXALM_KV_SEQUENCIAS_CPU.md`: contrato, custo, evidências e limites.
+
+Vigésimo nono incremento acrescenta:
+
+- `compiler/precision_map.py`: `POLICY_IDS`/`COSTS`, `policy_id` como campo do
+  mapa, `cost_basis`, `_COST_FIELDS` e `select_precision(..., cost=)`.
+- `tools/nexa_calibrate.py`: `physical_bytes`, `container_overhead_bytes`,
+  `dense_physical_bytes` e `physical_saved_bytes` por tensor e codec.
+- `tools/nexa_precision.py`: `plan --cost payload|physical`.
+- `tests/test_physical_cost_regressions.py`, um teste novo em
+  `tests/test_calibration_regressions.py` e `docs/NEXALM_CUSTO_FISICO.md`.
 
 Vigésimo oitavo incremento acrescenta:
 

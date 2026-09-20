@@ -153,7 +153,13 @@ def main(argv=None):
                                         tensor_codecs={name: "f32" for name in matrices})
             reference, dense_digests = run_model(dense, args.prompts, memory_budget=args.memory_budget,
                                                  tile_rows=args.tile_rows)
-            report["reference"] = {"codec": "RAW_F32_MATRIX", "logits_sha256": dense_digests}
+            with ModelBundleReader(dense) as bundle:
+                dense_physical = {item["name"]: item["physical_file_bytes"]
+                                  for item in bundle.inspect()["tensors"]}
+            for entry in tensors:
+                entry["dense_physical_bytes"] = dense_physical[entry["name"]]
+            report["reference"] = {"codec": "RAW_F32_MATRIX", "logits_sha256": dense_digests,
+                                   "physical_file_bytes": sum(dense_physical.values())}
             report["all_packed"] = {}
             for codec in codecs:
                 packed = work / f"reference-{codec}"
@@ -168,8 +174,11 @@ def main(argv=None):
                     "logits_sha256": packed_digests,
                     "sensitivity": aggregate(reference, packed_logits, labels)}
                 with ModelBundleReader(packed) as bundle:
-                    sizes = {item["name"]: item["packed_payload_bytes"]
-                             for item in bundle.inspect()["tensors"]}
+                    summary = bundle.inspect()["tensors"]
+                    sizes = {item["name"]: item["packed_payload_bytes"] for item in summary}
+                    # What the file holds, not what the codec encodes: container
+                    # header, per-block metadata and checksums are bytes too.
+                    physical = {item["name"]: item["physical_file_bytes"] for item in summary}
                 for entry in tensors:
                     name = entry["name"]
                     variant = work / f"variant-{codec}-{name.replace('.', '_')}"
@@ -184,7 +193,10 @@ def main(argv=None):
                             shutil.rmtree(variant, ignore_errors=True)
                     measurement = entry["codecs"][codec]
                     measurement["packed_bytes"] = sizes[name]
+                    measurement["physical_bytes"] = physical[name]
+                    measurement["container_overhead_bytes"] = physical[name] - sizes[name]
                     measurement["saved_bytes"] = entry["dense_bytes"] - sizes[name]
+                    measurement["physical_saved_bytes"] = entry["dense_physical_bytes"] - physical[name]
                     measurement["sensitivity"] = aggregate(reference, logits, labels)
                     saved = max(measurement["saved_bytes"], 1)
                     # Logit error per byte this codec saves on this tensor: the

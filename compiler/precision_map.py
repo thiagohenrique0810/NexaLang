@@ -18,7 +18,12 @@ import math
 from types import MappingProxyType
 
 SCHEMA_VERSION = 1
-POLICY_ID = "GREEDY_SENSITIVITY_PER_BYTE_V2"
+# The cost a plan optimizes is part of the policy: the same sensitivities rank
+# differently against payload bytes and against bytes the file actually holds.
+POLICY_IDS = {"payload": "GREEDY_SENSITIVITY_PER_BYTE_V2",
+              "physical": "GREEDY_SENSITIVITY_PER_PHYSICAL_BYTE_V3"}
+POLICY_ID = POLICY_IDS["payload"]
+COSTS = ("payload", "physical")
 CODECS = ("q2", "q3", "q4", "q8", "f16", "f32")
 MAX_MAP_TENSORS = 4096
 
@@ -34,6 +39,7 @@ class PrecisionMap:
     """Codec per tensor, with the provenance of the decision that produced it."""
     codecs: object
     provenance: dict = field(default_factory=dict)
+    policy_id: str = POLICY_ID
 
     def __post_init__(self):
         codecs = dict(self.codecs)
@@ -45,12 +51,22 @@ class PrecisionMap:
                 raise ValueError(f"Unsupported codec for {name}: {codec!r}")
         if not isinstance(self.provenance, dict):
             raise ValueError("Provenance must be a JSON object")
+        if self.policy_id not in POLICY_IDS.values():
+            raise ValueError(f"Unsupported precision map policy: {self.policy_id!r}")
         object.__setattr__(self, "codecs", MappingProxyType(dict(sorted(codecs.items()))))
         object.__setattr__(self, "provenance", json.loads(json.dumps(self.provenance, sort_keys=True)))
 
     @property
     def dense_tensors(self):
         return tuple(name for name, codec in self.codecs.items() if codec == "f32")
+
+    @property
+    def cost_basis(self):
+        """Which byte count this map was optimized against."""
+        for cost, policy in POLICY_IDS.items():
+            if policy == self.policy_id:
+                return cost
+        raise ValueError("Unsupported precision map policy")
 
     def bytes_for(self, sizes):
         """Total stored bytes, given {tensor: {"q4": n, "f32": n}} from calibration."""
@@ -62,7 +78,7 @@ class PrecisionMap:
         return total
 
     def to_dict(self):
-        return {"schema_version": SCHEMA_VERSION, "policy_id": POLICY_ID,
+        return {"schema_version": SCHEMA_VERSION, "policy_id": self.policy_id,
                 "codecs": dict(self.codecs), "provenance": self.provenance}
 
     def to_json(self, *, indent=2):
@@ -72,11 +88,11 @@ class PrecisionMap:
     def from_dict(cls, data):
         if not isinstance(data, dict) or set(data) != {"schema_version", "policy_id", "codecs", "provenance"}:
             raise ValueError("Unexpected precision map fields")
-        if data["schema_version"] != SCHEMA_VERSION or data["policy_id"] != POLICY_ID:
+        if data["schema_version"] != SCHEMA_VERSION or data["policy_id"] not in POLICY_IDS.values():
             raise ValueError("Unsupported precision map version or policy")
         if not isinstance(data["codecs"], dict):
             raise ValueError("Precision map codecs must be an object")
-        return cls(data["codecs"], data["provenance"])
+        return cls(data["codecs"], data["provenance"], data["policy_id"])
 
     @classmethod
     def from_json(cls, text):
@@ -89,19 +105,32 @@ def _rmse(value, label):
     return float(value)
 
 
-def _options(name, entry):
+# What each cost basis reads from the report, per tensor and per codec.
+_COST_FIELDS = {"payload": ("dense_bytes", "packed_bytes"),
+                "physical": ("dense_physical_bytes", "physical_bytes")}
+
+
+def _options(name, entry, cost="payload"):
     """Codec choices for one tensor, cheapest first, dominated ones removed.
 
     Dense is always available at its own size with zero measured error, since
     it is the reference every sensitivity was measured against.
+
+    `cost` picks the byte count to optimize. "payload" counts the codec's own
+    bytes; "physical" counts what the tensor file actually holds, including the
+    container header, the per-block metadata and its checksums. The second is
+    the number that has to fit on a device, and the two do not always rank the
+    codecs the same way.
     """
-    dense_bytes = entry.get("dense_bytes")
+    dense_field, packed_field = _COST_FIELDS[cost]
+    dense_bytes = entry.get(dense_field)
     if type(dense_bytes) is not int or dense_bytes <= 0:
-        raise ValueError(f"Calibration report lacks a valid dense_bytes for {name}")
+        raise ValueError(f"Calibration report lacks a valid {dense_field} for {name}")
     measured = entry.get("codecs")
     if measured is None and "packed_bytes" in entry:
         # A report from the single-codec calibration still plans correctly.
         measured = {"q4": {"packed_bytes": entry["packed_bytes"],
+                           "physical_bytes": entry.get("physical_bytes"),
                            "sensitivity": entry.get("sensitivity", {})}}
     if not isinstance(measured, dict) or not measured:
         raise ValueError(f"Calibration report lacks measured codecs for {name}")
@@ -110,9 +139,9 @@ def _options(name, entry):
         if codec not in CODECS or codec == "f32":
             raise ValueError(f"Unsupported measured codec for {name}: {codec!r}")
         # f32 is the reference itself and is appended below, never measured.
-        size = item.get("packed_bytes")
+        size = item.get(packed_field)
         if type(size) is not int or size <= 0:
-            raise ValueError(f"Calibration report lacks a valid packed_bytes for {name}/{codec}")
+            raise ValueError(f"Calibration report lacks a valid {packed_field} for {name}/{codec}")
         choices.append({"codec": codec, "bytes": size,
                         "sensitivity": _rmse(item.get("sensitivity", {}).get("rmse"), f"{name}/{codec}")})
     choices.append({"codec": "f32", "bytes": dense_bytes, "sensitivity": 0.0})
@@ -126,13 +155,14 @@ def _options(name, entry):
     return frontier
 
 
-def _measured(report):
+def _measured(report, cost="payload"):
     tensors = report.get("tensors")
     if not isinstance(tensors, list) or not tensors:
         raise ValueError("Calibration report contains no tensors")
     if not report.get("sensitivity_measured"):
         raise ValueError("Selection requires a calibration report with measured sensitivity")
-    return {_text(entry.get("name"), "tensor name"): _options(_text(entry.get("name"), "tensor name"), entry)
+    return {_text(entry.get("name"), "tensor name"):
+            _options(_text(entry.get("name"), "tensor name"), entry, cost)
             for entry in tensors}
 
 
@@ -146,7 +176,7 @@ def _estimated_rmse(rows, chosen):
     return math.sqrt(sum(rows[name][index]["sensitivity"] ** 2 for name, index in chosen.items()))
 
 
-def select_precision(report, budget_bytes=None, *, max_rmse=None):
+def select_precision(report, budget_bytes=None, *, max_rmse=None, cost="payload"):
     """Choose a codec per tensor, bounded by bytes or by estimated error.
 
     Every tensor starts at its cheapest measured codec. The upgrade with the
@@ -162,6 +192,8 @@ def select_precision(report, budget_bytes=None, *, max_rmse=None):
     and the error estimate combines measurements that were taken one tensor at
     a time. It ranks plans; it does not certify quality.
     """
+    if cost not in COSTS:
+        raise ValueError(f"cost must be one of {COSTS}")
     if (budget_bytes is None) == (max_rmse is None):
         raise ValueError("Pass exactly one of budget_bytes or max_rmse")
     if budget_bytes is not None and (type(budget_bytes) is not int or budget_bytes < 0):
@@ -169,7 +201,7 @@ def select_precision(report, budget_bytes=None, *, max_rmse=None):
     if max_rmse is not None and (not isinstance(max_rmse, (int, float)) or isinstance(max_rmse, bool)
                                  or not math.isfinite(max_rmse) or max_rmse < 0):
         raise ValueError("max_rmse must be a finite non-negative number")
-    rows = _measured(report)
+    rows = _measured(report, cost)
     baseline = sum(options[0]["bytes"] for options in rows.values())
     if budget_bytes is not None and baseline > budget_bytes:
         raise ValueError(f"Budget {budget_bytes} is below {baseline} bytes at the cheapest codecs")
@@ -208,7 +240,10 @@ def select_precision(report, budget_bytes=None, *, max_rmse=None):
     planned = sum(rows[name][index]["bytes"] for name, index in chosen.items())
     estimate = _estimated_rmse(rows, chosen)
     provenance = {
-        "policy": POLICY_ID, "budget_bytes": budget_bytes, "max_rmse": max_rmse,
+        "policy": POLICY_IDS[cost], "cost_basis": cost,
+        "cost_scope": ("codec payload only" if cost == "payload" else
+                       "bytes the tensor file holds: container header, per-block metadata and checksums"),
+        "budget_bytes": budget_bytes, "max_rmse": max_rmse,
         "bound": "bytes" if budget_bytes is not None else "estimated_rmse",
         "cheapest_baseline_bytes": baseline,
         "planned_bytes": planned,
@@ -226,4 +261,4 @@ def select_precision(report, budget_bytes=None, *, max_rmse=None):
                            "this ranks plans and does not predict combined quality"),
         "quality_measured": False,
     }
-    return PrecisionMap(codecs, provenance)
+    return PrecisionMap(codecs, provenance, POLICY_IDS[cost])

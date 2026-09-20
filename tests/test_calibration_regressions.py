@@ -183,6 +183,30 @@ class CalibrationCLIRegressions(_DenseFixture):
             self.assertLess(tensor["codecs"]["f16"]["quantization"]["rmse"],
                             tensor["codecs"]["q8"]["quantization"]["rmse"])
 
+    def test_the_report_carries_the_physical_cost_of_every_variant(self):
+        names = ["model.embed_tokens.weight", "model.layers.0.mlp.down_proj.weight"]
+        report = self.run_cli("--checkpoint", str(self.checkpoint), "--tokens", "1,3",
+                              "--group-size", "4", "--block-rows", "3", "--tile-rows", "3",
+                              "--memory-budget", "8MiB", "--tensor", names[0], "--tensor", names[1],
+                              "--codec", "q4", "--codec", "f16")
+        self.assertGreater(report["reference"]["physical_file_bytes"], 0)
+        for tensor in report["tensors"]:
+            self.assertGreater(tensor["dense_physical_bytes"], 0)
+            for codec, measured in tensor["codecs"].items():
+                with self.subTest(tensor=tensor["name"], codec=codec):
+                    # A file never holds fewer bytes than the codec encodes.
+                    self.assertGreaterEqual(measured["physical_bytes"], measured["packed_bytes"])
+                    self.assertEqual(measured["container_overhead_bytes"],
+                                     measured["physical_bytes"] - measured["packed_bytes"])
+                    self.assertEqual(measured["physical_saved_bytes"],
+                                     tensor["dense_physical_bytes"] - measured["physical_bytes"])
+            # On tensors this small the packed container costs more than the
+            # dense file it replaces: payload savings are not file savings.
+            packed = tensor["codecs"]["q4"]
+            self.assertGreater(packed["saved_bytes"], 0)
+            self.assertLess(packed["physical_saved_bytes"], 0)
+            self.assertEqual(tensor["codecs"]["f16"]["container_overhead_bytes"], 0)
+
     def test_sensitivity_pass_measures_each_tensor_and_codec(self):
         names = ["model.embed_tokens.weight", "model.layers.0.mlp.down_proj.weight"]
         report = self.run_cli("--checkpoint", str(self.checkpoint), "--tokens", "1,3",
