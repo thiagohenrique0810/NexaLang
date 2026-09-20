@@ -79,6 +79,9 @@ def main(argv=None):
                         help="Cold pages kept resident between layers and calls (default: 1); requires --kv-backing-store")
     parser.add_argument("--fork-tokens", type=token_list,
                         help="Derive a second sequence from the finished prefix and append these IDs to it; requires paged KV without a backing store")
+    parser.add_argument("--reuse-prefix-tokens", type=token_list,
+                        help="Run this prompt in a second, independent session that adopts the complete "
+                             "KV pages both prompts share; requires paged KV without a backing store")
     parser.add_argument("--verify", action="store_true", help="Compare small-model logits with optional PyTorch oracle")
     parser.add_argument("--reference-checkpoint", type=Path, help="Also measure original-vs-Q4 quantization error")
     parser.add_argument("--include-logits", action="store_true")
@@ -93,6 +96,7 @@ def main(argv=None):
     if args.recompute and (args.kv_cache or args.kv_two_banks or args.kv_page_tokens is not None
                            or args.kv_codec != "f32" or args.kv_policy != "homogeneous"
                            or args.kv_backing_store is not None or args.fork_tokens is not None
+                           or args.reuse_prefix_tokens is not None
                            or args.prefill_chunk_size is not None):
         parser.error("--recompute keeps no cache; drop the KV options")
     if args.kv_two_banks and (args.kv_page_tokens is not None or args.kv_codec != "f32"
@@ -137,6 +141,8 @@ def main(argv=None):
         parser.error("--bos requires --prompt")
     if args.fork_tokens is not None and (args.recompute or args.kv_two_banks):
         parser.error("--fork-tokens needs the paged cache; drop --recompute/--kv-two-banks")
+    if args.reuse_prefix_tokens is not None and (args.recompute or args.kv_two_banks):
+        parser.error("--reuse-prefix-tokens needs the paged cache; drop --recompute/--kv-two-banks")
     if (args.kv_bits is not None or args.kv_seed is not None) and args.kv_codec != "tq":
         parser.error("--kv-bits/--kv-seed require --kv-codec tq")
     if args.kv_bits is not None and not 1 <= args.kv_bits <= 8:
@@ -158,8 +164,10 @@ def main(argv=None):
                 raise ValueError("The encoded prompt is empty")
         steps = len(args.decode_tokens or ()) or args.generate
         forked = len(args.fork_tokens or ())
+        # The reusing session is a separate sequence, not a continuation: its
+        # own prompt, not the sum, is what has to fit the shared capacity.
         capacity = (args.max_sequence_length if args.max_sequence_length is not None
-                    else len(args.tokens) + steps + forked)
+                    else max(len(args.tokens) + steps + forked, len(args.reuse_prefix_tokens or ())))
         session_type = TransformerSession
         session_options = {}
         if args.recompute:
@@ -322,6 +330,39 @@ def main(argv=None):
                         report["derived_sequence"]["memory_pool"] = pool.to_dict()
                 finally:
                     derived.close()
+            if args.reuse_prefix_tokens:
+                # A second session built independently of this one: it never
+                # derived from it, and shares only the complete pages whose
+                # tokens both prompts agree on, position by position.
+                reuse = session_type(args.bundle, memory_budget=args.memory_budget,
+                                     max_sequence_length=capacity, tile_rows=args.tile_rows,
+                                     reserve_bytes=args.reserve, **session_options)
+                try:
+                    adoption = reuse.adopt_prefix(session, args.reuse_prefix_tokens)
+                    remainder = args.reuse_prefix_tokens[adoption["inherited_tokens"]:]
+                    if not remainder:
+                        raise ValueError("--reuse-prefix-tokens must extend past the pages it adopts")
+                    appended = reuse.append(remainder)
+                    memory = reuse.report()["memory"]
+                    digest = hashlib.sha256()
+                    for row in appended:
+                        for value in row:
+                            digest.update(struct.pack("<f", value))
+                    report["reused_prefix"] = {
+                        "prefix_adoption": adoption, "token_ids": list(reuse.token_ids),
+                        "appended_token_ids": list(remainder),
+                        "logits_sha256": digest.hexdigest(), "logits_scope": "appended_chunk",
+                        "kv_shared_page_count": memory["kv_shared_page_count"],
+                        "kv_shared_allocation_bytes": memory["kv_shared_allocation_bytes"],
+                        "kv_owned_allocation_bytes": memory["kv_owned_allocation_bytes"],
+                        "kv_resident_allocation_bytes": memory["kv_resident_allocation_bytes"],
+                        "managed_buffers_peak_bound_bytes": memory["managed_buffers_peak_bound_bytes"],
+                        "scope": "independent sequence sharing the pages both prompts agree on",
+                    }
+                    if pool is not None:
+                        report["reused_prefix"]["memory_pool"] = pool.to_dict()
+                finally:
+                    reuse.close()
             if args.verify:
                 sys.path.insert(0, str(ROOT / "tests"))
                 if args.kv_policy == "age":

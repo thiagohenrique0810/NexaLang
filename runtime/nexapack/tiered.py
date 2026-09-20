@@ -10,7 +10,7 @@ import ctypes
 import math
 import time
 
-from compiler.tiered_kv_plan import TieredKVPolicy, TieredKVCachePlan
+from compiler.tiered_kv_plan import _PRECISION_RANK, TieredKVPolicy, TieredKVCachePlan
 from compiler.planner.memory import MemoryRequest
 from .format import READ_CHUNK_BYTES
 from .paged import PagedTransformerSession, _KVPage
@@ -83,13 +83,61 @@ class TieredTransformerSession(PagedTransformerSession):
         # which decide how an inherited Q4/Q3 page is read back.
         return self._tier_plan.to_json(indent=None)
 
-    def _adopt_state(self, parent):
+    def _check_adoption(self, parent, pages):
+        """Truncating a prefix makes its pages *younger*, and age never runs back.
+
+        `tiered_kv_plan.desired_pages` ranks age from the newest page:
+        `age = count - 1 - page_index`. Adopting K of the source's N pages
+        drops every inherited page's age by N-K, so the policy demands *more*
+        precision of it, not less — the opposite of what one expects from
+        "an older prefix". A page the source already aged into Q4 or Q3 would
+        have to be promoted back to F32, and nothing can promote it: the F32
+        the re-encode destroyed is not recoverable from the packed bytes.
+
+        The refusal is narrower than it looks. When every inherited page
+        already holds at least the precision its new age demands, adoption is
+        sound, and it is admitted below. In practice that means a prefix the
+        source never aged: page K-1 becomes age zero, which is always hot F32.
+        The remaining case — inherited pages *more* precise than their new age
+        — is representable, but only as retained pages charged to
+        `retain_pages`, which needs a `quality_max_rmse` and a budget this
+        adoption does not admit. It stays refused, deliberately.
+        """
+        if pages is None:
+            return
+        inherited = parent._page_descriptors[:pages]
+        desired = self._tier_plan.desired_pages(pages * self.page_tokens)
+        younger = [[page.page_index, page.codec, want.codec]
+                   for page, want in zip(inherited, desired) if page.codec != want.codec]
+        promotions = [item for item in younger if _PRECISION_RANK[item[1]] < _PRECISION_RANK[item[2]]]
+        if promotions:
+            raise ValueError(
+                "Age tiers refuse a truncated prefix: dropping the newer pages makes the "
+                f"inherited ones younger, and pages {promotions} (index, inherited, required) "
+                "would have to be promoted back to a precision their packed bytes no longer hold")
+        if younger:
+            raise ValueError(
+                f"Age tiers refuse a truncated prefix: pages {younger} (index, inherited, required) "
+                "would be kept above their new age, which only the quality retention budget "
+                "may admit; this adoption does not admit one")
+
+    def _adopt_state(self, parent, *, pages=None):
         # Aging re-encodes a page into a *new* one and releases the source, so
         # a migration is private to the sequence performing it: the shared page
         # stays valid, and each sequence may pay that re-encode separately.
-        self._page_descriptors = parent._page_descriptors if parent is not None else ()
-        # The retained set describes the inherited pages, not a private decision.
-        self._retained = dict(parent._retained) if parent is not None else {}
+        if parent is None:
+            self._page_descriptors, self._retained = (), {}
+            return
+        if pages is None:
+            self._page_descriptors = parent._page_descriptors
+            # The retained set describes the inherited pages, not a private decision.
+            self._retained = dict(parent._retained)
+            return
+        # A truncated prefix has fewer pages, so age_rank must be recomputed
+        # for the shorter length instead of inherited. _check_adoption proved
+        # the codecs coincide, so the canonical layout needs no retention.
+        self._page_descriptors = self._tier_plan.desired_pages(pages * self.page_tokens)
+        self._retained = {}
 
     def _make_plan(self, length, *, execution_context=None):
         self._configure_cache()
